@@ -107,6 +107,8 @@ class WorkflowOut(_Base):
 # ----- runs -----
 class RunInput(BaseModel):
     input: dict[str, Any] = Field(default_factory=dict)
+    target_slug: str | None = None   # first-class; takes precedence over input.extra
+    target_id: str | None = None     # first-class; takes precedence over input.extra
 
 
 class RunOut(_Base):
@@ -425,7 +427,7 @@ class SkillOut(BaseModel):
 
 # ----- tools -----
 class ToolOut(BaseModel):
-    id: str            # "code.read_file" | "mcp.cai-mcp.searchCode" | "skill.dt-loco"
+    id: str            # "code.read_file"
     kind: str          # builtin|mcp|skill
     name: str
     description: str = ""

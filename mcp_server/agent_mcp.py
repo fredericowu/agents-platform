@@ -163,7 +163,7 @@ def _agent_spec_schema() -> dict:
             "model_slug":    {"type": ["string", "null"],
                               "description": "Slug from list_models; omit to use platform default."},
             "tool_specs":    {"type": "array", "items": {"type": "string"},
-                              "description": "Tool ids like 'code.read_file', 'code.write_file', 'mcp.cai-mcp.searchCode'."},
+                              "description": "Tool ids like 'code.read_file', 'code.write_file'."},
             "skill_slugs":   {"type": "array", "items": {"type": "string"}},
             "params":        {"type": "object",
                               "description": "Model params like {\"temperature\":0.2,\"max_tokens\":2000}."},
@@ -397,23 +397,28 @@ async def _list_tools() -> list[Tool]:
         Tool(name="run_agent_async",
              description=("Start an agent run in the background and return its run_id. "
                           "Poll with `run_status` / `run_events`, or block with `wait_run`.\n\n"
-                          "Pass `target_slug` (or `target_id`) to link this run to a Target "
-                          "so it appears in `target_summary` / `list_target_runs`."),
+                          "**`target_slug` is REQUIRED.** Create a Target first with "
+                          "`create_target` if none exists. Calls without `target_slug` "
+                          "are rejected with a 400 error."),
              inputSchema={"type": "object",
                           "properties": {"slug": {"type": "string"},
                                          "input": {"type": "string"},
-                                         "target_slug": {"type": ["string", "null"]},
+                                         "target_slug": {"type": "string",
+                                                         "description": "Slug of the Target this run is delivering against. REQUIRED."},
                                          "target_id": {"type": ["string", "null"]}},
-                          "required": ["slug", "input"]}),
+                          "required": ["slug", "input", "target_slug"]}),
         Tool(name="run_workflow_async",
              description=("Start a workflow run in the background and return its run_id.\n\n"
-                          "Pass `target_slug` (or `target_id`) to link this run to a Target."),
+                          "**`target_slug` is REQUIRED.** Create a Target first with "
+                          "`create_target` if none exists. Calls without `target_slug` "
+                          "are rejected with a 400 error."),
              inputSchema={"type": "object",
                           "properties": {"slug": {"type": "string"},
                                          "input": {"type": "string"},
-                                         "target_slug": {"type": ["string", "null"]},
+                                         "target_slug": {"type": "string",
+                                                         "description": "Slug of the Target this run is delivering against. REQUIRED."},
                                          "target_id": {"type": ["string", "null"]}},
-                          "required": ["slug", "input"]}),
+                          "required": ["slug", "input", "target_slug"]}),
         Tool(name="run_status",
              description=("Return the current Run row: status, output, error, tokens, "
                           "and (for workflows) `limit_reached` if a budget cap stopped it.\n\n"
@@ -488,7 +493,8 @@ async def _list_tools() -> list[Tool]:
                           "  ],\n"
                           "  \"target_slug\":\"us1924311-acsb-alerts\"\n"
                           "}}\n"
-                          "```"),
+                          "```\n\n"
+                          "**`target_slug` is REQUIRED.** Calls without it are rejected with a 400 error."),
              inputSchema={"type": "object",
                           "properties": {
                               "agents": {"type": "array", "minItems": 1, "maxItems": 20,
@@ -498,11 +504,12 @@ async def _list_tools() -> list[Tool]:
                                              "node_id": {"type": "string"},
                                          }, "required": ["slug"]}},
                               "target_id": {"type": ["string", "null"]},
-                              "target_slug": {"type": ["string", "null"]},
+                              "target_slug": {"type": "string",
+                                              "description": "Slug of the Target this fan-out is delivering against. REQUIRED."},
                               "max_hops": {"type": ["integer", "null"]},
                               "max_tokens": {"type": ["integer", "null"]},
                           },
-                          "required": ["agents"]}),
+                          "required": ["agents", "target_slug"]}),
         Tool(name="run_tree",
              description=("Recursive run tree (root + descendants) with rolled-up "
                           "totals — tokens, costs, hops/tokens budget."),
@@ -984,23 +991,35 @@ async def _list_tools() -> list[Tool]:
             name=f"agent_{a['slug'].replace('-', '_')}",
             description=(f"Run agent **{a['name']}** and wait for the result. "
                          f"{a['description']}\n\n"
+                         f"**`target_slug` is REQUIRED** — create a Target first with "
+                         f"`create_target` if none exists. Calls without it are rejected.\n\n"
                          f"Equivalent to `run_agent_async`(slug={a['slug']!r}) + poll."),
             inputSchema={"type": "object",
-                         "properties": {"input": {"type": "string",
-                                                  "description": "User input passed to the agent."}},
-                         "required": ["input"]},
+                         "properties": {
+                             "input": {"type": "string",
+                                       "description": "User input passed to the agent."},
+                             "target_slug": {"type": "string",
+                                             "description": "Slug of the Target this run delivers against. REQUIRED."},
+                         },
+                         "required": ["input", "target_slug"]},
         ))
     for w in workflows:
         dynamic.append(Tool(
             name=f"workflow_{w['slug'].replace('-', '_')}",
             description=(f"Run workflow **{w['name']}** ({w['kind']}) and wait for "
                          f"completion. {w['description']}\n\n"
+                         f"**`target_slug` is REQUIRED** — create a Target first with "
+                         f"`create_target` if none exists. Calls without it are rejected.\n\n"
                          f"Equivalent to `run_workflow_async`(slug={w['slug']!r}) + poll. "
                          f"If `graph.max_hops` / `graph.max_tokens` are set, the run "
                          f"may stop gracefully with `output.limit_reached`."),
             inputSchema={"type": "object",
-                         "properties": {"input": {"type": "string"}},
-                         "required": ["input"]},
+                         "properties": {
+                             "input": {"type": "string"},
+                             "target_slug": {"type": "string",
+                                             "description": "Slug of the Target this run delivers against. REQUIRED."},
+                         },
+                         "required": ["input", "target_slug"]},
         ))
 
     return static + dynamic
@@ -1104,25 +1123,23 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
 
         # --- runs ---
         if name == "run_agent_async":
-            extra: dict[str, Any] = {}
+            if not args.get("target_slug") and not args.get("target_id"):
+                return _err(400, "target_slug is required. Use list_targets to find an existing Target or create_target to make one, then pass target_slug.")
+            body: dict[str, Any] = {"input": {"input": args["input"]}}
             if args.get("target_id"):
-                extra["target_id"] = args["target_id"]
+                body["target_id"] = args["target_id"]
             if args.get("target_slug"):
-                extra["target_slug"] = args["target_slug"]
-            body = {"input": {"input": args["input"]}}
-            if extra:
-                body["input"]["extra"] = extra
+                body["target_slug"] = args["target_slug"]
             r = await c.post(f"{BASE}/api/agents/{args['slug']}/run", json=body)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "run_workflow_async":
-            extra = {}
-            if args.get("target_id"):
-                extra["target_id"] = args["target_id"]
-            if args.get("target_slug"):
-                extra["target_slug"] = args["target_slug"]
+            if not args.get("target_slug") and not args.get("target_id"):
+                return _err(400, "target_slug is required. Use list_targets to find an existing Target or create_target to make one, then pass target_slug.")
             body = {"input": {"input": args["input"]}}
-            if extra:
-                body["input"]["extra"] = extra
+            if args.get("target_id"):
+                body["target_id"] = args["target_id"]
+            if args.get("target_slug"):
+                body["target_slug"] = args["target_slug"]
             r = await c.post(f"{BASE}/api/workflows/{args['slug']}/run", json=body)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name in ("run_status", "get_run"):
@@ -1163,6 +1180,8 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
             r = await c.get(f"{BASE}/api/runs/{args['run_id']}/peek", params=params)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "run_agents_parallel":
+            if not args.get("target_slug") and not args.get("target_id"):
+                return _err(400, "target_slug is required. Use list_targets to find an existing Target or create_target to make one, then pass target_slug.")
             r = await c.post(f"{BASE}/api/runs/parallel", json=args)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "cancel_run":
@@ -1359,17 +1378,29 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
 
         # --- dynamic per-resource runners (blocking) ---
         if name.startswith("agent_"):
+            if not args.get("target_slug") and not args.get("target_id"):
+                return _err(400, "target_slug is required. Use list_targets to find an existing Target or create_target to make one, then pass target_slug.")
             slug = _slug_from("agent_", name)
-            r = await c.post(f"{BASE}/api/agents/{slug}/run",
-                             json={"input": {"input": args.get("input", "")}})
+            body: dict[str, Any] = {"input": {"input": args.get("input", "")}}
+            if args.get("target_slug"):
+                body["target_slug"] = args["target_slug"]
+            if args.get("target_id"):
+                body["target_id"] = args["target_id"]
+            r = await c.post(f"{BASE}/api/agents/{slug}/run", json=body)
             if r.status_code != 200:
                 return _err(r.status_code, r.text)
             run = await _poll_run(c, r.json()["run_id"])
             return _ok(run)
         if name.startswith("workflow_"):
+            if not args.get("target_slug") and not args.get("target_id"):
+                return _err(400, "target_slug is required. Use list_targets to find an existing Target or create_target to make one, then pass target_slug.")
             slug = _slug_from("workflow_", name)
-            r = await c.post(f"{BASE}/api/workflows/{slug}/run",
-                             json={"input": {"input": args.get("input", "")}})
+            body = {"input": {"input": args.get("input", "")}}
+            if args.get("target_slug"):
+                body["target_slug"] = args["target_slug"]
+            if args.get("target_id"):
+                body["target_id"] = args["target_id"]
+            r = await c.post(f"{BASE}/api/workflows/{slug}/run", json=body)
             if r.status_code != 200:
                 return _err(r.status_code, r.text)
             run = await _poll_run(c, r.json()["run_id"])

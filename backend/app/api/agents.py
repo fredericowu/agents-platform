@@ -215,16 +215,18 @@ async def run_agent_ep(slug: str, body: RunInput, s: Session = Depends(get_sessi
     if not a:
         raise HTTPException(404, "not found")
     payload = body.input.get("input", "") if isinstance(body.input, dict) else str(body.input)
-    # Pluck the optional Target linkage from input.extra (if present) so external
-    # callers can associate runs with a Target at dispatch time.
+    # Prefer first-class body fields; fall back to legacy input.extra for compat.
     extra = body.input.get("extra", {}) if isinstance(body.input, dict) else {}
-    target_id = extra.get("target_id") if isinstance(extra, dict) else None
-    target_slug = extra.get("target_slug") if isinstance(extra, dict) else None
+    target_id = body.target_id or (extra.get("target_id") if isinstance(extra, dict) else None)
+    target_slug = body.target_slug or (extra.get("target_slug") if isinstance(extra, dict) else None)
     if target_id is None and target_slug:
         from ..models import Target
         t = s.query(Target).filter(Target.slug == target_slug).first()
-        if t is not None:
-            target_id = t.id
+        if t is None:
+            raise HTTPException(404, f"target slug '{target_slug}' not found")
+        target_id = t.id
+    if target_id is None:
+        raise HTTPException(400, "target_slug is required — pass a target_slug to link this run to a delivery Target")
     try:
         rid = start_agent_run_bg(slug, payload, target_id=target_id)
     except __import__("backend.app.core.executor", fromlist=["TargetBudgetExceeded"]).TargetBudgetExceeded as e:

@@ -58,6 +58,7 @@ async def run_agent(
     initiator_kind: str = "agent_run",
     initiator_id: str | None = None,
     node_id: str | None = None,
+    target_id: str | None = None,
     extra_messages: list[dict] | None = None,
 ) -> dict[str, Any]:
     """Run an agent and return ``{run_id, text, status, error, tokens_in, tokens_out}``.
@@ -80,25 +81,40 @@ async def run_agent(
             raise ValueError(f"agent soft-deleted: {agent_slug} — restore it first")
         runtime = _agent_to_runtime(s, agent)
         agent_name = agent.name
+        # Resolve target_slug: prefer the actual Target's slug; fall back to
+        # agent slug only if no target_id is available (legacy / child run paths).
+        _run_target_slug = agent_slug
+        if target_id is None and parent_run_id:
+            # Inherit target from the parent run so child rows are always linked.
+            parent_row = s.query(Run).filter(Run.id == parent_run_id).first()
+            if parent_row and parent_row.target_id:
+                target_id = parent_row.target_id
+        if target_id:
+            from ..models import Target as _Target
+            _t = s.query(_Target).filter(_Target.id == target_id).first()
+            if _t:
+                _run_target_slug = _t.slug
         if own_row:
-            r = Run(kind="agent", target_slug=agent_slug, status="running",
+            r = Run(kind="agent", target_slug=_run_target_slug, status="running",
                     input={"input": user_input},
                     parent_run_id=parent_run_id,
                     initiator_kind=initiator_kind,
                     initiator_id=initiator_id,
                     node_id=node_id,
+                    target_id=target_id,
                     model_slug=runtime["model_slug"])
             s.add(r); s.flush()
             run_id = r.id
         else:
             r = s.query(Run).filter(Run.id == run_id).first()
             if r is None:
-                r = Run(id=run_id, kind="agent", target_slug=agent_slug, status="running",
+                r = Run(id=run_id, kind="agent", target_slug=_run_target_slug, status="running",
                         input={"input": user_input},
                         parent_run_id=parent_run_id,
                         initiator_kind=initiator_kind,
                         initiator_id=initiator_id,
                         node_id=node_id,
+                        target_id=target_id,
                         model_slug=runtime["model_slug"])
                 s.add(r)
 
@@ -272,6 +288,7 @@ async def run_workflow(
     parent_run_id: str | None = None,
     initiator_kind: str = "workflow_run",
     initiator_id: str | None = None,
+    target_id: str | None = None,
 ) -> dict[str, Any]:
     with session_scope() as s:
         wf = s.query(Workflow).filter(Workflow.slug == workflow_slug).first()
@@ -283,11 +300,24 @@ async def run_workflow(
         graph = dict(wf.graph or {})
         name = wf.name
         if run_id is None:
-            r = Run(kind="workflow", target_slug=workflow_slug, status="running",
+            # Inherit target from parent run if not supplied directly.
+            if target_id is None and parent_run_id:
+                parent_row = s.query(Run).filter(Run.id == parent_run_id).first()
+                if parent_row and parent_row.target_id:
+                    target_id = parent_row.target_id
+            # Resolve target_slug from the actual Target row.
+            _wf_target_slug = workflow_slug
+            if target_id:
+                from ..models import Target as _Target
+                _t = s.query(_Target).filter(_Target.id == target_id).first()
+                if _t:
+                    _wf_target_slug = _t.slug
+            r = Run(kind="workflow", target_slug=_wf_target_slug, status="running",
                     input={"input": user_input},
                     parent_run_id=parent_run_id,
                     initiator_kind=initiator_kind,
-                    initiator_id=initiator_id or workflow_slug)
+                    initiator_id=initiator_id or workflow_slug,
+                    target_id=target_id)
             s.add(r); s.flush()
             run_id = r.id
 
@@ -327,6 +357,7 @@ async def run_workflow(
                 parent_run_id=run_id,
                 initiator_kind="workflow_run",
                 initiator_id=workflow_slug,
+                target_id=target_id,
             )
             import json as _json
             txt = (_json.dumps(res.get("output"), default=str)
@@ -348,6 +379,7 @@ async def run_workflow(
             initiator_kind="workflow_run",
             initiator_id=workflow_slug,
             node_id=node_id,
+            target_id=target_id,
         )
 
     err: str | None = None
@@ -465,16 +497,24 @@ def start_agent_run_bg(agent_slug: str, user_input: str, *,
                        node_id: str | None = None,
                        target_id: str | None = None) -> str:
     """Schedule an agent run in the background; return its run_id."""
+    if target_id is None and parent_run_id is None:
+        raise ValueError("target_id is required for top-level agent runs")
     _check_target_budget(target_id)
     with session_scope() as s:
-        from ..models import Agent, Model
+        from ..models import Agent, Model, Target as _Target
         agent = s.query(Agent).filter(Agent.slug == agent_slug).first()
         model_slug = None
         if agent and agent.model_slug:
             m = s.query(Model).filter(Model.slug == agent.model_slug).first()
             if m:
                 model_slug = m.slug
-        r = Run(kind="agent", target_slug=agent_slug, status="running",
+        # Resolve target_slug from the actual Target row (not the agent slug).
+        _run_target_slug = agent_slug  # fallback
+        if target_id:
+            _t = s.query(_Target).filter(_Target.id == target_id).first()
+            if _t:
+                _run_target_slug = _t.slug
+        r = Run(kind="agent", target_slug=_run_target_slug, status="running",
                 input={"input": user_input},
                 initiator_kind=initiator_kind,
                 initiator_id=initiator_id,
@@ -502,9 +542,17 @@ def start_workflow_run_bg(workflow_slug: str, user_input: Any, *,
                           initiator_kind: str = "workflow_run",
                           initiator_id: str | None = None,
                           target_id: str | None = None) -> str:
+    if target_id is None:
+        raise ValueError("target_id is required for workflow runs")
     _check_target_budget(target_id)
     with session_scope() as s:
-        r = Run(kind="workflow", target_slug=workflow_slug, status="running",
+        from ..models import Target as _Target
+        # Resolve target_slug from the actual Target row.
+        _wf_target_slug = workflow_slug  # fallback
+        _t = s.query(_Target).filter(_Target.id == target_id).first()
+        if _t:
+            _wf_target_slug = _t.slug
+        r = Run(kind="workflow", target_slug=_wf_target_slug, status="running",
                 input={"input": user_input},
                 initiator_kind=initiator_kind,
                 initiator_id=initiator_id or workflow_slug,
@@ -517,7 +565,8 @@ def start_workflow_run_bg(workflow_slug: str, user_input: Any, *,
             await run_workflow(workflow_slug, user_input,
                                run_id=rid,
                                initiator_kind=initiator_kind,
-                               initiator_id=initiator_id or workflow_slug)
+                               initiator_id=initiator_id or workflow_slug,
+                               target_id=target_id)
         finally:
             await bus.close(rid)
 

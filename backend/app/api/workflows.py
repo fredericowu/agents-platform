@@ -198,14 +198,17 @@ async def run_workflow_ep(slug: str, body: RunInput, s: Session = Depends(get_se
     if not w:
         raise HTTPException(404, "not found")
     payload = body.input.get("input") if isinstance(body.input, dict) and "input" in body.input else body.input
+    # Prefer first-class body fields; fall back to legacy input.extra for compat.
     extra = body.input.get("extra", {}) if isinstance(body.input, dict) else {}
-    target_id = extra.get("target_id") if isinstance(extra, dict) else None
-    target_slug = extra.get("target_slug") if isinstance(extra, dict) else None
+    target_id = body.target_id or (extra.get("target_id") if isinstance(extra, dict) else None)
+    target_slug = body.target_slug or (extra.get("target_slug") if isinstance(extra, dict) else None)
     if target_id is None and target_slug:
         from ..models import Target
         t = s.query(Target).filter(Target.slug == target_slug).first()
         if t is not None:
             target_id = t.id
+    if target_id is None:
+        raise HTTPException(400, "target_slug is required — pass a target_slug to link this run to a delivery Target")
     try:
         rid = start_workflow_run_bg(slug, payload, target_id=target_id)
     except __import__("backend.app.core.executor", fromlist=["TargetBudgetExceeded"]).TargetBudgetExceeded as e:
