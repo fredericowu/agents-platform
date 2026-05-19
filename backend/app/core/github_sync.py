@@ -96,16 +96,17 @@ async def create_target_issue(
 ---
 *Managed by [Agents Platform](http://localhost:9123)*"""
 
+    # gh issue create outputs the issue URL as plain text (e.g. https://github.com/owner/repo/issues/42)
     result = await _run_gh("issue", "create",
         "--title", f"[Target] {target_name}",
         "--body", body,
         "--label", "type:target,status:ready",
-        "--json", "number",
     )
     if result:
         try:
-            return json.loads(result).get("number")
+            return int(result.rstrip("/").split("/")[-1])
         except Exception:
+            logger.warning("Could not parse issue number from: %s", result)
             return None
     return None
 
@@ -151,12 +152,12 @@ async def create_run_issue(
         "--title", f"[Run] {agent_slug}: {input_summary[:60]}{'...' if len(input_summary) > 60 else ''}",
         "--body", body,
         "--label", ",".join(labels),
-        "--json", "number",
     )
     if result:
         try:
-            return json.loads(result).get("number")
+            return int(result.rstrip("/").split("/")[-1])
         except Exception:
+            logger.warning("Could not parse issue number from: %s", result)
             return None
     return None
 
