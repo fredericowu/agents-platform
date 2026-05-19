@@ -1,0 +1,525 @@
+"""Run an agent or a workflow. Emits events to the bus and updates Run rows.
+
+Lineage:
+  * Every Run row carries ``parent_run_id`` (NULL = root) and ``initiator_kind``
+    (``agent_run``, ``workflow_run``, ``chat``, ``eval``, ``mcp``, ``cli``).
+  * Workflow children are real Run rows whose parent is the workflow's run.
+  * Events on a child node are also published on the *parent*'s event channel
+    so a single SSE subscription gives the UI the whole tree.
+"""
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy.orm import Session
+
+from ..db import session_scope
+from ..models import Agent, Run, Workflow
+from .retro_scorer import score_run_terminal
+from .agent_loop import _provider_supports_langchain, run_langchain_agent
+from .cancel import Cancelled, is_cancelled
+from .events import bus
+from . import hops
+from .models import make_llm
+from .orchestrators import dispatch as dispatch_workflow
+from .tools.langchain_tools import tools_for_agent
+
+
+def _agent_to_runtime(s: Session, agent: Agent) -> dict[str, Any]:
+    from ..models import Model
+    provider = "echo"
+    model_id = "echo"
+    model_slug = None
+    params: dict[str, Any] = {}
+    if agent.model_slug:
+        m = s.query(Model).filter(Model.slug == agent.model_slug).first()
+        if m:
+            provider = m.provider
+            model_id = m.model_id
+            params = dict(m.params or {})
+            model_slug = m.slug
+    params.update(agent.params or {})
+    return {"provider": provider, "model_id": model_id, "model_slug": model_slug,
+            "params": params,
+            "system_prompt": agent.system_prompt or "",
+            "tool_specs": list(agent.tool_specs or []),
+            "skill_slugs": list(agent.skill_slugs or [])}
+
+
+async def run_agent(
+    agent_slug: str,
+    user_input: str,
+    *,
+    run_id: str | None = None,
+    event_run_id: str | None = None,
+    parent_run_id: str | None = None,
+    initiator_kind: str = "agent_run",
+    initiator_id: str | None = None,
+    node_id: str | None = None,
+    extra_messages: list[dict] | None = None,
+) -> dict[str, Any]:
+    """Run an agent and return ``{run_id, text, status, error, tokens_in, tokens_out}``.
+
+    ``run_id``      attach to existing row (no parent set)
+    ``event_run_id`` publish events on this id too (so workflows roll up nicely)
+    """
+    # If the workflow that spawned us was already cancelled (or our own row was
+    # marked while pending), bail out before spinning up an LLM subprocess.
+    if is_cancelled(parent_run_id) or is_cancelled(event_run_id):
+        return {"run_id": None, "text": "", "status": "cancelled",
+                "error": "parent workflow cancelled", "tokens_in": 0, "tokens_out": 0}
+
+    own_row = run_id is None
+    with session_scope() as s:
+        agent = s.query(Agent).filter(Agent.slug == agent_slug).first()
+        if not agent:
+            raise ValueError(f"agent not found: {agent_slug}")
+        if agent.deleted_at is not None:
+            raise ValueError(f"agent soft-deleted: {agent_slug} — restore it first")
+        runtime = _agent_to_runtime(s, agent)
+        agent_name = agent.name
+        if own_row:
+            r = Run(kind="agent", target_slug=agent_slug, status="running",
+                    input={"input": user_input},
+                    parent_run_id=parent_run_id,
+                    initiator_kind=initiator_kind,
+                    initiator_id=initiator_id,
+                    node_id=node_id,
+                    model_slug=runtime["model_slug"])
+            s.add(r); s.flush()
+            run_id = r.id
+        else:
+            r = s.query(Run).filter(Run.id == run_id).first()
+            if r is None:
+                r = Run(id=run_id, kind="agent", target_slug=agent_slug, status="running",
+                        input={"input": user_input},
+                        parent_run_id=parent_run_id,
+                        initiator_kind=initiator_kind,
+                        initiator_id=initiator_id,
+                        node_id=node_id,
+                        model_slug=runtime["model_slug"])
+                s.add(r)
+
+    ev_ids = {run_id}
+    if event_run_id and event_run_id != run_id:
+        ev_ids.add(event_run_id)
+
+    async def emit(kind: str, payload: dict | None = None, node: str | None = None):
+        for eid in ev_ids:
+            await bus.publish(eid, kind, payload or {}, node_id=node or agent_slug)
+
+    await emit("node_start", {"label": agent_name, "agent": agent_slug,
+                              "provider": runtime["provider"],
+                              "model": runtime["model_id"],
+                              "model_slug": runtime["model_slug"],
+                              "run_id": run_id,
+                              "parent_run_id": parent_run_id}, node=node_id or agent_slug)
+
+    text = ""
+    tin = tout = 0
+    cost = 0.0
+    err: str | None = None
+    try:
+        from .skills import load_skill
+        sys_blocks = [runtime["system_prompt"]] if runtime["system_prompt"] else []
+        for sslug in runtime["skill_slugs"]:
+            content = load_skill(sslug)
+            if content:
+                sys_blocks.append(f"[skill:{sslug}]\n{content}")
+        messages: list[dict] = []
+        if sys_blocks:
+            messages.append({"role": "system", "content": "\n\n".join(sys_blocks)})
+        if extra_messages:
+            messages.extend(extra_messages)
+        messages.append({"role": "user", "content": user_input})
+
+        # Tag this run for subprocess registry (cli_subshell only — harmless otherwise).
+        from .models.cli_subshell import current_run_id
+        from .tools.code import current_agent_params
+        token = current_run_id.set(run_id)
+        # Make the agent's params visible to the run_command gate so per-agent
+        # security_mode / command_allowlist overrides are honored.
+        params_token = current_agent_params.set(runtime["params"])
+        try:
+            if _provider_supports_langchain(runtime["provider"]):
+                # ───── API-direct providers via LangGraph ReAct loop ─────
+                tools = await tools_for_agent(runtime["tool_specs"])
+                async def _emit(kind: str, payload: dict, nid: str | None):
+                    await emit(kind, payload, node=nid or node_id or agent_slug)
+                res = await run_langchain_agent(
+                    provider=runtime["provider"],
+                    model_id=runtime["model_id"],
+                    params=runtime["params"],
+                    system_prompt="\n\n".join(sys_blocks) if sys_blocks else "",
+                    extra_messages=extra_messages or [],
+                    user_message=user_input,
+                    tools=tools,
+                    emit=_emit,
+                    node_id=node_id or agent_slug,
+                    cancel_check=lambda: is_cancelled(run_id) or is_cancelled(event_run_id) or is_cancelled(parent_run_id),
+                )
+                text = res.text
+                tin = max(tin, res.tokens_in)
+                tout = max(tout, res.tokens_out)
+                cost = max(cost, res.cost_usd)
+            else:
+                # ───── CLI subshell + echo path (text-only stream) ─────
+                llm = make_llm(runtime["provider"], runtime["model_id"], **runtime["params"])
+                async for chunk in llm.astream(messages):
+                    meta_kind = getattr(chunk, "meta_kind", None)
+                    meta_payload = getattr(chunk, "meta_payload", None)
+                    if meta_kind:
+                        await emit(meta_kind, meta_payload or {}, node=node_id or agent_slug)
+                    if chunk.delta:
+                        text += chunk.delta
+                        await emit("llm_token", {"delta": chunk.delta}, node=node_id or agent_slug)
+                    if chunk.tokens_in:
+                        tin = max(tin, chunk.tokens_in)
+                    if chunk.tokens_out:
+                        tout = max(tout, chunk.tokens_out)
+                    if chunk.cost_usd:
+                        cost = max(cost, chunk.cost_usd)
+        finally:
+            try: current_run_id.reset(token)
+            except Exception: pass
+            try: current_agent_params.reset(params_token)
+            except Exception: pass
+    except Exception as e:
+        err = str(e)
+        await emit("error", {"error": err}, node=node_id or agent_slug)
+
+    # Marker: streaming done, status flip imminent. Lets clients stop watching
+    # for new llm_token events and start expecting a terminal status.
+    await emit("finalizing", {"tokens_in": tin, "tokens_out": tout, "cost_usd": cost},
+               node=node_id or agent_slug)
+
+    # Cancel-grace: if the work actually completed (output present, no error)
+    # but a cancel signal arrived during finalisation, preserve the output.
+    # Status becomes 'success' with a note instead of overwriting work.
+    cancelled = (is_cancelled(run_id) or is_cancelled(event_run_id)
+                 or is_cancelled(parent_run_id))
+    work_completed = bool(text) and not err
+    if cancelled and work_completed:
+        # Treat as graceful late-cancel — preserve the output.
+        status = "success"
+        err = "cancel received after completion — output preserved"
+    elif cancelled:
+        status = "cancelled"
+        if not err:
+            err = "cancelled by user"
+    else:
+        status = "error" if err else "success"
+    with session_scope() as s:
+        r = s.query(Run).filter(Run.id == run_id).first()
+        if r:
+            r.status = status
+            r.output = {"text": text}
+            r.error = err
+            r.tokens_in = tin
+            r.tokens_out = tout
+            r.cost_usd = cost
+            r.ended_at = datetime.utcnow()
+    score_run_terminal(run_id)
+    await emit("node_end", {"text": text[:500], "tokens_in": tin, "tokens_out": tout,
+                            "cost_usd": cost, "run_id": run_id},
+               node=node_id or agent_slug)
+    return {"run_id": run_id, "text": text, "status": status, "error": err,
+            "tokens_in": tin, "tokens_out": tout, "cost_usd": cost}
+
+
+# ---------------- workflow execution ----------------
+
+def _depth_of(run_id: str | None) -> int:
+    """How many workflow ancestors does this run have? Used to cap recursion."""
+    if not run_id:
+        return 0
+    depth = 0
+    cur = run_id
+    seen: set[str] = set()
+    with session_scope() as s:
+        while cur and cur not in seen and depth < 20:
+            seen.add(cur)
+            row = s.query(Run).filter(Run.id == cur).first()
+            if row is None or row.parent_run_id is None:
+                break
+            cur = row.parent_run_id
+            depth += 1
+    return depth
+
+
+def _root_run_id(run_id: str | None) -> str | None:
+    """Walk up parent_run_id until NULL → returns the root workflow's run_id."""
+    if not run_id:
+        return None
+    cur = run_id
+    seen: set[str] = set()
+    with session_scope() as s:
+        while cur and cur not in seen:
+            seen.add(cur)
+            row = s.query(Run).filter(Run.id == cur).first()
+            if row is None or row.parent_run_id is None:
+                return cur
+            cur = row.parent_run_id
+    return run_id
+
+async def run_workflow(
+    workflow_slug: str,
+    user_input: Any,
+    *,
+    run_id: str | None = None,
+    parent_run_id: str | None = None,
+    initiator_kind: str = "workflow_run",
+    initiator_id: str | None = None,
+) -> dict[str, Any]:
+    with session_scope() as s:
+        wf = s.query(Workflow).filter(Workflow.slug == workflow_slug).first()
+        if not wf:
+            raise ValueError(f"workflow not found: {workflow_slug}")
+        if wf.deleted_at is not None:
+            raise ValueError(f"workflow soft-deleted: {workflow_slug} — restore it first")
+        kind = wf.kind
+        graph = dict(wf.graph or {})
+        name = wf.name
+        if run_id is None:
+            r = Run(kind="workflow", target_slug=workflow_slug, status="running",
+                    input={"input": user_input},
+                    parent_run_id=parent_run_id,
+                    initiator_kind=initiator_kind,
+                    initiator_id=initiator_id or workflow_slug)
+            s.add(r); s.flush()
+            run_id = r.id
+
+    # Budget setup: the root workflow owns a shared budget the whole tree
+    # charges against (both hops + tokens). Sub-workflows reuse it
+    # (no re-init / no double clear).
+    root_id = _root_run_id(run_id) or run_id
+    own_counter = (parent_run_id is None) and not hops.has(root_id)
+    if own_counter:
+        max_hops = int(graph.get("max_hops") or hops.DEFAULT_MAX_HOPS)
+        max_tokens = int(graph.get("max_tokens") or hops.DEFAULT_MAX_TOKENS)
+        hops.init(root_id, max_hops=max_hops, max_tokens=max_tokens)
+        budget_msg = f"hop limit {max_hops}"
+        if max_tokens:
+            budget_msg += f", token limit {max_tokens}"
+        else:
+            budget_msg += ", token limit unlimited"
+        await bus.publish(run_id, "log", {"msg": f"budget: {budget_msg}"})
+
+    await bus.publish(run_id, "log", {"msg": f"start workflow {name} ({kind})"})
+
+    # Children: own row, parent set, events also bubble to workflow's run_id.
+    # If a node's "agent" slug starts with ``workflow:`` we spawn a SUB-WORKFLOW
+    # instead of an agent run. Lineage threads through the parent_run_id.
+    async def child_agent(slug: str, payload: str, **kwargs):
+        node_id = kwargs.get("node_id")
+        if isinstance(slug, str) and slug.startswith("workflow:"):
+            sub_slug = slug[len("workflow:"):]
+            # cycle / runaway-recursion guard: max 5 levels of sub-workflow
+            depth = _depth_of(run_id) + 1
+            if depth > 5:
+                return {"run_id": None, "text": "", "status": "error",
+                        "error": f"sub-workflow depth limit exceeded at {sub_slug}",
+                        "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0}
+            res = await run_workflow(
+                sub_slug, payload,
+                parent_run_id=run_id,
+                initiator_kind="workflow_run",
+                initiator_id=workflow_slug,
+            )
+            import json as _json
+            txt = (_json.dumps(res.get("output"), default=str)
+                   if res.get("output") is not None else "")
+            return {
+                "run_id": res.get("run_id"),
+                "text": txt,
+                "status": res.get("status"),
+                "error": res.get("error"),
+                "tokens_in": res.get("tokens_in", 0),
+                "tokens_out": res.get("tokens_out", 0),
+                "cost_usd": res.get("cost_usd", 0.0),
+            }
+        return await run_agent(
+            slug, payload,
+            run_id=None,
+            event_run_id=run_id,
+            parent_run_id=run_id,
+            initiator_kind="workflow_run",
+            initiator_id=workflow_slug,
+            node_id=node_id,
+        )
+
+    err: str | None = None
+    final: Any = None
+    cancelled = False
+    limit_reached: str | None = None    # "hops" | "tokens" | None
+    try:
+        final = await dispatch_workflow(kind, graph, user_input, run_id,
+                                        child_agent, root_run_id=root_id)
+    except Cancelled as ce:
+        cancelled = True
+        await bus.publish(run_id, "log", {"msg": str(ce)})
+    except hops.BudgetExceeded as be:
+        # Safety net — orchestrators *should* catch this internally and return
+        # a partial result with `limit_reached` set. If a future orchestrator
+        # forgets, we still stop gracefully here (no error status).
+        limit_reached = be.reason
+        final = {"limit_reached": be.reason, f"{be.reason}_limit_reached": True,
+                 "message": str(be)}
+        await bus.publish(run_id, "log",
+                          {"msg": f"budget reached ({be.reason}): {be}",
+                           "budget": hops.get(root_id)})
+    except Exception as e:
+        err = str(e)
+        await bus.publish(run_id, "error", {"error": err})
+
+    # If the orchestrator returned a dict with `limit_reached`, surface it on
+    # the workflow's run too, so the parent (and the UI) can see the cap.
+    if isinstance(final, dict) and final.get("limit_reached") and not limit_reached:
+        limit_reached = str(final.get("limit_reached") or "budget")
+
+    if cancelled or is_cancelled(run_id):
+        status = "cancelled"
+    elif err:
+        status = "error"
+    else:
+        # NOTE: budget breach is a *graceful* stop — status is success and
+        # the output dict carries the `limit_reached` flag.
+        status = "success"
+    # roll-up totals from children
+    with session_scope() as s:
+        children = s.query(Run).filter(Run.parent_run_id == run_id).all()
+        rollup_in = sum(c.tokens_in for c in children)
+        rollup_out = sum(c.tokens_out for c in children)
+        rollup_cost = sum(c.cost_usd for c in children)
+        r = s.query(Run).filter(Run.id == run_id).first()
+        if r:
+            r.status = status
+            r.output = final if isinstance(final, dict) else {"output": final}
+            r.error = err
+            r.tokens_in = rollup_in
+            r.tokens_out = rollup_out
+            r.cost_usd = rollup_cost
+            r.ended_at = datetime.utcnow()
+    score_run_terminal(run_id)
+    budget_snap = hops.get(root_id)
+    await bus.publish(run_id, "node_end", {"final": "<wf done>",
+                                           "tokens_in": rollup_in,
+                                           "tokens_out": rollup_out,
+                                           "cost_usd": rollup_cost,
+                                           "budget": budget_snap},
+                      node_id="__workflow__")
+    await bus.publish(run_id, "done",
+                      {"status": status, "budget": budget_snap,
+                       "limit_reached": limit_reached})
+    await bus.close(run_id)
+    # Only the root workflow that owns the counter clears it.
+    if own_counter:
+        hops.clear(root_id)
+    return {"run_id": run_id, "status": status, "output": final, "error": err,
+            "tokens_in": rollup_in, "tokens_out": rollup_out, "cost_usd": rollup_cost,
+            "budget": budget_snap, "limit_reached": limit_reached}
+
+
+# ---------------- entry-point helpers ----------------
+
+class TargetBudgetExceeded(Exception):
+    """Raised when a new run dispatch would violate a Target's hard budget."""
+
+
+def _check_target_budget(target_id: str | None) -> None:
+    """If target_id refers to a Target with enforce_budget=true and the rolled-up
+    spend already exceeds its caps, raise TargetBudgetExceeded.
+
+    Called at dispatch time only — once a run is in flight the existing
+    hops/wait_run mechanisms take over."""
+    if not target_id:
+        return
+    with session_scope() as s:
+        from ..models import Run, Target
+        t = s.query(Target).filter(Target.id == target_id,
+                                   Target.deleted_at.is_(None)).first()
+        if t is None or not t.enforce_budget:
+            return
+        if t.status != "active":
+            raise TargetBudgetExceeded(
+                f"target '{t.slug}' is {t.status} — no new runs accepted")
+        if t.budget_tokens is None and t.budget_usd is None:
+            return
+        runs = s.query(Run).filter(Run.target_id == target_id).all()
+        tot_tok = sum((r.tokens_in or 0) + (r.tokens_out or 0) for r in runs)
+        tot_usd = sum(r.cost_usd or 0.0 for r in runs)
+        if t.budget_tokens is not None and tot_tok >= t.budget_tokens:
+            raise TargetBudgetExceeded(
+                f"target '{t.slug}' tokens {tot_tok:,} >= cap {t.budget_tokens:,}")
+        if t.budget_usd is not None and tot_usd >= t.budget_usd:
+            raise TargetBudgetExceeded(
+                f"target '{t.slug}' cost ${tot_usd:.2f} >= cap ${t.budget_usd:.2f}")
+
+
+def start_agent_run_bg(agent_slug: str, user_input: str, *,
+                       initiator_kind: str = "agent_run",
+                       initiator_id: str | None = None,
+                       parent_run_id: str | None = None,
+                       node_id: str | None = None,
+                       target_id: str | None = None) -> str:
+    """Schedule an agent run in the background; return its run_id."""
+    _check_target_budget(target_id)
+    with session_scope() as s:
+        from ..models import Agent, Model
+        agent = s.query(Agent).filter(Agent.slug == agent_slug).first()
+        model_slug = None
+        if agent and agent.model_slug:
+            m = s.query(Model).filter(Model.slug == agent.model_slug).first()
+            if m:
+                model_slug = m.slug
+        r = Run(kind="agent", target_slug=agent_slug, status="running",
+                input={"input": user_input},
+                initiator_kind=initiator_kind,
+                initiator_id=initiator_id,
+                parent_run_id=parent_run_id,
+                node_id=node_id,
+                target_id=target_id,
+                model_slug=model_slug)
+        s.add(r); s.flush()
+        rid = r.id
+
+    async def _go():
+        try:
+            await run_agent(agent_slug, user_input, run_id=rid,
+                            initiator_kind=initiator_kind,
+                            initiator_id=initiator_id)
+        finally:
+            await bus.publish(rid, "done", {})
+            await bus.close(rid)
+
+    asyncio.create_task(_go())
+    return rid
+
+
+def start_workflow_run_bg(workflow_slug: str, user_input: Any, *,
+                          initiator_kind: str = "workflow_run",
+                          initiator_id: str | None = None,
+                          target_id: str | None = None) -> str:
+    _check_target_budget(target_id)
+    with session_scope() as s:
+        r = Run(kind="workflow", target_slug=workflow_slug, status="running",
+                input={"input": user_input},
+                initiator_kind=initiator_kind,
+                initiator_id=initiator_id or workflow_slug,
+                target_id=target_id)
+        s.add(r); s.flush()
+        rid = r.id
+
+    async def _go():
+        try:
+            await run_workflow(workflow_slug, user_input,
+                               run_id=rid,
+                               initiator_kind=initiator_kind,
+                               initiator_id=initiator_id or workflow_slug)
+        finally:
+            await bus.close(rid)
+
+    asyncio.create_task(_go())
+    return rid

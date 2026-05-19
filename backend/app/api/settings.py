@@ -1,0 +1,109 @@
+"""Settings CRUD — global platform configuration.
+
+Persisted via the ``Setting`` model (key/value JSON). Tracked keys:
+
+  * ``command_timeout_seconds`` — timeout for ``code.run_command`` (default 300)
+  * ``security_mode``           — global default ``insecure`` | ``secure``
+  * ``command_allowlist``       — allow-list of command prefixes (secure mode only)
+  * ``command_denylist``        — regex deny-list (always enforced)
+
+Unknown keys are accepted (they round-trip through the API) so future
+settings don't need a code change — but only the ones above are read by
+the engine.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+
+from ..core import security
+
+router = APIRouter(prefix="/api/settings", tags=["settings"])
+
+_KNOWN = {"command_timeout_seconds", "security_mode",
+          "command_allowlist", "command_denylist",
+          "rag_provider", "retro_score_weights"}
+
+
+class SettingPatch(BaseModel):
+    value: Any
+
+
+@router.get("")
+def get_all_settings():
+    """Return the effective settings (DB overrides → compiled defaults)."""
+    from ..core.rag import _default_provider
+    rag = security.get_setting("rag_provider")
+    return {
+        **security.all_settings(),
+        "rag_provider": rag if isinstance(rag, dict) else _default_provider(),
+        # exposed for the UI so it can show "(default)" badges
+        "_defaults": {
+            "command_timeout_seconds": security.DEFAULT_COMMAND_TIMEOUT,
+            "security_mode":           security.DEFAULT_SECURITY_MODE,
+            "command_allowlist":       security.DEFAULT_ALLOWLIST,
+            "command_denylist":        security.DEFAULT_DENYLIST,
+            "rag_provider":            _default_provider(),
+        },
+    }
+
+
+@router.put("/{key}")
+def update_setting(key: str, body: SettingPatch):
+    """Set or replace a setting's value. Validates the known keys' shape."""
+    if key == "command_timeout_seconds":
+        try:
+            v = int(body.value)
+        except Exception:
+            raise HTTPException(400, "command_timeout_seconds must be an integer")
+        if v < 5 or v > 3600:
+            raise HTTPException(400, "command_timeout_seconds must be 5–3600")
+        security.set_setting(key, v)
+    elif key == "security_mode":
+        if body.value not in ("insecure", "secure"):
+            raise HTTPException(400, "security_mode must be 'insecure' or 'secure'")
+        security.set_setting(key, body.value)
+    elif key in ("command_allowlist", "command_denylist"):
+        if not isinstance(body.value, list) or not all(isinstance(x, str) for x in body.value):
+            raise HTTPException(400, f"{key} must be a list of strings")
+        security.set_setting(key, body.value)
+    elif key == "rag_provider":
+        # Loose validation — just ensure it's an object and `kind` is one of the supported ones.
+        if not isinstance(body.value, dict):
+            raise HTTPException(400, "rag_provider must be a JSON object")
+        kind = body.value.get("kind")
+        if kind not in ("disabled", "http", "mcp"):
+            raise HTTPException(400, "rag_provider.kind must be one of: disabled | http | mcp")
+        if kind == "http":
+            if not body.value.get("base_url"):
+                raise HTTPException(400, "rag_provider(http) requires base_url")
+            endpoints = body.value.get("endpoints") or {}
+            for op in ("search", "upsert", "delete"):
+                if op not in endpoints:
+                    raise HTTPException(400, f"rag_provider.endpoints.{op} is required")
+        security.set_setting(key, body.value)
+    elif key == "retro_score_weights":
+        # Dedicated table — validate and write to RetroScoreWeights (not generic store).
+        # The UI should prefer PUT /api/retro-score-weights; this handler exists for
+        # completeness so the settings UI doesn't have to know about the split.
+        from .retro_scores import RetroWeightsIn, set_retro_score_weights
+        from ..db import get_session as _gs
+        if not isinstance(body.value, dict):
+            raise HTTPException(400, "retro_score_weights must be a JSON object {dim: weight}")
+        s = next(_gs())
+        try:
+            return set_retro_score_weights(RetroWeightsIn(weights=body.value), s=s)
+        finally:
+            s.close()
+    else:
+        # Unknown setting: accept verbatim (forward-compatible)
+        security.set_setting(key, body.value)
+    return get_all_settings()
+
+
+@router.post("/reset")
+def reset_settings():
+    """Delete every override — fall back to compiled defaults."""
+    return security.reset_settings()

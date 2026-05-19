@@ -1,0 +1,115 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  height: 100%;
+  background: theme('colors.bg.DEFAULT');
+  color: theme('colors.fg');
+  font-family: theme('fontFamily.sans');
+  font-size: 14px;
+  margin: 0;
+}
+
+* { box-sizing: border-box; }
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: #30363d; border-radius: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+a { color: theme('colors.accent'); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+button, input, select, textarea { font: inherit; color: inherit; }
+input, select, textarea {
+  background: theme('colors.bg.2');
+  border: 1px solid theme('colors.line');
+  border-radius: 6px;
+  padding: 6px 10px;
+  outline: none;
+  width: 100%;
+}
+input:focus, select:focus, textarea:focus { border-color: theme('colors.accent'); }
+
+.btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 12px;
+  background: theme('colors.bg.2');
+  border: 1px solid theme('colors.line');
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 120ms;
+  font-size: 13px;
+  user-select: none;
+}
+.btn:hover { background: theme('colors.bg.3'); border-color: theme('colors.accent'); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-primary { background: theme('colors.accent'); color: #0a0f17; border-color: theme('colors.accent'); font-weight: 600; }
+.btn-primary:hover { filter: brightness(1.1); }
+.btn-danger  { color: theme('colors.err'); border-color: theme('colors.err'); }
+
+.card {
+  background: theme('colors.bg.2');
+  border: 1px solid theme('colors.line');
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.kbd {
+  font-family: theme('fontFamily.mono');
+  background: theme('colors.bg.3');
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  border: 1px solid theme('colors.line');
+}
+
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 600;
+  background: theme('colors.bg.3');
+  color: theme('colors.muted');
+}
+.badge-success { background: rgba(45,212,191,0.15); color: theme('colors.ok'); }
+.badge-error   { background: rgba(248,113,113,0.15); color: theme('colors.err'); }
+.badge-warn    { background: rgba(240,192,0,0.15);   color: theme('colors.warn'); }
+.badge-info    { background: rgba(88,166,255,0.15);  color: theme('colors.accent'); }
+.badge-pending { background: theme('colors.bg.3'); color: theme('colors.muted'); }
+.badge-running { background: rgba(88,166,255,0.15); color: theme('colors.accent'); animation: pulse 1.2s infinite; }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; } 50% { opacity: 0.5; }
+}
+
+.codebox {
+  font-family: theme('fontFamily.mono');
+  background: theme('colors.bg.1');
+  border: 1px solid theme('colors.line');
+  border-radius: 6px;
+  padding: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.react-flow__node {
+  background: theme('colors.bg.2') !important;
+  border: 1.5px solid theme('colors.line') !important;
+  color: theme('colors.fg') !important;
+  border-radius: 8px !important;
+  padding: 10px 14px !important;
+  font-size: 13px !important;
+  min-width: 140px !important;
+}
+.react-flow__node.running { border-color: theme('colors.accent') !important; box-shadow: 0 0 0 3px rgba(88,166,255,0.25); }
+.react-flow__node.done    { border-color: theme('colors.ok') !important; }
+.react-flow__node.error   { border-color: theme('colors.err') !important; }
+.react-flow__node .react-flow__handle { background: theme('colors.line'); border: none; }
+.react-flow__edge-path { stroke: theme('colors.line') !important; stroke-width: 1.5 !important; }
+.react-flow__background { background: theme('colors.bg.DEFAULT') !important; }
+.react-flow__controls { background: theme('colors.bg.2') !important; border: 1px solid theme('colors.line') !important; }
+.react-flow__controls button { background: theme('colors.bg.2') !important; color: theme('colors.fg') !important; border-bottom: 1px solid theme('colors.line') !important; }

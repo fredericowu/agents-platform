@@ -1,0 +1,272 @@
+import { useEffect, useMemo, useState } from "react";
+import { Link, useNavigate, useParams } from "react-router-dom";
+import Page from "../components/Page";
+import { api, type Agent, type Model, type ToolItem, type Skill } from "../lib/api";
+
+const BLANK: Agent = {
+  slug: "", name: "", description: "", system_prompt: "",
+  model_slug: "claude-cli", tool_specs: [], skill_slugs: [],
+  params: {}, icon: "bot", color: "#58a6ff",
+};
+
+export default function AgentEdit() {
+  const { slug } = useParams<{ slug: string }>();
+  const isNew = slug === "new";
+  const nav = useNavigate();
+  const [a, setA] = useState<Agent | null>(null);
+  const [models, setModels] = useState<Model[]>([]);
+  const [tools, setTools] = useState<ToolItem[]>([]);
+  const [skills, setSkills] = useState<Skill[]>([]);
+  const [resettableSet, setResettableSet] = useState<Set<string>>(new Set());
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [runOutput, setRunOutput] = useState<string>("");
+  const [runStatus, setRunStatus] = useState<string>("");
+  const [runInput, setRunInput] = useState("hello");
+
+  useEffect(() => {
+    api.listModels().then(setModels);
+    api.listTools().then(setTools);
+    api.listSkills().then(setSkills);
+    api.listResettableAgents().then(r => setResettableSet(new Set(r))).catch(() => {});
+    if (!slug) return;
+    if (isNew) {
+      setA({ ...BLANK });
+    } else {
+      api.getAgent(slug).then(setA);
+    }
+  }, [slug, isNew]);
+
+  const enabledToolIds = useMemo(() => new Set(a?.tool_specs ?? []), [a]);
+  const enabledSkills  = useMemo(() => new Set(a?.skill_slugs ?? []), [a]);
+
+  if (!a) return <Page title="Agent">…loading…</Page>;
+
+  async function save() {
+    if (!a) return;
+    setSaving(true); setError("");
+    try {
+      if (isNew) {
+        const created = await api.createAgent({
+          slug: a.slug, name: a.name || a.slug, description: a.description,
+          system_prompt: a.system_prompt, model_slug: a.model_slug,
+          tool_specs: a.tool_specs, skill_slugs: a.skill_slugs,
+          params: a.params, color: a.color, icon: a.icon,
+        });
+        nav(`/agents/${created.slug}`);
+      } else if (slug) {
+        await api.saveAgent(slug, {
+          name: a.name, description: a.description, system_prompt: a.system_prompt,
+          model_slug: a.model_slug, tool_specs: a.tool_specs, skill_slugs: a.skill_slugs,
+          params: a.params, color: a.color, icon: a.icon,
+        });
+      }
+    } catch (e: any) { setError(String(e.message || e)); }
+    finally { setSaving(false); }
+  }
+
+  async function remove() {
+    if (!slug || isNew || !a) return;
+    if (!confirm(`Delete agent "${slug}"?`)) return;
+    try { await api.deleteAgent(slug); nav("/agents"); }
+    catch (e: any) { setError(String(e.message || e)); }
+  }
+
+  async function exportSpec() {
+    if (!slug || isNew) return;
+    const spec = await api.exportAgent(slug);
+    const blob = new Blob([JSON.stringify(spec, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `${slug}.agent.json`; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function run() {
+    if (!slug || isNew) return;
+    setRunOutput(""); setRunStatus("running");
+    const { run_id } = await api.runAgent(slug, runInput);
+    const es = new EventSource(`/api/runs/${run_id}/stream`);
+    es.addEventListener("llm_token", (e: any) => {
+      try { setRunOutput(o => o + (JSON.parse(e.data).payload.delta || "")); } catch {}
+    });
+    es.addEventListener("node_end", () => { setRunStatus("success"); es.close(); });
+    es.addEventListener("error", () => { setRunStatus("error"); es.close(); });
+    es.addEventListener("done", () => { setRunStatus("done"); es.close(); });
+  }
+
+  function toggleTool(id: string) {
+    if (!a) return;
+    const next = a.tool_specs.includes(id)
+      ? a.tool_specs.filter(t => t !== id)
+      : [...a.tool_specs, id];
+    setA({ ...a, tool_specs: next });
+  }
+  function toggleSkill(slug: string) {
+    if (!a) return;
+    const next = a.skill_slugs.includes(slug)
+      ? a.skill_slugs.filter(t => t !== slug)
+      : [...a.skill_slugs, slug];
+    setA({ ...a, skill_slugs: next });
+  }
+
+  return (
+    <Page title={isNew ? "New agent" : a.name} subtitle={isNew ? "Define a new agent profile." : a.description}
+          actions={
+            <>
+              <Link to="/agents" className="btn">← back</Link>
+              {!isNew && (
+                <button className="btn" onClick={exportSpec} data-testid="agent-export">export</button>
+              )}
+              {!isNew && slug && resettableSet.has(slug) && (
+                <button className="btn" data-testid="agent-reset"
+                        onClick={async () => {
+                          if (!confirm(`Reset "${slug}" to its seed defaults? Your edits will be lost.`)) return;
+                          try { const next = await api.resetAgent(slug); setA(next); }
+                          catch (e: any) { setError(String(e.message || e)); }
+                        }}>reset to default</button>
+              )}
+              {!isNew && (
+                <button className="btn btn-danger" onClick={remove} data-testid="agent-delete">delete</button>
+              )}
+              <button className="btn btn-primary" onClick={save} disabled={saving} data-testid="agent-save">
+                {saving ? "saving..." : (isNew ? "create" : "save")}
+              </button>
+            </>
+          }>
+      {error && <div className="codebox text-err mb-3" data-testid="agent-error">{error}</div>}
+      <div className="grid grid-cols-3 gap-4">
+        <div className="col-span-2 space-y-4">
+          <div className="card">
+            <h2 className="text-base font-semibold mb-3">Configuration</h2>
+            {isNew && (
+              <>
+                <label className="block text-xs text-muted mb-1">slug</label>
+                <input value={a.slug} onChange={e => setA({ ...a, slug: e.target.value })}
+                       data-testid="agent-slug" />
+              </>
+            )}
+            <label className="block text-xs text-muted mt-3 mb-1">name</label>
+            <input value={a.name} onChange={e => setA({ ...a, name: e.target.value })} data-testid="agent-name" />
+            <label className="block text-xs text-muted mt-3 mb-1">description</label>
+            <input value={a.description} onChange={e => setA({ ...a, description: e.target.value })} />
+            <label className="block text-xs text-muted mt-3 mb-1">system prompt</label>
+            <textarea rows={6} value={a.system_prompt}
+                      onChange={e => setA({ ...a, system_prompt: e.target.value })}
+                      data-testid="agent-prompt" />
+            <label className="block text-xs text-muted mt-3 mb-1">model</label>
+            <select value={a.model_slug ?? ""} onChange={e => setA({ ...a, model_slug: e.target.value || null })}
+                    data-testid="agent-model">
+              <option value="">(none)</option>
+              {models.map(m => (
+                <option key={m.slug} value={m.slug}>{m.display_name}</option>
+              ))}
+            </select>
+            <div className="grid grid-cols-2 gap-3 mt-3">
+              <div>
+                <label className="block text-xs text-muted mb-1">color</label>
+                <input value={a.color} onChange={e => setA({ ...a, color: e.target.value })} />
+              </div>
+              <div>
+                <label className="block text-xs text-muted mb-1">icon</label>
+                <input value={a.icon} onChange={e => setA({ ...a, icon: e.target.value })} />
+              </div>
+            </div>
+
+            {/* ───── Security override ───── */}
+            <div className="mt-4 pt-3 border-t border-line">
+              <div className="text-xs text-muted uppercase mb-2">Security</div>
+              <label className="block text-xs text-muted mb-1">
+                security mode
+                <span className="ml-1 text-[10px]">
+                  (overrides the global default from Settings)
+                </span>
+              </label>
+              <select className="w-full mb-2"
+                      data-testid="agent-security-mode"
+                      value={(a.params as any)?.security_mode || "inherit"}
+                      onChange={e => {
+                        const v = e.target.value;
+                        const p = { ...(a.params || {}) } as any;
+                        if (v === "inherit") delete p.security_mode;
+                        else p.security_mode = v;
+                        setA({ ...a, params: p });
+                      }}>
+                <option value="inherit">inherit (use global default)</option>
+                <option value="insecure">insecure — deny-list only</option>
+                <option value="secure">secure — allow-list enforced + CLI no bash</option>
+              </select>
+              <label className="block text-xs text-muted mb-1">
+                custom allow-list (one entry per line, optional)
+                <span className="ml-1 text-[10px]">
+                  — when set, replaces the global allow-list for this agent in secure mode
+                </span>
+              </label>
+              <textarea rows={4}
+                        className="font-mono text-xs"
+                        placeholder="(blank → use global allow-list)"
+                        data-testid="agent-allowlist"
+                        value={((a.params as any)?.command_allowlist || []).join("\n")}
+                        onChange={e => {
+                          const lines = e.target.value.split("\n")
+                            .map(l => l.trim()).filter(Boolean);
+                          const p = { ...(a.params || {}) } as any;
+                          if (lines.length === 0) delete p.command_allowlist;
+                          else p.command_allowlist = lines;
+                          setA({ ...a, params: p });
+                        }} />
+            </div>
+          </div>
+
+          <div className="card">
+            <h2 className="text-base font-semibold mb-3">Tools ({a.tool_specs.length} selected)</h2>
+            <div className="space-y-3">
+              {["builtin", "mcp", "skill"].map(kind => (
+                <div key={kind}>
+                  <div className="text-xs text-muted uppercase mb-1">{kind}</div>
+                  <div className="grid grid-cols-2 gap-1 max-h-48 overflow-y-auto">
+                    {tools.filter(t => t.kind === kind).map(t => (
+                      <label key={t.id} className="flex items-center gap-2 py-1 cursor-pointer text-xs">
+                        <input type="checkbox" className="w-auto"
+                               checked={enabledToolIds.has(t.id)}
+                               onChange={() => toggleTool(t.id)} />
+                        <span className="font-mono">{t.id}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="card">
+            <h2 className="text-base font-semibold mb-3">Skills ({a.skill_slugs.length} selected)</h2>
+            <div className="grid grid-cols-2 gap-1">
+              {skills.map(sk => (
+                <label key={sk.slug} className="flex items-center gap-2 py-1 cursor-pointer text-xs">
+                  <input type="checkbox" className="w-auto"
+                         checked={enabledSkills.has(sk.slug)}
+                         onChange={() => toggleSkill(sk.slug)} />
+                  <span>{sk.slug}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {!isNew && (
+          <div className="card space-y-2">
+            <h2 className="text-base font-semibold mb-1">Quick test</h2>
+            <textarea rows={3} value={runInput} onChange={e => setRunInput(e.target.value)}
+                      placeholder="prompt..." data-testid="agent-input" />
+            <button className="btn btn-primary w-full justify-center" onClick={run} data-testid="agent-run">
+              run ▸
+            </button>
+            {runStatus && <div className="text-xs text-muted">status: <span className="badge badge-info">{runStatus}</span></div>}
+            {runOutput && <pre className="codebox" data-testid="agent-output">{runOutput}</pre>}
+          </div>
+        )}
+      </div>
+    </Page>
+  );
+}

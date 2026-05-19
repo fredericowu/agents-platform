@@ -1,0 +1,15 @@
+.git
+.pytest_cache
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.venv
+venv
+node_modules
+frontend/node_modules
+data/*.db.bak-*
+data/mcp-bdd.log
+data/server.log
+.env
+*.log

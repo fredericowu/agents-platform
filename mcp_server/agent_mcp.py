@@ -1,0 +1,1391 @@
+"""agent-mcp — control the local Agents Platform from any MCP-aware client.
+
+A **stdio** MCP server that exposes the platform's agents, workflows and runs
+to a calling model (Claude Code, etc.).
+
+What this gives the model:
+  * Static control-plane tools: ``list_*``, ``get_*``, ``create_*``,
+    ``update_*``, ``delete_*``, ``restore_*`` — full CRUD for agents and
+    workflows. Delete is **soft** by default (recoverable) — hard delete
+    requires ``hard=true``.
+  * Dynamic per-resource runners: ``agent_<slug>`` / ``workflow_<slug>``
+    appear automatically for every active (non-deleted) agent / workflow.
+  * Run inspection: ``run_async`` (fire-and-forget), ``run_status`` (poll),
+    ``run_events`` (event stream), ``cancel_run``, ``cancel_all_runs``.
+  * Budget / safety: workflows can carry ``graph.max_hops`` and
+    ``graph.max_tokens`` — exceeding either stops the run gracefully with
+    ``output.limit_reached`` set.
+
+If the backend isn't already running on ``$AGENTS_BASE`` (default
+``http://127.0.0.1:8765``) the first tool call starts it.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import httpx
+
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp.types import TextContent, Tool
+
+BASE = os.environ.get("AGENTS_BASE", "http://127.0.0.1:8765")
+
+INSTRUCTIONS = """\
+You are connected to the **Agents Platform** — a local control plane for
+defining, running and observing AI agents + multi-agent workflows.
+
+## Discovery flow
+
+1. Call ``list_agents`` and ``list_workflows`` first. Each row carries a
+   slug, name, description, and (for workflows) the ``kind`` + ``graph``.
+2. To execute a known resource use the dynamic tools ``agent_<slug>`` or
+   ``workflow_<slug>`` — those are generated per-row and block until done.
+3. For long-running work prefer ``run_workflow_async`` / ``run_agent_async``
+   + ``run_status`` polling so you can stay responsive.
+
+## CRUD flow
+
+* ``create_agent`` / ``create_workflow`` accept a full spec.
+* ``update_agent`` / ``update_workflow`` accept a partial patch — only the
+  fields you send are changed.
+* ``delete_agent`` / ``delete_workflow`` default to **soft-delete** (sets
+  ``deleted_at``, hidden from default lists, recoverable). Pass
+  ``hard=true`` for an irreversible delete.
+* ``restore_agent`` / ``restore_workflow`` undo a soft-delete.
+* ``list_*_deleted`` shows the trash bin.
+
+## Budget / safety
+
+Every workflow can declare ``graph.max_hops`` (default 50) and
+``graph.max_tokens`` (default unlimited). Hitting either stops the run
+gracefully — status remains ``success`` but ``output.limit_reached`` is set
+to ``"hops"`` or ``"tokens"`` and ``output.<kind>_limit_reached`` is true.
+
+## Examples
+
+Create a workflow that runs two agents sequentially with a hop cap:
+
+```json
+{
+  "name": "create_workflow",
+  "arguments": {
+    "slug": "plan-then-build",
+    "name": "Plan → Build",
+    "description": "Planner outlines the work, then coder implements.",
+    "kind": "sequential",
+    "graph": {
+      "concurrency": "sequential",
+      "max_hops": 20,
+      "max_tokens": 100000,
+      "nodes": [
+        {"id": "plan",  "agent": "planner", "label": "Plan",
+         "input_template": "{input}"},
+        {"id": "build", "agent": "coder",   "label": "Build",
+         "input_template": "Plan:\\n{prev}\\n\\nNow implement it."}
+      ]
+    }
+  }
+}
+```
+
+Run it and wait for the result:
+
+```json
+{"name": "workflow_plan_then_build", "arguments": {"input": "Build a tic-tac-toe game"}}
+```
+
+Or start it in the background and poll:
+
+```json
+{"name": "run_workflow_async", "arguments": {"slug": "plan-then-build", "input": "..."}}
+{"name": "run_status",         "arguments": {"run_id": "<id>"}}
+```
+"""
+
+
+# ---------------------------------------------------------------------------
+# Backend lifecycle
+# ---------------------------------------------------------------------------
+
+def _running() -> bool:
+    try:
+        return httpx.get(f"{BASE}/api/health", timeout=1.5).status_code == 200
+    except Exception:
+        return False
+
+
+def _ensure_running() -> bool:
+    if _running():
+        return True
+    repo = Path(__file__).resolve().parents[1]
+    log = repo / "data" / "server.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    venv_py = repo / ".venv" / "bin" / "python"
+    py = str(venv_py) if venv_py.exists() else sys.executable
+    subprocess.Popen(
+        [py, "-m", "uvicorn", "backend.app.main:app", "--host", "127.0.0.1",
+         "--port", str(BASE.rsplit(":", 1)[-1].rstrip("/")), "--log-level", "warning"],
+        cwd=str(repo), stdout=open(log, "ab"), stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    for _ in range(50):
+        if _running():
+            return True
+        time.sleep(0.2)
+    return False
+
+
+server = Server("agent-mcp", instructions=INSTRUCTIONS)
+
+
+# ---------------------------------------------------------------------------
+# Tool catalogue
+# ---------------------------------------------------------------------------
+
+def _agent_spec_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "slug":          {"type": "string", "description": "Unique URL-safe id (lowercase, dashes)."},
+            "name":          {"type": "string"},
+            "description":   {"type": "string", "description": "One-line summary of what this agent does."},
+            "system_prompt": {"type": "string", "description": "Free-form system instructions for the LLM."},
+            "use_cases":     {"type": "array", "items": {"type": "string"},
+                              "description": "Short list of example use cases — when to pick this agent. e.g. ['Greenfield product research', 'Domain investigation before plan']. Consumed by the conductor to choose between agents."},
+            "model_slug":    {"type": ["string", "null"],
+                              "description": "Slug from list_models; omit to use platform default."},
+            "tool_specs":    {"type": "array", "items": {"type": "string"},
+                              "description": "Tool ids like 'code.read_file', 'code.write_file', 'mcp.cai-mcp.searchCode'."},
+            "skill_slugs":   {"type": "array", "items": {"type": "string"}},
+            "params":        {"type": "object",
+                              "description": "Model params like {\"temperature\":0.2,\"max_tokens\":2000}."},
+            "icon":          {"type": "string"},
+            "color":         {"type": "string"},
+        },
+        "required": ["slug", "name"],
+    }
+
+
+def _agent_patch_schema() -> dict:
+    s = dict(_agent_spec_schema())
+    s["required"] = ["slug"]
+    s["properties"] = dict(s["properties"])
+    s["properties"]["slug"] = {"type": "string",
+                               "description": "Slug of the agent to patch."}
+    return s
+
+
+def _workflow_spec_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "slug":        {"type": "string"},
+            "name":        {"type": "string"},
+            "description": {"type": "string"},
+            "use_cases":   {"type": "array", "items": {"type": "string"},
+                            "description": "Short list of example use cases — when to pick this workflow. e.g. ['Build new product with research', 'Investigate cross-cutting bug']. Consumed by the conductor to choose between workflows."},
+            "kind":        {"type": "string",
+                            "enum": ["sequential", "parallel", "pipeline",
+                                     "orchestrator_worker", "group_chat"],
+                            "description": "Derived from graph shape if omitted."},
+            "graph":       {"type": "object",
+                            "description": ("Topology + nodes. Shapes: "
+                                "sequential/parallel → {nodes:[…], concurrency:'sequential|parallel'}, "
+                                "pipeline → {stages:[…]}, "
+                                "orchestrator_worker → {orchestrator,workers,synthesizer}, "
+                                "group_chat → {participants,max_turns}. "
+                                "Add graph.max_hops / graph.max_tokens for budget caps. "
+                                "A node's 'agent' may be 'workflow:<slug>' to invoke a sub-workflow.")},
+        },
+        "required": ["slug", "name", "graph"],
+    }
+
+
+def _workflow_patch_schema() -> dict:
+    s = dict(_workflow_spec_schema())
+    s["required"] = ["slug"]
+    s["properties"] = dict(s["properties"])
+    s["properties"]["slug"] = {"type": "string",
+                               "description": "Slug of the workflow to patch."}
+    return s
+
+
+def _target_spec_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "slug":              {"type": "string", "description": "Unique URL-safe id (e.g. 'us1924311-acsb-alerts')."},
+            "name":              {"type": "string", "description": "Human-readable goal name."},
+            "description":       {"type": "string", "description": "What this Target is delivering. Multi-line OK."},
+            "source_kind":       {"type": "string", "enum": ["manual", "rally_story", "incident", "jira", "github_issue", "github_pr", "loop", "other"],
+                                  "description": "Where the goal originated."},
+            "source_ref":        {"type": ["string", "null"], "description": "Identifier in the source system (US1924311, INC-123, github URL, ...)."},
+            "plan_canvas_id":    {"type": ["string", "null"], "description": "Canvas id for the approved plan, if any."},
+            "report_canvas_id":  {"type": ["string", "null"], "description": "Canvas id for the final report, if any."},
+            "budget_tokens":     {"type": ["integer", "null"]},
+            "budget_usd":        {"type": ["number", "null"]},
+            "tags":              {"type": "array", "items": {"type": "string"}},
+            "notes":             {"type": "string"},
+            "created_by":        {"type": ["string", "null"]},
+        },
+        "required": ["slug", "name"],
+    }
+
+
+def _target_patch_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "slug":              {"type": "string", "description": "Slug of the Target to patch."},
+            "name":              {"type": ["string", "null"]},
+            "description":       {"type": ["string", "null"]},
+            "source_kind":       {"type": ["string", "null"]},
+            "source_ref":        {"type": ["string", "null"]},
+            "plan_canvas_id":    {"type": ["string", "null"]},
+            "report_canvas_id":  {"type": ["string", "null"]},
+            "budget_tokens":     {"type": ["integer", "null"]},
+            "budget_usd":        {"type": ["number", "null"]},
+            "status":            {"type": ["string", "null"], "enum": [None, "active", "completed", "cancelled", "abandoned"]},
+            "tags":              {"type": ["array", "null"], "items": {"type": "string"}},
+            "notes":             {"type": ["string", "null"]},
+        },
+        "required": ["slug"],
+    }
+
+
+@server.list_tools()
+async def _list_tools() -> list[Tool]:
+    _ensure_running()
+    async with httpx.AsyncClient(timeout=10) as c:
+        agents = (await c.get(f"{BASE}/api/agents")).json()
+        workflows = (await c.get(f"{BASE}/api/workflows")).json()
+
+    static: list[Tool] = [
+        # ----- discovery -----
+        Tool(name="list_agents",
+             description=("List active (non-deleted) agents. Each row includes "
+                          "slug, name, description, system_prompt, **use_cases** "
+                          "(short examples of when to pick this agent), model_slug, "
+                          "tool_specs, skill_slugs. Use this to PICK an agent for a "
+                          "task — read use_cases first, then description, then "
+                          "system_prompt for the full spec.\n\n"
+                          "Pass `exclude_pattern` (SQL LIKE) to hide clutter, "
+                          "e.g. `{\"exclude_pattern\":\"agent-ui-%\"}` to drop "
+                          "playwright-test rows.\n\n"
+                          "Example: `{\"name\":\"list_agents\"}`."),
+             inputSchema={"type": "object", "properties": {
+                 "include_deleted": {"type": "boolean",
+                                     "description": "Set true to include soft-deleted rows."},
+                 "exclude_pattern": {"type": "string",
+                                     "description": "SQL LIKE pattern to drop matching slugs (use % wildcards). E.g. 'agent-ui-%'."},
+             }}),
+        Tool(name="list_workflows",
+             description=("List active (non-deleted) workflows. Each row includes "
+                          "slug, name, description, **use_cases** (short examples of "
+                          "when to pick this workflow), kind, and the full graph. "
+                          "Use this to PICK a workflow for a task — read use_cases "
+                          "first, then description.\n\n"
+                          "Pass `exclude_pattern` (SQL LIKE) to hide clutter."),
+             inputSchema={"type": "object", "properties": {
+                 "include_deleted": {"type": "boolean"},
+                 "exclude_pattern": {"type": "string"},
+             }}),
+        Tool(name="list_agents_deleted",
+             description="List ONLY soft-deleted agents (the trash bin).",
+             inputSchema={"type": "object", "properties": {}}),
+        Tool(name="list_workflows_deleted",
+             description="List ONLY soft-deleted workflows (the trash bin).",
+             inputSchema={"type": "object", "properties": {}}),
+        Tool(name="get_agent",
+             description=("Fetch one agent's full spec by slug — includes "
+                          "description, system_prompt, **use_cases**, model_slug, "
+                          "tool_specs, etc. Use to deep-dive on an agent before "
+                          "dispatching it."),
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"}},
+                          "required": ["slug"]}),
+        Tool(name="get_workflow",
+             description=("Fetch one workflow's full spec (description, "
+                          "**use_cases**, kind, graph). Use to deep-dive before "
+                          "running."),
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"}},
+                          "required": ["slug"]}),
+        Tool(name="list_models",
+             description="List configured LLM models (provider + model_id).",
+             inputSchema={"type": "object", "properties": {}}),
+        Tool(name="list_tools",
+             description=("List built-in / MCP / skill tools that agents can be "
+                          "given via the `tool_specs` field."),
+             inputSchema={"type": "object", "properties": {}}),
+
+        # ----- create -----
+        Tool(name="create_agent",
+             description=("Create a brand-new agent.\n\n"
+                          "Example:\n"
+                          "```json\n"
+                          "{\"name\":\"create_agent\",\"arguments\":{\n"
+                          "  \"slug\":\"reviewer-strict\",\n"
+                          "  \"name\":\"Strict Reviewer\",\n"
+                          "  \"description\":\"Critiques code changes.\",\n"
+                          "  \"system_prompt\":\"You are a strict code reviewer.\",\n"
+                          "  \"model_slug\":\"claude-sonnet\",\n"
+                          "  \"tool_specs\":[\"code.read_file\"]\n"
+                          "}}\n"
+                          "```"),
+             inputSchema=_agent_spec_schema()),
+        Tool(name="create_workflow",
+             description=("Create a brand-new workflow.\n\n"
+                          "See the server description for full examples. "
+                          "`graph.max_hops` / `graph.max_tokens` set safety caps; "
+                          "leaving them out uses platform defaults (50 hops, unlimited tokens)."),
+             inputSchema=_workflow_spec_schema()),
+
+        # ----- update -----
+        Tool(name="update_agent",
+             description=("Patch an agent. Only the fields you send are changed. "
+                          "Use this to tweak prompt/model/tools without retyping the rest.\n\n"
+                          "Example:\n"
+                          "```json\n"
+                          "{\"name\":\"update_agent\",\"arguments\":{\n"
+                          "  \"slug\":\"reviewer-strict\",\n"
+                          "  \"system_prompt\":\"You are an even stricter reviewer.\"\n"
+                          "}}\n"
+                          "```"),
+             inputSchema=_agent_patch_schema()),
+        Tool(name="update_workflow",
+             description=("Patch a workflow. Sending a `graph` REPLACES the graph "
+                          "wholesale — fetch via `get_workflow` first if you only "
+                          "want to tweak one field of it."),
+             inputSchema=_workflow_patch_schema()),
+
+        # ----- delete / restore -----
+        Tool(name="delete_agent",
+             description=("Soft-delete an agent. The row keeps existing and can be "
+                          "restored. Pass `hard:true` to permanently delete.\n\n"
+                          "Example: `{\"name\":\"delete_agent\",\"arguments\":{\"slug\":\"reviewer-strict\"}}`"),
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"},
+                                         "hard": {"type": "boolean"}},
+                          "required": ["slug"]}),
+        Tool(name="delete_workflow",
+             description=("Soft-delete a workflow. Pass `hard:true` for irreversible delete."),
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"},
+                                         "hard": {"type": "boolean"}},
+                          "required": ["slug"]}),
+        Tool(name="restore_agent",
+             description="Undo a soft-delete on an agent.",
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"}},
+                          "required": ["slug"]}),
+        Tool(name="restore_workflow",
+             description="Undo a soft-delete on a workflow.",
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"}},
+                          "required": ["slug"]}),
+
+        # ----- execution -----
+        Tool(name="run_agent_async",
+             description=("Start an agent run in the background and return its run_id. "
+                          "Poll with `run_status` / `run_events`, or block with `wait_run`.\n\n"
+                          "Pass `target_slug` (or `target_id`) to link this run to a Target "
+                          "so it appears in `target_summary` / `list_target_runs`."),
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"},
+                                         "input": {"type": "string"},
+                                         "target_slug": {"type": ["string", "null"]},
+                                         "target_id": {"type": ["string", "null"]}},
+                          "required": ["slug", "input"]}),
+        Tool(name="run_workflow_async",
+             description=("Start a workflow run in the background and return its run_id.\n\n"
+                          "Pass `target_slug` (or `target_id`) to link this run to a Target."),
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"},
+                                         "input": {"type": "string"},
+                                         "target_slug": {"type": ["string", "null"]},
+                                         "target_id": {"type": ["string", "null"]}},
+                          "required": ["slug", "input"]}),
+        Tool(name="run_status",
+             description=("Return the current Run row: status, output, error, tokens, "
+                          "and (for workflows) `limit_reached` if a budget cap stopped it.\n\n"
+                          "Pass `summary:true` to truncate huge `input` fields (~200 chars) "
+                          "so you don't echo your own prompt back in every poll."),
+             inputSchema={"type": "object",
+                          "properties": {"run_id": {"type": "string"},
+                                         "summary": {"type": "boolean",
+                                                     "description": "Truncate huge `input` fields to ~200 chars."}},
+                          "required": ["run_id"]}),
+        Tool(name="run_events",
+             description=("Return the ordered event stream for a run (node_start, "
+                          "node_end, tool_call, tool_result, llm_token, error, done). "
+                          "Useful for observing how a workflow progressed.\n\n"
+                          "Use `after_ts` (ISO8601) as a cursor to tail just new events. "
+                          "Use `kinds` (comma list) to filter by event kind. "
+                          "E.g. `{\"run_id\":\"…\",\"kinds\":\"node_start,error,done\"}`."),
+             inputSchema={"type": "object",
+                          "properties": {"run_id": {"type": "string"},
+                                         "after_ts": {"type": "string",
+                                                      "description": "Only events with ts > this ISO8601 timestamp."},
+                                         "kinds": {"type": "string",
+                                                   "description": "Comma-separated kinds to keep (omit for all)."},
+                                         "limit": {"type": "integer"}},
+                          "required": ["run_id"]}),
+        Tool(name="wait_run",
+             description=("BLOCK until the run reaches a terminal status "
+                          "(success|error|cancelled) or until `timeout_s` elapses, "
+                          "then return the full RunOut snapshot. **Eliminates the "
+                          "polling pattern** — caller doesn't need to call "
+                          "`run_status` in a loop. On timeout, returns the row in its "
+                          "current state without raising; check `status` to detect.\n\n"
+                          "Optional `max_cost_usd`: if the rolled-up cost (run + "
+                          "descendants) exceeds this mid-wait, the run is cancelled "
+                          "(cascading) and the snapshot returned with status='cancelled' "
+                          "and reason='cost_cap'."),
+             inputSchema={"type": "object",
+                          "properties": {"run_id": {"type": "string"},
+                                         "timeout_s": {"type": "integer",
+                                                       "description": "Hard cap on the wait (1..3600). Default 300."},
+                                         "poll_interval_s": {"type": "number",
+                                                             "description": "Server-side internal poll cadence (0.25..30). Default 2."},
+                                         "max_cost_usd": {"type": "number",
+                                                          "description": "Cancel if rolled-up cost exceeds this USD value mid-wait. Default: no cap."},
+                                         "summary": {"type": "boolean"}},
+                          "required": ["run_id"]}),
+        Tool(name="peek_run_output",
+             description=("MID-FLIGHT snapshot of a running run. Returns last N events, "
+                          "accumulated streamed text (if any), tokens/cost so far, and "
+                          "current output buffer. Lets you catch a misbehaving agent "
+                          "BEFORE waiting for terminal. NO polling required."),
+             inputSchema={"type": "object",
+                          "properties": {"run_id": {"type": "string"},
+                                         "tail_events": {"type": "integer",
+                                                         "description": "How many trailing events to return (1..200). Default 20."}},
+                          "required": ["run_id"]}),
+        Tool(name="run_agents_parallel",
+             description=("FAN OUT N agent runs in parallel under a synthetic parent "
+                          "run. **No row is written to the `workflows` table** — the "
+                          "parent is ephemeral (kind='workflow', target_slug='_ephemeral_parallel_'). "
+                          "Returns parent_run_id + child_run_ids so you can `wait_run` "
+                          "on the parent or roll up costs via `run_tree`.\n\n"
+                          "Use this instead of N separate `run_agent_async` calls when "
+                          "you want shared lineage + cost rollup. Max 20 children per "
+                          "dispatch.\n\n"
+                          "Example:\n"
+                          "```json\n"
+                          "{\"name\":\"run_agents_parallel\",\"arguments\":{\n"
+                          "  \"agents\":[\n"
+                          "    {\"slug\":\"explorer\",\"input\":\"locate the auth code\"},\n"
+                          "    {\"slug\":\"researcher\",\"input\":\"web research session lib\"}\n"
+                          "  ],\n"
+                          "  \"target_slug\":\"us1924311-acsb-alerts\"\n"
+                          "}}\n"
+                          "```"),
+             inputSchema={"type": "object",
+                          "properties": {
+                              "agents": {"type": "array", "minItems": 1, "maxItems": 20,
+                                         "items": {"type": "object", "properties": {
+                                             "slug": {"type": "string"},
+                                             "input": {"type": "string"},
+                                             "node_id": {"type": "string"},
+                                         }, "required": ["slug"]}},
+                              "target_id": {"type": ["string", "null"]},
+                              "target_slug": {"type": ["string", "null"]},
+                              "max_hops": {"type": ["integer", "null"]},
+                              "max_tokens": {"type": ["integer", "null"]},
+                          },
+                          "required": ["agents"]}),
+        Tool(name="run_tree",
+             description=("Recursive run tree (root + descendants) with rolled-up "
+                          "totals — tokens, costs, hops/tokens budget."),
+             inputSchema={"type": "object",
+                          "properties": {"run_id": {"type": "string"}},
+                          "required": ["run_id"]}),
+        Tool(name="cancel_run",
+             description=("Cancel a running run. For workflows the cancel cascades "
+                          "through all descendants."),
+             inputSchema={"type": "object",
+                          "properties": {"run_id": {"type": "string"}},
+                          "required": ["run_id"]}),
+        Tool(name="cancel_all_runs",
+             description="Cancel every currently-running run on the platform.",
+             inputSchema={"type": "object", "properties": {}}),
+
+        # ----- legacy alias -----
+        Tool(name="get_run",
+             description="Alias for run_status — fetches a Run row by id.",
+             inputSchema={"type": "object",
+                          "properties": {"run_id": {"type": "string"}},
+                          "required": ["run_id"]}),
+
+        # ----- Targets (overall delivery goals) -----
+        Tool(name="list_targets",
+             description=("List Targets — first-class umbrella goals that group runs. "
+                          "Each Target represents the WHY of an orchestration (e.g. "
+                          "'deliver US1924311'). Use this to find existing Targets, "
+                          "or read its retro view via `target_summary`."),
+             inputSchema={"type": "object", "properties": {
+                 "include_deleted": {"type": "boolean"},
+                 "status": {"type": "string",
+                            "description": "Filter by status: active|completed|cancelled|abandoned."},
+                 "q": {"type": "string", "description": "Search slug/name/description/source_ref."},
+                 "limit": {"type": "integer"},
+             }}),
+        Tool(name="get_target",
+             description="Fetch one Target's full spec by slug.",
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"}},
+                          "required": ["slug"]}),
+        Tool(name="create_target",
+             description=("Create a new Target — the umbrella goal a tree of runs "
+                          "is delivering against. Set this at the START of an "
+                          "orchestration; pass `target_slug` to subsequent "
+                          "`run_agent_async` / `run_agents_parallel` calls to link "
+                          "every run back.\n\n"
+                          "Example (Rally-derived):\n"
+                          "```json\n"
+                          "{\"name\":\"create_target\",\"arguments\":{\n"
+                          "  \"slug\":\"us1924311-acsb-alerts\",\n"
+                          "  \"name\":\"US1924311 — ACSB alerts for dr-external-api\",\n"
+                          "  \"description\":\"Bootstrap ACSB gold-signal monitoring + open PR.\",\n"
+                          "  \"source_kind\":\"rally_story\",\n"
+                          "  \"source_ref\":\"US1924311\",\n"
+                          "  \"budget_usd\":20,\n"
+                          "  \"budget_tokens\":800000\n"
+                          "}}\n"
+                          "```"),
+             inputSchema=_target_spec_schema()),
+        Tool(name="update_target",
+             description=("Patch a Target — set status to 'completed'/'cancelled' to "
+                          "stamp ended_at, attach plan_canvas_id / report_canvas_id, "
+                          "or update budgets."),
+             inputSchema=_target_patch_schema()),
+        Tool(name="delete_target",
+             description=("Soft-delete by default (recoverable). Pass `hard:true` for "
+                          "irreversible delete, which also nulls runs.target_id "
+                          "pointing at this Target."),
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"},
+                                         "hard": {"type": "boolean"}},
+                          "required": ["slug"]}),
+        Tool(name="restore_target",
+             description="Undo a soft-delete on a Target.",
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"}},
+                          "required": ["slug"]}),
+        Tool(name="target_summary",
+             description=("Retro view — rolled-up stats across every Run linked to a "
+                          "Target: total runs (by status), tokens in/out, cost $, "
+                          "agents used (with counts), models used, wall time, and "
+                          "percent of budget consumed. Use this for end-of-delivery "
+                          "reports + post-mortems."),
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"}},
+                          "required": ["slug"]}),
+        Tool(name="list_target_runs",
+             description=("List every Run linked to a Target, chronologically. "
+                          "Lightweight (no events). For deep-dive on any single run "
+                          "use `run_tree`."),
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"},
+                                         "limit": {"type": "integer"}},
+                          "required": ["slug"]}),
+        Tool(name="link_run_to_target",
+             description=("LINK an existing run (and its whole subtree by default) "
+                          "to a Target. Use this for retroactive linkage when a run "
+                          "was dispatched without a target_slug, or to fix mis-tagged "
+                          "runs. Idempotent."),
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"},
+                                         "run_id": {"type": "string"},
+                                         "include_descendants": {"type": "boolean",
+                                                                 "description": "Also link every descendant in the run tree. Default true."}},
+                          "required": ["slug", "run_id"]}),
+        Tool(name="unlink_run_from_target",
+             description="Reverse of link_run_to_target — set runs.target_id = NULL.",
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"},
+                                         "run_id": {"type": "string"},
+                                         "include_descendants": {"type": "boolean"}},
+                          "required": ["slug", "run_id"]}),
+        Tool(name="attach_pr_to_target",
+             description=("Attach a PR URL (with optional title/status/ci_status) to "
+                          "a Target. Idempotent on URL — re-attaching the same URL "
+                          "updates the metadata in place. Use this so the retro view "
+                          "shows the PRs that delivered the Target."),
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"},
+                                         "url": {"type": "string"},
+                                         "title": {"type": "string"},
+                                         "status": {"type": "string", "enum": ["open", "merged", "closed"]},
+                                         "ci_status": {"type": "string", "enum": ["passing", "failing", "pending"]},
+                                         "notes": {"type": "string"}},
+                          "required": ["slug", "url"]}),
+        Tool(name="detach_pr_from_target",
+             description="Remove a PR URL from a Target.",
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"},
+                                         "url": {"type": "string"}},
+                          "required": ["slug", "url"]}),
+
+        # ----- Target Lessons (the retro / continuous-learning store) -----
+        Tool(name="search_lessons",
+             description=("**Cross-target search** over the platform's lessons-learned store. "
+                          "The `retro` agent calls this BEFORE creating new lessons, to find "
+                          "existing ones it should UPDATE rather than duplicate. Future "
+                          "deliveries call this at Phase 1.5 to surface relevant prior "
+                          "lessons matching the task's tags.\n\n"
+                          "Pass `tags` (comma-separated) to filter by applicable_tags overlap, "
+                          "`category` to filter by lesson kind, or `q` for full-text search "
+                          "over title + content."),
+             inputSchema={"type": "object",
+                          "properties": {"tags": {"type": "string",
+                                                  "description": "Comma-separated tag list. e.g. 'cat-2,acsb,cookiecutter'"},
+                                         "category": {"type": "string",
+                                                      "description": "time-saver|pitfall|tooling-gap|pattern-that-worked|prompt-fix|cost-trap|scope-creep"},
+                                         "q": {"type": "string"},
+                                         "include_superseded": {"type": "boolean"},
+                                         "limit": {"type": "integer"}}}),
+        Tool(name="list_target_lessons",
+             description=("List all lessons for one Target (scoped). Use this when running "
+                          "a retro on a Target — see what's already been recorded."),
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"},
+                                         "include_superseded": {"type": "boolean"}},
+                          "required": ["slug"]}),
+        Tool(name="create_target_lesson",
+             description=("Record a new lesson against a Target. Use this AFTER "
+                          "`search_lessons` confirms no existing lesson covers this insight.\n\n"
+                          "`category`: time-saver | pitfall | tooling-gap | pattern-that-worked | "
+                          "prompt-fix | cost-trap | scope-creep (or your own — these are conventions).\n"
+                          "`evidence_run_ids`: list of run ids that motivated this lesson.\n"
+                          "`applicable_tags`: tags future searches will match on (e.g. "
+                          "`['cat-2','acsb','cookiecutter']`)."),
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"},
+                                         "category": {"type": "string"},
+                                         "title": {"type": "string"},
+                                         "content": {"type": "string"},
+                                         "evidence_run_ids": {"type": "array", "items": {"type": "string"}},
+                                         "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+                                         "applicable_tags": {"type": "array", "items": {"type": "string"}},
+                                         "source": {"type": "string"},
+                                         "created_in_run_id": {"type": "string", "description": "FK to the run that authored this lesson — typically the retro agent's own run_id. Required for the 'lesson → originating agent' UI navigation to work deterministically."},
+                                         "status": {"type": "string", "enum": ["pending_review", "active", "archived"], "description": "Lesson lifecycle status. Default 'active'. Set 'pending_review' for auto-drafted low-score lessons that need human approval."}},
+                          "required": ["slug", "category", "title"]}),
+        Tool(name="update_target_lesson",
+             description=("PATCH an existing lesson — used by the `retro` agent to extend a "
+                          "prior lesson with new evidence (append to `evidence_run_ids`), refine "
+                          "the body, or raise `confidence` as more deliveries confirm the pattern. "
+                          "Pass `superseded_by` to mark a lesson replaced by a newer one."),
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"},
+                                         "lesson_id": {"type": "string"},
+                                         "category": {"type": "string"},
+                                         "title": {"type": "string"},
+                                         "content": {"type": "string"},
+                                         "evidence_run_ids": {"type": "array", "items": {"type": "string"}},
+                                         "confidence": {"type": "string"},
+                                         "applicable_tags": {"type": "array", "items": {"type": "string"}},
+                                         "superseded_by": {"type": "string"},
+                                         "created_in_run_id": {"type": "string", "description": "FK to the run that authored this lesson — typically the retro agent's own run_id. Required for the 'lesson → originating agent' UI navigation to work deterministically."},
+                                         "status": {"type": "string", "enum": ["pending_review", "active", "archived"], "description": "Lesson lifecycle status. Default 'active'. Set 'pending_review' for auto-drafted low-score lessons that need human approval."}},
+                          "required": ["slug", "lesson_id"]}),
+        Tool(name="delete_target_lesson",
+             description="Soft-delete a lesson (or `hard:true` for irreversible).",
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"},
+                                         "lesson_id": {"type": "string"},
+                                         "hard": {"type": "boolean"}},
+                          "required": ["slug", "lesson_id"]}),
+
+        # ----- Lesson Applications (the tracking layer for continuous improvement) -----
+        Tool(name="record_lesson_application",
+             description=("Record that a lesson was surfaced / applied / rejected / "
+                          "ignored for a specific Target (optionally tied to a run). "
+                          "**The conductor MUST call this at Phase 1.5** with outcome="
+                          "`shown_to_pm` for every lesson it passes to project-manager. "
+                          "The retro agent calls it later with outcome=`applied` | `prevented` | "
+                          "`ignored` | `partial` based on what it observes.\n\n"
+                          "Outcomes: retrieved | shown_to_pm | applied | rejected | "
+                          "prevented | ignored | partial"),
+             inputSchema={"type": "object",
+                          "properties": {"lesson_id": {"type": "string"},
+                                         "target_id": {"type": "string",
+                                                       "description": "Optional — defaults to lesson's home Target."},
+                                         "applied_in_run_id": {"type": "string",
+                                                               "description": "Optional — the specific run that applied or ignored the lesson."},
+                                         "outcome": {"type": "string",
+                                                     "enum": ["retrieved", "shown_to_pm", "applied", "rejected", "prevented", "ignored", "partial"]},
+                                         "notes": {"type": "string"}},
+                          "required": ["lesson_id", "outcome"]}),
+        Tool(name="list_lesson_applications",
+             description=("List application records. Filter by lesson_id, target_id, "
+                          "or outcome. Use this to find lessons that have been "
+                          "consistently IGNORED (biggest improvement opportunity)."),
+             inputSchema={"type": "object",
+                          "properties": {"lesson_id": {"type": "string"},
+                                         "target_id": {"type": "string"},
+                                         "outcome": {"type": "string"},
+                                         "limit": {"type": "integer"}}}),
+        Tool(name="lesson_effectiveness",
+             description=("Per-lesson stats: how often was it applied vs ignored? "
+                          "`effectiveness_rate` = (applied+prevented) / total. "
+                          "`propagation_gap_rate` = ignored / shown_to_pm — high gap "
+                          "means the lesson is well-known but still missed."),
+             inputSchema={"type": "object",
+                          "properties": {"lesson_id": {"type": "string"}},
+                          "required": ["lesson_id"]}),
+        Tool(name="lesson_forecast",
+             description=("**PRE-FLIGHT FORECAST** for an upcoming task. Given tags + "
+                          "category, returns:\n"
+                          "  - matched_lessons: top-relevant lessons (by tag overlap)\n"
+                          "  - similar_targets: prior Targets sharing tags\n"
+                          "  - predicted_cost_usd / wall_seconds: p10/p50/p90 from priors\n"
+                          "  - advisories: high-confidence pitfalls + proven patterns to apply\n\n"
+                          "**Call this BEFORE Phase 1.5** to see what the platform knows about "
+                          "similar tasks. The conductor uses it to set realistic budgets and "
+                          "pick the right model tiers."),
+             inputSchema={"type": "object",
+                          "properties": {"tags": {"type": "array", "items": {"type": "string"}},
+                                         "category": {"type": "string"},
+                                         "description": {"type": "string"}}}),
+        Tool(name="lessons_metrics",
+             description=("Cross-target 'are we improving?' dashboard. Returns:\n"
+                          "  - total_lessons by category / confidence\n"
+                          "  - application outcomes breakdown\n"
+                          "  - avg_effectiveness_rate · avg_propagation_gap_rate\n"
+                          "  - cost_trend · wall_trend across Targets (chronological)\n"
+                          "  - top_applied_lessons (most valuable) · top_ignored_lessons (biggest gaps)"),
+             inputSchema={"type": "object", "properties": {}}),
+
+        # ----- Retro scores (Wave-6 A3) -----
+        Tool(name="list_retro_scores",
+             description=("List quality scores for a run, broken down by dimension "
+                          "(cost, wall, mistakes, lessons_applied, plan_adherence, "
+                          "scope_discipline, accuracy, output_quality, recovery, overall). "
+                          "Each score has a source (auto|retro_agent|human), rationale, "
+                          "and evidence_json. By default only the active (non-superseded) "
+                          "row per dimension is returned; pass include_superseded=true to "
+                          "see the full override history."),
+             inputSchema={"type": "object",
+                          "properties": {
+                              "run_id": {"type": "string", "description": "ID of the run to score."},
+                              "include_superseded": {"type": "boolean",
+                                                     "description": "If true, include rows superseded by human overrides."},
+                          },
+                          "required": ["run_id"]}),
+        Tool(name="override_retro_score",
+             description=("Write a human quality score for one dimension of a run. "
+                          "Creates a new row with source='human', marks the previous "
+                          "active row as superseded, then recomputes the overall score "
+                          "and Run.retro_score_summary.\n\n"
+                          "Valid dimensions: accuracy, output_quality, lessons_applied, "
+                          "recovery, plan_adherence, cost, wall, mistakes, scope_discipline.\n"
+                          "Score must be an integer 1–10 (10 = best)."),
+             inputSchema={"type": "object",
+                          "properties": {
+                              "run_id": {"type": "string"},
+                              "dimension": {"type": "string",
+                                            "description": "accuracy|output_quality|lessons_applied|recovery|plan_adherence|cost|wall|mistakes|scope_discipline"},
+                              "score": {"type": "integer", "minimum": 1, "maximum": 10},
+                              "rationale": {"type": "string",
+                                            "description": "Human-readable explanation for this score."},
+                              "evidence_json": {"type": "object",
+                                                "description": "Arbitrary structured evidence supporting the score."},
+                          },
+                          "required": ["run_id", "dimension", "score"]}),
+        Tool(name="recompute_retro_score",
+             description=("Re-run the auto-scorer (score_run_terminal) on a run that has "
+                          "already completed. Useful for back-filling retro scores on older "
+                          "runs, or refreshing scores after event data changes. "
+                          "Returns {computed: bool, summary: {...}}. "
+                          "The run must be in a terminal status (success|error|cancelled)."),
+             inputSchema={"type": "object",
+                          "properties": {
+                              "run_id": {"type": "string"},
+                          },
+                          "required": ["run_id"]}),
+        Tool(name="get_retro_score_weights",
+             description=("Return the current dimension→weight map used to compute the "
+                          "weighted-mean overall retro score. The 9 dimensions are: "
+                          "accuracy, output_quality, lessons_applied, recovery, plan_adherence, "
+                          "cost, wall, mistakes, scope_discipline. Weights sum to ~1.0. "
+                          "Returns {weights: {dim: float}, updated_at}."),
+             inputSchema={"type": "object", "properties": {}}),
+        Tool(name="set_retro_score_weights",
+             description=("Update the dimension→weight map for overall retro-score computation. "
+                          "All provided weights must be 0–1 and sum to ~1.0 (±0.01 tolerance). "
+                          "Missing dimensions default to 0. 'overall' is computed and cannot "
+                          "be set directly. Returns the updated {weights, updated_at}.\n\n"
+                          "Example: {\"accuracy\": 0.30, \"output_quality\": 0.20, "
+                          "\"lessons_applied\": 0.15, \"recovery\": 0.10, "
+                          "\"plan_adherence\": 0.10, \"cost\": 0.05, \"wall\": 0.04, "
+                          "\"mistakes\": 0.03, \"scope_discipline\": 0.03}"),
+             inputSchema={"type": "object",
+                          "properties": {
+                              "weights": {"type": "object",
+                                          "description": "Map of dimension → weight (float 0–1). Must sum to ~1.0.",
+                                          "additionalProperties": {"type": "number"}},
+                          },
+                          "required": ["weights"]}),
+        Tool(name="list_pending_lessons",
+             description=("List lessons in 'pending_review' status — written by the retro "
+                          "agent but not yet promoted to 'active'. Use this to review and "
+                          "approve or archive AI-generated lessons before they propagate to "
+                          "future deliveries. Supports pagination via limit/offset."),
+             inputSchema={"type": "object",
+                          "properties": {
+                              "limit": {"type": "integer", "minimum": 1, "maximum": 200,
+                                        "description": "Max lessons to return (default 50)."},
+                              "offset": {"type": "integer", "minimum": 0,
+                                         "description": "Pagination offset (default 0)."},
+                          }}),
+        Tool(name="approve_pending_lesson",
+             description=("Promote a lesson from 'pending_review' to 'active' status. "
+                          "Once active, the lesson is surfaced by search_lessons and "
+                          "lesson_forecast for future deliveries. "
+                          "Returns the updated LessonOut."),
+             inputSchema={"type": "object",
+                          "properties": {
+                              "lesson_id": {"type": "string"},
+                          },
+                          "required": ["lesson_id"]}),
+        Tool(name="archive_lesson",
+             description=("Set a lesson's status to 'archived'. Archived lessons are "
+                          "excluded from search_lessons and lesson_forecast results. "
+                          "Use this to retire outdated or incorrect lessons without hard-deleting them. "
+                          "Returns the updated LessonOut."),
+             inputSchema={"type": "object",
+                          "properties": {
+                              "lesson_id": {"type": "string"},
+                          },
+                          "required": ["lesson_id"]}),
+
+        # ----- Lesson consolidation (Wave-6 L2) -----
+        Tool(name="consolidate_lessons",
+             description=("Merge N existing lessons into ONE consolidated lesson. "
+                          "The source lessons are archived (status='archived') with "
+                          "superseded_by pointing to the new lesson. The new lesson "
+                          "inherits the union of evidence_run_ids and applicable_tags.\n\n"
+                          "Provide title and content (the merged body). category, "
+                          "applicable_tags, and confidence default to majority/union/max "
+                          "of the sources if omitted. target_id defaults to the first "
+                          "source lesson's target.\n\n"
+                          "Rejects if any source lesson is already archived."),
+             inputSchema={"type": "object",
+                          "properties": {
+                              "lesson_ids": {"type": "array", "items": {"type": "string"},
+                                             "description": "IDs of lessons to merge (min 2)."},
+                              "title": {"type": "string", "description": "Title for the consolidated lesson."},
+                              "content": {"type": "string", "description": "Merged markdown body."},
+                              "category": {"type": "string",
+                                           "description": "pitfall|time-saver|tooling-gap|pattern-that-worked|prompt-fix|cost-trap|scope-creep. Defaults to majority category of sources."},
+                              "applicable_tags": {"type": "array", "items": {"type": "string"},
+                                                  "description": "Tags for the new lesson. Defaults to union of source tags."},
+                              "confidence": {"type": "string", "enum": ["low", "medium", "high"],
+                                             "description": "Defaults to max confidence of sources."},
+                              "target_id": {"type": "string",
+                                            "description": "Target to attach to. Defaults to first source's target_id."},
+                          },
+                          "required": ["lesson_ids", "title", "content"]}),
+        Tool(name="suggest_lesson_consolidation",
+             description=("Find clusters of active lessons that are candidates for "
+                          "consolidation, using deterministic tag + title overlap scoring "
+                          "(no LLM). Two lessons join the same cluster if "
+                          "(jaccard_tags ≥ 0.5 AND title_overlap ≥ 0.3) OR jaccard_tags ≥ 0.8.\n\n"
+                          "Returns clusters sorted by confidence DESC. Each cluster "
+                          "includes lesson_ids, reason (shared tags + title tokens), "
+                          "confidence score, common_tags, and common_category.\n\n"
+                          "Typical workflow: call this first, pick a cluster, optionally "
+                          "call draft_consolidated_lesson for an AI-drafted merge, then "
+                          "call consolidate_lessons to finalize."),
+             inputSchema={"type": "object",
+                          "properties": {
+                              "min_overlap": {"type": "integer", "minimum": 1, "default": 1,
+                                              "description": "Min number of common tags required to report a cluster."},
+                              "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20,
+                                        "description": "Max clusters to return."},
+                              "min_cluster_size": {"type": "integer", "minimum": 2, "default": 2,
+                                                   "description": "Min number of lessons in a reportable cluster."},
+                          }}),
+        Tool(name="draft_consolidated_lesson",
+             description=("Kick off a planner agent run to draft a merged title + content "
+                          "from N source lessons. Returns {run_id, status: 'running'} — "
+                          "poll with run_status until done, then read output.final.\n\n"
+                          "The planner output follows a strict template:\n"
+                          "  TITLE: ...\n"
+                          "  CATEGORY: ...\n"
+                          "  TAGS: ...\n"
+                          "  BODY:\\n<markdown>\n\n"
+                          "Parse it and pass to consolidate_lessons for final write. "
+                          "This is the ONLY LLM call in the consolidation flow — opt-in, "
+                          "on explicit user request."),
+             inputSchema={"type": "object",
+                          "properties": {
+                              "lesson_ids": {"type": "array", "items": {"type": "string"},
+                                             "description": "IDs of lessons to draft a merge for (min 2)."},
+                          },
+                          "required": ["lesson_ids"]}),
+
+        # ----- Run artefacts (structured outputs attached to a run) -----
+        Tool(name="add_run_artefact",
+             description=("Attach a named artefact (file blob) to a run. Use this "
+                          "instead of cramming structured outputs (NRQL tables, "
+                          "terraform plans, diffs, JSON configs) into `output.final` "
+                          "as one string. Replaces by name if it already exists.\n\n"
+                          "Example:\n"
+                          "```json\n"
+                          "{\"name\":\"add_run_artefact\",\"arguments\":{\n"
+                          "  \"run_id\":\"abc123\",\n"
+                          "  \"name\":\"nrql-baselines.md\",\n"
+                          "  \"mime\":\"text/markdown\",\n"
+                          "  \"content\":\"# baselines\\n…\"\n"
+                          "}}\n"
+                          "```"),
+             inputSchema={"type": "object",
+                          "properties": {"run_id": {"type": "string"},
+                                         "name": {"type": "string"},
+                                         "mime": {"type": "string"},
+                                         "content": {"type": "string"},
+                                         "is_binary": {"type": "boolean"}},
+                          "required": ["run_id", "name", "content"]}),
+        Tool(name="list_run_artefacts",
+             description="List all artefacts attached to a run (names + sizes, no content).",
+             inputSchema={"type": "object",
+                          "properties": {"run_id": {"type": "string"}},
+                          "required": ["run_id"]}),
+        Tool(name="get_run_artefact",
+             description="Fetch one artefact's full content.",
+             inputSchema={"type": "object",
+                          "properties": {"run_id": {"type": "string"},
+                                         "name": {"type": "string"}},
+                          "required": ["run_id", "name"]}),
+        Tool(name="delete_run_artefact",
+             description="Remove an artefact from a run.",
+             inputSchema={"type": "object",
+                          "properties": {"run_id": {"type": "string"},
+                                         "name": {"type": "string"}},
+                          "required": ["run_id", "name"]}),
+    ]
+
+    # Dynamic per-resource runners (blocking; poll variants live above).
+    dynamic: list[Tool] = []
+    for a in agents:
+        dynamic.append(Tool(
+            name=f"agent_{a['slug'].replace('-', '_')}",
+            description=(f"Run agent **{a['name']}** and wait for the result. "
+                         f"{a['description']}\n\n"
+                         f"Equivalent to `run_agent_async`(slug={a['slug']!r}) + poll."),
+            inputSchema={"type": "object",
+                         "properties": {"input": {"type": "string",
+                                                  "description": "User input passed to the agent."}},
+                         "required": ["input"]},
+        ))
+    for w in workflows:
+        dynamic.append(Tool(
+            name=f"workflow_{w['slug'].replace('-', '_')}",
+            description=(f"Run workflow **{w['name']}** ({w['kind']}) and wait for "
+                         f"completion. {w['description']}\n\n"
+                         f"Equivalent to `run_workflow_async`(slug={w['slug']!r}) + poll. "
+                         f"If `graph.max_hops` / `graph.max_tokens` are set, the run "
+                         f"may stop gracefully with `output.limit_reached`."),
+            inputSchema={"type": "object",
+                         "properties": {"input": {"type": "string"}},
+                         "required": ["input"]},
+        ))
+
+    return static + dynamic
+
+
+# ---------------------------------------------------------------------------
+# Tool dispatch
+# ---------------------------------------------------------------------------
+
+def _slug_from(prefix: str, name: str) -> str:
+    return name[len(prefix):].replace("_", "-")
+
+
+def _ok(data: Any) -> list[TextContent]:
+    return [TextContent(type="text", text=json.dumps(data, indent=2, default=str))]
+
+
+def _err(status: int, text: str) -> list[TextContent]:
+    return [TextContent(type="text",
+                        text=json.dumps({"error": True, "status": status, "message": text}, indent=2))]
+
+
+async def _poll_run(c: httpx.AsyncClient, run_id: str, *, timeout_s: int = 900) -> dict:
+    for _ in range(timeout_s):
+        await asyncio.sleep(1.0)
+        run = (await c.get(f"{BASE}/api/runs/{run_id}")).json()
+        if run["status"] in ("success", "error", "cancelled"):
+            return run
+    return {"status": "timeout", "run_id": run_id}
+
+
+@server.call_tool()
+async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextContent]:
+    args = arguments or {}
+    async with httpx.AsyncClient(timeout=120) as c:
+        # --- discovery ---
+        if name == "list_agents":
+            params: dict[str, Any] = {}
+            if args.get("include_deleted"):
+                params["include_deleted"] = "true"
+            if args.get("exclude_pattern"):
+                params["exclude_pattern"] = args["exclude_pattern"]
+            r = await c.get(f"{BASE}/api/agents", params=params)
+            return _ok(r.json())
+        if name == "list_workflows":
+            params = {}
+            if args.get("include_deleted"):
+                params["include_deleted"] = "true"
+            if args.get("exclude_pattern"):
+                params["exclude_pattern"] = args["exclude_pattern"]
+            r = await c.get(f"{BASE}/api/workflows", params=params)
+            return _ok(r.json())
+        if name == "list_agents_deleted":
+            r = await c.get(f"{BASE}/api/agents", params={"deleted_only": "true"})
+            return _ok(r.json())
+        if name == "list_workflows_deleted":
+            r = await c.get(f"{BASE}/api/workflows", params={"deleted_only": "true"})
+            return _ok(r.json())
+        if name == "get_agent":
+            r = await c.get(f"{BASE}/api/agents/{args['slug']}")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "get_workflow":
+            r = await c.get(f"{BASE}/api/workflows/{args['slug']}")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "list_models":
+            return _ok((await c.get(f"{BASE}/api/models")).json())
+        if name == "list_tools":
+            return _ok((await c.get(f"{BASE}/api/tools")).json())
+
+        # --- CRUD: agents ---
+        if name == "create_agent":
+            r = await c.post(f"{BASE}/api/agents", json=args)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "update_agent":
+            slug = args.pop("slug")
+            r = await c.put(f"{BASE}/api/agents/{slug}", json=args)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "delete_agent":
+            params = {"hard": "true"} if args.get("hard") else {}
+            r = await c.delete(f"{BASE}/api/agents/{args['slug']}", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "restore_agent":
+            r = await c.post(f"{BASE}/api/agents/{args['slug']}/restore")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+
+        # --- CRUD: workflows ---
+        if name == "create_workflow":
+            r = await c.post(f"{BASE}/api/workflows", json=args)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "update_workflow":
+            slug = args.pop("slug")
+            r = await c.put(f"{BASE}/api/workflows/{slug}", json=args)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "delete_workflow":
+            params = {"hard": "true"} if args.get("hard") else {}
+            r = await c.delete(f"{BASE}/api/workflows/{args['slug']}", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "restore_workflow":
+            r = await c.post(f"{BASE}/api/workflows/{args['slug']}/restore")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+
+        # --- runs ---
+        if name == "run_agent_async":
+            extra: dict[str, Any] = {}
+            if args.get("target_id"):
+                extra["target_id"] = args["target_id"]
+            if args.get("target_slug"):
+                extra["target_slug"] = args["target_slug"]
+            body = {"input": {"input": args["input"]}}
+            if extra:
+                body["input"]["extra"] = extra
+            r = await c.post(f"{BASE}/api/agents/{args['slug']}/run", json=body)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "run_workflow_async":
+            extra = {}
+            if args.get("target_id"):
+                extra["target_id"] = args["target_id"]
+            if args.get("target_slug"):
+                extra["target_slug"] = args["target_slug"]
+            body = {"input": {"input": args["input"]}}
+            if extra:
+                body["input"]["extra"] = extra
+            r = await c.post(f"{BASE}/api/workflows/{args['slug']}/run", json=body)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name in ("run_status", "get_run"):
+            params = {"summary": "true"} if args.get("summary") else {}
+            r = await c.get(f"{BASE}/api/runs/{args['run_id']}", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "run_events":
+            params = {}
+            if args.get("after_ts"):
+                params["after_ts"] = args["after_ts"]
+            if args.get("kinds"):
+                params["kinds"] = args["kinds"]
+            if args.get("limit"):
+                params["limit"] = str(args["limit"])
+            r = await c.get(f"{BASE}/api/runs/{args['run_id']}/events", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "run_tree":
+            r = await c.get(f"{BASE}/api/runs/{args['run_id']}/tree")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "wait_run":
+            # Use a separate client with a larger timeout — the server itself
+            # waits up to timeout_s, and we need our HTTP read budget to cover it.
+            timeout_s = int(args.get("timeout_s") or 300)
+            params = {"timeout_s": str(timeout_s)}
+            if args.get("poll_interval_s") is not None:
+                params["poll_interval_s"] = str(args["poll_interval_s"])
+            if args.get("max_cost_usd") is not None:
+                params["max_cost_usd"] = str(args["max_cost_usd"])
+            if args.get("summary"):
+                params["summary"] = "true"
+            async with httpx.AsyncClient(timeout=timeout_s + 30) as wc:
+                r = await wc.get(f"{BASE}/api/runs/{args['run_id']}/wait", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "peek_run_output":
+            params = {}
+            if args.get("tail_events"):
+                params["tail_events"] = str(args["tail_events"])
+            r = await c.get(f"{BASE}/api/runs/{args['run_id']}/peek", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "run_agents_parallel":
+            r = await c.post(f"{BASE}/api/runs/parallel", json=args)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "cancel_run":
+            r = await c.post(f"{BASE}/api/runs/{args['run_id']}/cancel")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "cancel_all_runs":
+            r = await c.post(f"{BASE}/api/runs/cancel_all")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+
+        # --- Targets ---
+        if name == "list_targets":
+            params = {}
+            if args.get("include_deleted"):
+                params["include_deleted"] = "true"
+            if args.get("status"):
+                params["status"] = args["status"]
+            if args.get("q"):
+                params["q"] = args["q"]
+            if args.get("limit"):
+                params["limit"] = str(args["limit"])
+            r = await c.get(f"{BASE}/api/targets", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "get_target":
+            r = await c.get(f"{BASE}/api/targets/{args['slug']}")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "create_target":
+            r = await c.post(f"{BASE}/api/targets", json=args)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "update_target":
+            slug = args.pop("slug")
+            r = await c.put(f"{BASE}/api/targets/{slug}", json=args)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "delete_target":
+            params = {"hard": "true"} if args.get("hard") else {}
+            r = await c.delete(f"{BASE}/api/targets/{args['slug']}", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "restore_target":
+            r = await c.post(f"{BASE}/api/targets/{args['slug']}/restore")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "target_summary":
+            r = await c.get(f"{BASE}/api/targets/{args['slug']}/summary")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "list_target_runs":
+            params = {}
+            if args.get("limit"):
+                params["limit"] = str(args["limit"])
+            r = await c.get(f"{BASE}/api/targets/{args['slug']}/runs", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "link_run_to_target":
+            slug = args.pop("slug")
+            r = await c.post(f"{BASE}/api/targets/{slug}/link_run", json=args)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "unlink_run_from_target":
+            slug = args["slug"]; rid = args["run_id"]
+            params = {}
+            if args.get("include_descendants"):
+                params["include_descendants"] = "true"
+            r = await c.delete(f"{BASE}/api/targets/{slug}/link_run/{rid}", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "attach_pr_to_target":
+            slug = args.pop("slug")
+            r = await c.post(f"{BASE}/api/targets/{slug}/pr", json=args)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "detach_pr_from_target":
+            slug = args["slug"]; url = args["url"]
+            r = await c.delete(f"{BASE}/api/targets/{slug}/pr", params={"url": url})
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+
+        # --- Target Lessons ---
+        if name == "search_lessons":
+            params = {}
+            for k in ("tags", "category", "q"):
+                if args.get(k):
+                    params[k] = args[k]
+            if args.get("include_superseded"):
+                params["include_superseded"] = "true"
+            if args.get("limit"):
+                params["limit"] = str(args["limit"])
+            r = await c.get(f"{BASE}/api/lessons/search", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "list_target_lessons":
+            slug = args["slug"]
+            params = {}
+            if args.get("include_superseded"):
+                params["include_superseded"] = "true"
+            r = await c.get(f"{BASE}/api/targets/{slug}/lessons", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "create_target_lesson":
+            slug = args.pop("slug")
+            r = await c.post(f"{BASE}/api/targets/{slug}/lessons", json=args)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "update_target_lesson":
+            slug = args.pop("slug"); lesson_id = args.pop("lesson_id")
+            r = await c.put(f"{BASE}/api/targets/{slug}/lessons/{lesson_id}", json=args)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "delete_target_lesson":
+            slug = args["slug"]; lesson_id = args["lesson_id"]
+            params = {"hard": "true"} if args.get("hard") else {}
+            r = await c.delete(f"{BASE}/api/targets/{slug}/lessons/{lesson_id}", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+
+        # --- Lesson Applications / Metrics / Forecast ---
+        if name == "record_lesson_application":
+            r = await c.post(f"{BASE}/api/lessons/applications", json=args)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "list_lesson_applications":
+            params = {}
+            for k in ("lesson_id", "target_id", "outcome"):
+                if args.get(k):
+                    params[k] = args[k]
+            if args.get("limit"):
+                params["limit"] = str(args["limit"])
+            r = await c.get(f"{BASE}/api/lessons/applications", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "lesson_effectiveness":
+            r = await c.get(f"{BASE}/api/lessons/{args['lesson_id']}/effectiveness")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "lesson_forecast":
+            r = await c.post(f"{BASE}/api/lessons/forecast", json=args)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "lessons_metrics":
+            r = await c.get(f"{BASE}/api/lessons/metrics")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+
+        # --- Retro scores (Wave-6 A3) ---
+        if name == "list_retro_scores":
+            params = {}
+            if args.get("include_superseded"):
+                params["include_superseded"] = "true"
+            r = await c.get(f"{BASE}/api/runs/{args['run_id']}/retro-scores", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "override_retro_score":
+            run_id = args.pop("run_id")
+            dimension = args.pop("dimension")
+            r = await c.patch(f"{BASE}/api/runs/{run_id}/retro-scores/{dimension}", json=args)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "recompute_retro_score":
+            r = await c.post(f"{BASE}/api/runs/{args['run_id']}/retro-scores/recompute")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "get_retro_score_weights":
+            r = await c.get(f"{BASE}/api/retro-score-weights")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "set_retro_score_weights":
+            r = await c.put(f"{BASE}/api/retro-score-weights", json={"weights": args["weights"]})
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "list_pending_lessons":
+            params = {}
+            if args.get("limit"):
+                params["limit"] = str(args["limit"])
+            if args.get("offset"):
+                params["offset"] = str(args["offset"])
+            r = await c.get(f"{BASE}/api/lessons/pending", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "approve_pending_lesson":
+            r = await c.post(f"{BASE}/api/lessons/{args['lesson_id']}/approve")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "archive_lesson":
+            r = await c.post(f"{BASE}/api/lessons/{args['lesson_id']}/archive")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+
+        # --- Lesson consolidation (Wave-6 L2) ---
+        if name == "consolidate_lessons":
+            body: dict = {"lesson_ids": args["lesson_ids"], "title": args["title"], "content": args["content"]}
+            for k in ("category", "applicable_tags", "confidence", "target_id"):
+                if args.get(k) is not None:
+                    body[k] = args[k]
+            r = await c.post(f"{BASE}/api/lessons/consolidate", json=body)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "suggest_lesson_consolidation":
+            params: dict = {}
+            for k in ("min_overlap", "limit", "min_cluster_size"):
+                if args.get(k) is not None:
+                    params[k] = str(args[k])
+            r = await c.get(f"{BASE}/api/lessons/consolidate/suggestions", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "draft_consolidated_lesson":
+            r = await c.post(f"{BASE}/api/lessons/consolidate/draft", json={"lesson_ids": args["lesson_ids"]})
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+
+        # --- Run artefacts ---
+        if name == "add_run_artefact":
+            body = {k: v for k, v in args.items() if k != "run_id"}
+            r = await c.post(f"{BASE}/api/runs/{args['run_id']}/artefacts", json=body)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "list_run_artefacts":
+            r = await c.get(f"{BASE}/api/runs/{args['run_id']}/artefacts")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "get_run_artefact":
+            r = await c.get(f"{BASE}/api/runs/{args['run_id']}/artefacts/{args['name']}")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "delete_run_artefact":
+            r = await c.delete(f"{BASE}/api/runs/{args['run_id']}/artefacts/{args['name']}")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+
+        # --- dynamic per-resource runners (blocking) ---
+        if name.startswith("agent_"):
+            slug = _slug_from("agent_", name)
+            r = await c.post(f"{BASE}/api/agents/{slug}/run",
+                             json={"input": {"input": args.get("input", "")}})
+            if r.status_code != 200:
+                return _err(r.status_code, r.text)
+            run = await _poll_run(c, r.json()["run_id"])
+            return _ok(run)
+        if name.startswith("workflow_"):
+            slug = _slug_from("workflow_", name)
+            r = await c.post(f"{BASE}/api/workflows/{slug}/run",
+                             json={"input": {"input": args.get("input", "")}})
+            if r.status_code != 200:
+                return _err(r.status_code, r.text)
+            run = await _poll_run(c, r.json()["run_id"])
+            return _ok(run)
+
+        return _err(404, f"unknown tool: {name}")
+
+
+async def _async_main() -> None:
+    async with stdio_server() as (read, write):
+        await server.run(read, write, server.create_initialization_options())
+
+
+def main() -> None:
+    asyncio.run(_async_main())
+
+
+if __name__ == "__main__":
+    main()
