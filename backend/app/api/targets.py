@@ -6,12 +6,13 @@ rolls up runs/tokens/cost over the whole tree for retros + dashboards.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from ..db import get_session
+from ..db import get_session, session_scope
 from ..models import Run, Target
 from ..schemas import AttachPrIn, LinkRunIn, TargetIn, TargetOut, TargetSummary, TargetUpdate
 
@@ -74,7 +75,7 @@ def get_target(slug: str, include_deleted: bool = Query(False),
 
 
 @router.post("", response_model=TargetOut)
-def create_target(body: TargetIn, s: Session = Depends(get_session)):
+async def create_target(body: TargetIn, s: Session = Depends(get_session)):
     existing = s.query(Target).filter(Target.slug == body.slug).first()
     if existing is not None:
         if existing.deleted_at is not None:
@@ -85,24 +86,63 @@ def create_target(body: TargetIn, s: Session = Depends(get_session)):
     s.add(t)
     s.commit()
     s.refresh(t)
+    # GitHub sync — fire-and-forget
+    try:
+        from ..core.github_sync import create_target_issue
+        from ..core import security as _sec
+        _t_slug = t.slug
+        _t_name = t.name
+        _t_desc = t.description
+        _t_tags = list(t.tags or [])
+
+        async def _sync_new_target():
+            issue_number = await create_target_issue(
+                target_slug=_t_slug,
+                target_name=_t_name,
+                description=_t_desc,
+                tags=_t_tags,
+            )
+            if issue_number:
+                repo = _sec.get_setting("github_repo", "") or ""
+                with session_scope() as sync_s:
+                    from sqlalchemy import update as _upd
+                    sync_s.execute(
+                        _upd(Target).where(Target.slug == _t_slug).values(
+                            github_issue_number=issue_number,
+                            github_issue_url=f"https://github.com/{repo}/issues/{issue_number}",
+                        )
+                    )
+
+        asyncio.create_task(_sync_new_target())
+    except Exception:
+        pass
     return t
 
 
 @router.put("/{slug}", response_model=TargetOut)
-def update_target(slug: str, body: TargetUpdate, s: Session = Depends(get_session)):
+async def update_target(slug: str, body: TargetUpdate, s: Session = Depends(get_session)):
     t = s.query(Target).filter(Target.slug == slug).first()
     if not t:
         raise HTTPException(404, "not found")
     if t.deleted_at is not None:
         raise HTTPException(409, "target is soft-deleted — restore it first")
     patch = body.model_dump(exclude_unset=True)
+    new_status = patch.get("status")
     # If status flips to a terminal value and ended_at not set, auto-stamp it.
-    if patch.get("status") in ("completed", "cancelled", "abandoned") and t.ended_at is None:
+    if new_status in ("completed", "cancelled", "abandoned") and t.ended_at is None:
         patch.setdefault("ended_at", datetime.utcnow())
     for k, v in patch.items():
         setattr(t, k, v)
     s.commit()
     s.refresh(t)
+    # GitHub sync — fire-and-forget when status changes
+    try:
+        _gh_issue_num = getattr(t, "github_issue_number", None)
+        if new_status and _gh_issue_num:
+            from ..core.github_sync import update_target_issue
+            asyncio.create_task(update_target_issue(_gh_issue_num, new_status))
+    except Exception:
+        pass
     return t
 
 

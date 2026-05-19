@@ -24,7 +24,8 @@ router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 _KNOWN = {"command_timeout_seconds", "security_mode",
           "command_allowlist", "command_denylist",
-          "rag_provider", "retro_score_weights"}
+          "rag_provider", "retro_score_weights",
+          "github_sync_enabled", "github_repo", "github_webhook_secret"}
 
 
 class SettingPatch(BaseModel):
@@ -39,6 +40,9 @@ def get_all_settings():
     return {
         **security.all_settings(),
         "rag_provider": rag if isinstance(rag, dict) else _default_provider(),
+        "github_sync_enabled": security.get_setting("github_sync_enabled", False),
+        "github_repo": security.get_setting("github_repo", ""),
+        "github_webhook_secret": security.get_setting("github_webhook_secret", ""),
         # exposed for the UI so it can show "(default)" badges
         "_defaults": {
             "command_timeout_seconds": security.DEFAULT_COMMAND_TIMEOUT,
@@ -97,6 +101,20 @@ def update_setting(key: str, body: SettingPatch):
             return set_retro_score_weights(RetroWeightsIn(weights=body.value), s=s)
         finally:
             s.close()
+    elif key == "github_sync_enabled":
+        if not isinstance(body.value, bool):
+            raise HTTPException(400, "github_sync_enabled must be a boolean")
+        security.set_setting(key, body.value)
+    elif key == "github_repo":
+        if not isinstance(body.value, str):
+            raise HTTPException(400, "github_repo must be a string")
+        if body.value and "/" not in body.value:
+            raise HTTPException(400, "github_repo must be in 'owner/repo' format")
+        security.set_setting(key, body.value)
+    elif key == "github_webhook_secret":
+        if not isinstance(body.value, str):
+            raise HTTPException(400, "github_webhook_secret must be a string")
+        security.set_setting(key, body.value)
     else:
         # Unknown setting: accept verbatim (forward-compatible)
         security.set_setting(key, body.value)

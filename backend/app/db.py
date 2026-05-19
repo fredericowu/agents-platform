@@ -139,6 +139,12 @@ def _apply_inline_migrations() -> None:
             # Wave-6 L1: FK to the retro run that authored this lesson
             _ensure_column(conn, "target_lessons", "created_in_run_id",
                            "created_in_run_id VARCHAR")
+        # GitHub Issues mirror columns
+        _ensure_column(conn, "runs", "github_issue_number", "github_issue_number INTEGER")
+        _ensure_column(conn, "runs", "github_issue_url", "github_issue_url TEXT")
+        if "targets" in insp.get_table_names():
+            _ensure_column(conn, "targets", "github_issue_number", "github_issue_number INTEGER")
+            _ensure_column(conn, "targets", "github_issue_url", "github_issue_url TEXT")
 
 
 def _backfill_lesson_evidence_runs(conn) -> None:

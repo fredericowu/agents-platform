@@ -92,6 +92,8 @@ class Run(Base):
     target_id: Mapped[str] = mapped_column(String, ForeignKey("targets.id"), nullable=False, index=True)
 
     retro_score_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    github_issue_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    github_issue_url: Mapped[str | None] = mapped_column(String, nullable=True)
 
     events: Mapped[list["RunEvent"]] = relationship(back_populates="run", cascade="all, delete-orphan")
     children: Mapped[list["Run"]] = relationship("Run",
@@ -127,6 +129,8 @@ class Target(Base):
     # First-class PR linkage — each delivery may produce 1+ PRs (per-repo, stacked, retry).
     # Each entry: {url, title?, status?: open|merged|closed, ci_status?: passing|failing|pending}.
     pr_urls: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    github_issue_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    github_issue_url: Mapped[str | None] = mapped_column(String, nullable=True)
     created_by: Mapped[str | None] = mapped_column(String, nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     started_at: Mapped[datetime] = mapped_column(DateTime, default=_now)

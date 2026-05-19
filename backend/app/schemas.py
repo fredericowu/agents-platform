@@ -130,6 +130,8 @@ class RunOut(_Base):
     node_id: str | None = None
     model_slug: str | None = None
     target_id: str | None = None
+    github_issue_number: int | None = None
+    github_issue_url: str | None = None
 
 
 class RunEventOut(_Base):
@@ -192,6 +194,8 @@ class TargetOut(_Base):
     tags: list[str] = []
     notes: str = ""
     pr_urls: list[dict[str, Any]] = []
+    github_issue_number: int | None = None
+    github_issue_url: str | None = None
     created_by: str | None = None
     deleted_at: datetime | None = None
     started_at: datetime

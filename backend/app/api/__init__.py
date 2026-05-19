@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from . import agents, consolidation, evals, health, lessons, mcp, models, playground, retro_scores, runs, settings, skills, targets, tools, workflows
+from . import agents, consolidation, evals, github, health, lessons, mcp, models, playground, retro_scores, runs, settings, skills, targets, tools, workflows
 
 api_router = APIRouter()
 api_router.include_router(health.router)
@@ -22,3 +22,4 @@ api_router.include_router(tools.router)
 api_router.include_router(evals.router)
 api_router.include_router(playground.router)
 api_router.include_router(settings.router)
+api_router.include_router(github.router)

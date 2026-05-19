@@ -183,6 +183,9 @@ export type PlatformSettings = {
   command_allowlist: string[];
   command_denylist: string[];
   rag_provider?: RagProviderConfig;
+  github_sync_enabled?: boolean;
+  github_repo?: string;
+  github_webhook_secret?: string;
   _defaults?: {
     command_timeout_seconds: number;
     security_mode: "insecure" | "secure";
@@ -470,6 +473,9 @@ export const api = {
       method: "PUT", body: JSON.stringify({ value }),
     }),
   resetSettings: () => call<PlatformSettings>("/api/settings/reset", { method: "POST" }),
+
+  testGithubConnection: () =>
+    call<{ ok: boolean; output: string }>("/api/github/test", { method: "POST" }),
 
   getRetroScoreWeights: () => call<RetroScoreWeights>("/api/retro-score-weights"),
   setRetroScoreWeights: (weights: Record<string, number>) =>

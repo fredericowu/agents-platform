@@ -227,6 +227,7 @@ async def run_agent(
             err = "cancelled by user"
     else:
         status = "error" if err else "success"
+    _gh_issue_number = None
     with session_scope() as s:
         r = s.query(Run).filter(Run.id == run_id).first()
         if r:
@@ -237,7 +238,21 @@ async def run_agent(
             r.tokens_out = tout
             r.cost_usd = cost
             r.ended_at = datetime.utcnow()
+            _gh_issue_number = getattr(r, "github_issue_number", None)
     score_run_terminal(run_id)
+    try:
+        if _gh_issue_number:
+            from .github_sync import update_run_issue
+            asyncio.create_task(update_run_issue(
+                issue_number=_gh_issue_number,
+                status=status,
+                tokens_in=tin,
+                tokens_out=tout,
+                cost_usd=cost,
+                error=err,
+            ))
+    except Exception:
+        pass
     await emit("node_end", {"text": text[:500], "tokens_in": tin, "tokens_out": tout,
                             "cost_usd": cost, "run_id": run_id},
                node=node_id or agent_slug)
@@ -420,6 +435,7 @@ async def run_workflow(
         # the output dict carries the `limit_reached` flag.
         status = "success"
     # roll-up totals from children
+    _wf_gh_issue_number = None
     with session_scope() as s:
         children = s.query(Run).filter(Run.parent_run_id == run_id).all()
         rollup_in = sum(c.tokens_in for c in children)
@@ -434,7 +450,21 @@ async def run_workflow(
             r.tokens_out = rollup_out
             r.cost_usd = rollup_cost
             r.ended_at = datetime.utcnow()
+            _wf_gh_issue_number = getattr(r, "github_issue_number", None)
     score_run_terminal(run_id)
+    try:
+        if _wf_gh_issue_number:
+            from .github_sync import update_run_issue
+            asyncio.create_task(update_run_issue(
+                issue_number=_wf_gh_issue_number,
+                status=status,
+                tokens_in=rollup_in,
+                tokens_out=rollup_out,
+                cost_usd=rollup_cost,
+                error=err,
+            ))
+    except Exception:
+        pass
     budget_snap = hops.get(root_id)
     await bus.publish(run_id, "node_end", {"final": "<wf done>",
                                            "tokens_in": rollup_in,
@@ -534,6 +564,48 @@ def start_agent_run_bg(agent_slug: str, user_input: str, *,
             await bus.publish(rid, "done", {})
             await bus.close(rid)
 
+    # GitHub sync: create issue for this run (fire-and-forget)
+    try:
+        from .github_sync import create_run_issue
+        _gh_rid = rid
+        _gh_target_id = target_id
+        _gh_agent_slug = agent_slug
+        _gh_model_slug = model_slug
+        _gh_input = str(user_input)[:200]
+
+        async def _create_agent_run_issue():
+            _t_issue_num = None
+            try:
+                with session_scope() as ss:
+                    from ..models import Target as _GT
+                    gt = ss.query(_GT).filter(_GT.id == _gh_target_id).first()
+                    if gt:
+                        _t_issue_num = getattr(gt, "github_issue_number", None)
+            except Exception:
+                pass
+            issue_num = await create_run_issue(
+                run_id=_gh_rid,
+                agent_slug=_gh_agent_slug,
+                model_slug=_gh_model_slug,
+                target_issue_number=_t_issue_num,
+                target_name="",
+                input_summary=_gh_input,
+            )
+            if issue_num:
+                from .security import get_setting
+                repo = get_setting("github_repo", "") or ""
+                with session_scope() as ss:
+                    from ..models import Run as _RM
+                    from sqlalchemy import update as _upd
+                    ss.execute(_upd(_RM).where(_RM.id == _gh_rid).values(
+                        github_issue_number=issue_num,
+                        github_issue_url=f"https://github.com/{repo}/issues/{issue_num}",
+                    ))
+
+        asyncio.create_task(_create_agent_run_issue())
+    except Exception:
+        pass
+
     asyncio.create_task(_go())
     return rid
 
@@ -569,6 +641,47 @@ def start_workflow_run_bg(workflow_slug: str, user_input: Any, *,
                                target_id=target_id)
         finally:
             await bus.close(rid)
+
+    # GitHub sync: create issue for this workflow run (fire-and-forget)
+    try:
+        from .github_sync import create_run_issue
+        _gh_wrid = rid
+        _gh_wtarget_id = target_id
+        _gh_wf_slug = workflow_slug
+        _gh_winput = str(user_input)[:200]
+
+        async def _create_wf_run_issue():
+            _t_issue_num = None
+            try:
+                with session_scope() as ss:
+                    from ..models import Target as _GT
+                    gt = ss.query(_GT).filter(_GT.id == _gh_wtarget_id).first()
+                    if gt:
+                        _t_issue_num = getattr(gt, "github_issue_number", None)
+            except Exception:
+                pass
+            issue_num = await create_run_issue(
+                run_id=_gh_wrid,
+                agent_slug=_gh_wf_slug,
+                model_slug=None,
+                target_issue_number=_t_issue_num,
+                target_name="",
+                input_summary=_gh_winput,
+            )
+            if issue_num:
+                from .security import get_setting
+                repo = get_setting("github_repo", "") or ""
+                with session_scope() as ss:
+                    from ..models import Run as _RM
+                    from sqlalchemy import update as _upd
+                    ss.execute(_upd(_RM).where(_RM.id == _gh_wrid).values(
+                        github_issue_number=issue_num,
+                        github_issue_url=f"https://github.com/{repo}/issues/{issue_num}",
+                    ))
+
+        asyncio.create_task(_create_wf_run_issue())
+    except Exception:
+        pass
 
     asyncio.create_task(_go())
     return rid

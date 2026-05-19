@@ -17,6 +17,12 @@ export default function Settings() {
   const [ragHealth, setRagHealth] = useState<RagHealth | null>(null);
   const [ragResyncResult, setRagResyncResult] = useState<string>("");
 
+  // GitHub settings
+  const [ghEnabled, setGhEnabled] = useState(false);
+  const [ghRepo, setGhRepo] = useState("");
+  const [ghSecret, setGhSecret] = useState("");
+  const [ghTestResult, setGhTestResult] = useState<{ ok: boolean; output: string } | null>(null);
+
   const RETRO_DIMS = ["cost", "wall", "mistakes", "lessons_applied", "plan_adherence",
                       "scope_discipline", "accuracy", "output_quality", "recovery"];
   const RETRO_DEFAULTS: Record<string, number> = {
@@ -39,6 +45,9 @@ export default function Settings() {
       setAllow((res.command_allowlist || []).join("\n"));
       setDeny((res.command_denylist || []).join("\n"));
       setRagJson(JSON.stringify(res.rag_provider || {}, null, 2));
+      setGhEnabled(!!res.github_sync_enabled);
+      setGhRepo(res.github_repo || "");
+      setGhSecret(res.github_webhook_secret || "");
     } catch (e: any) { setError(String(e.message || e)); }
     try {
       const rw = await api.getRetroScoreWeights();
@@ -307,6 +316,93 @@ export default function Settings() {
             <div><b>mcp</b> — future: dispatch to an MCP server. Not implemented yet.</div>
           </div>
         </details>
+      </div>
+
+      {/* ─────── GitHub Integration ─────── */}
+      <div className="card mb-4" data-testid="settings-github">
+        <h2 className="text-base font-semibold mb-1">GitHub Issues Integration</h2>
+        <div className="text-xs text-muted mb-3">
+          Mirror Targets and Runs to GitHub Issues. Requires the <span className="kbd">gh</span> CLI
+          to be authenticated. Bidirectional: closing a GitHub Issue cancels the linked run.
+        </div>
+
+        <FormRow label="Enable GitHub sync"
+                 hint="When enabled, new Targets and Runs are mirrored to GitHub Issues.">
+          <div className="flex items-center gap-2">
+            <input type="checkbox" checked={ghEnabled}
+                   onChange={e => {
+                     setGhEnabled(e.target.checked);
+                     save("github_sync_enabled", e.target.checked);
+                   }}
+                   data-testid="settings-gh-enabled" />
+            <span className="text-sm">{ghEnabled ? "Enabled" : "Disabled"}</span>
+          </div>
+        </FormRow>
+
+        <FormRow label="GitHub Repository"
+                 hint="Repository in 'owner/repo' format where issues will be created.">
+          <div className="flex items-center gap-2">
+            <input type="text" className="w-64 font-mono text-sm"
+                   placeholder="owner/repo"
+                   value={ghRepo}
+                   onChange={e => setGhRepo(e.target.value)}
+                   data-testid="settings-gh-repo" />
+            <button className="btn btn-primary"
+                    disabled={saving === "github_repo" || ghRepo === (s.github_repo || "")}
+                    onClick={() => save("github_repo", ghRepo)}
+                    data-testid="settings-gh-repo-save">
+              {saving === "github_repo" ? "saving…" : "save"}
+            </button>
+          </div>
+        </FormRow>
+
+        <FormRow label="Webhook Secret"
+                 hint="Secret to verify incoming GitHub webhooks. Leave blank to skip verification.">
+          <div className="flex items-center gap-2">
+            <input type="password" className="w-64 font-mono text-sm"
+                   value={ghSecret}
+                   onChange={e => setGhSecret(e.target.value)}
+                   data-testid="settings-gh-secret" />
+            <button className="btn btn-primary"
+                    disabled={saving === "github_webhook_secret" || ghSecret === (s.github_webhook_secret || "")}
+                    onClick={() => save("github_webhook_secret", ghSecret)}
+                    data-testid="settings-gh-secret-save">
+              {saving === "github_webhook_secret" ? "saving…" : "save"}
+            </button>
+          </div>
+        </FormRow>
+
+        <div className="card mt-3 mb-2" style={{ padding: 10, background: "var(--bg-muted, #f5f5f5)" }}>
+          <div className="text-xs text-muted">
+            <b>Webhook URL:</b> <span className="font-mono">https://your-domain/api/github/webhook</span>
+            <br />Configure this in your GitHub repo → Settings → Webhooks. Select <b>Issues</b> events.
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2 mt-2 flex-wrap">
+          <button className="btn btn-ghost"
+                  onClick={async () => {
+                    setGhTestResult(null);
+                    try {
+                      const r = await api.testGithubConnection();
+                      setGhTestResult(r);
+                    } catch (e: any) {
+                      setGhTestResult({ ok: false, output: String(e.message || e) });
+                    }
+                  }}
+                  data-testid="settings-gh-test">test connection</button>
+          {ghTestResult && (
+            <span className={`badge ${ghTestResult.ok ? "badge-success" : "badge-crit"}`}
+                  data-testid="settings-gh-test-result">
+              {ghTestResult.ok ? "✓ ok" : "✗ failed"}
+            </span>
+          )}
+          {ghTestResult?.output && (
+            <span className="text-xs text-muted font-mono" style={{ maxWidth: 400, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {ghTestResult.output}
+            </span>
+          )}
+        </div>
       </div>
 
       {/* ─────── Retro-Score Weights ─────── */}
