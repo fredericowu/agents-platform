@@ -29,7 +29,7 @@ from .models import Agent, Eval, Model, Workflow
 # Models — provider configurations
 # ----------------------------------------------------------------------
 
-WORKSPACE = str(settings.workspace_root)        # /Users/.../dt-loco2
+WORKSPACE = str(settings.workspace_root)
 
 def _cli_params(cli: str, model: str | None = None, *, readonly: bool = False, timeout: int = 900) -> dict:
     base = {
@@ -140,37 +140,6 @@ SEED_MODELS = [
      "params": {"cli": "aider", "extra_args": ["--no-pretty"],
                 "cwd": WORKSPACE, "timeout_s": 900, "stream_json": False,
                 "dangerous_skip_permissions": False}},
-
-    # ============================================================
-    # Ollama (local LLM runtime — Llama, Mistral, Qwen, Phi, etc.)
-    # Common defaults; the auto-detector below adds whatever is actually
-    # `ollama pull`-ed on this machine at seed time.
-    # ============================================================
-    {"slug": "ollama-llama3-1", "provider": "cli_subshell", "model_id": "ollama-llama3.1",
-     "display_name": "Ollama – Llama 3.1 8B (local, free)",
-     "params": {"cli": "ollama", "extra_args": ["run", "llama3.1"],
-                "stream_json": False, "dangerous_skip_permissions": False,
-                "timeout_s": 300}},
-    {"slug": "ollama-qwen2-5-coder", "provider": "cli_subshell", "model_id": "ollama-qwen2.5-coder",
-     "display_name": "Ollama – Qwen 2.5 Coder 7B (local)",
-     "params": {"cli": "ollama", "extra_args": ["run", "qwen2.5-coder"],
-                "stream_json": False, "dangerous_skip_permissions": False,
-                "timeout_s": 300}},
-    {"slug": "ollama-codellama", "provider": "cli_subshell", "model_id": "ollama-codellama",
-     "display_name": "Ollama – CodeLlama 13B (local)",
-     "params": {"cli": "ollama", "extra_args": ["run", "codellama"],
-                "stream_json": False, "dangerous_skip_permissions": False,
-                "timeout_s": 300}},
-    {"slug": "ollama-mistral", "provider": "cli_subshell", "model_id": "ollama-mistral",
-     "display_name": "Ollama – Mistral 7B (local)",
-     "params": {"cli": "ollama", "extra_args": ["run", "mistral"],
-                "stream_json": False, "dangerous_skip_permissions": False,
-                "timeout_s": 300}},
-    {"slug": "ollama-phi3", "provider": "cli_subshell", "model_id": "ollama-phi3",
-     "display_name": "Ollama – Phi-3 (local, tiny+fast)",
-     "params": {"cli": "ollama", "extra_args": ["run", "phi3"],
-                "stream_json": False, "dangerous_skip_permissions": False,
-                "timeout_s": 180}},
 
     # ============================================================
     # API-direct (require keys in env)
@@ -315,7 +284,7 @@ SEED_AGENTS = [
         "Increment confidence if multiple Targets now share this lesson.\n"
         "  3. If hits are partial → consider whether to MERGE (update existing) or DIVERGE "
         "(create new + reference the existing via the body). Prefer merge.\n"
-        "  4. If no hits → search the KB via `mcp__loco-knowledge-base__search_knowledge_base` "
+        "  4. If no hits → search the KB via `mcp__aw-knowledge-base__search_knowledge_base` "
         "for related domain articles. If a KB article covers this lesson, REFERENCE it in the "
         "lesson body rather than duplicating. If the KB is silent, create the lesson and "
         "consider whether the KB should also be updated.\n"
@@ -413,9 +382,7 @@ SEED_AGENTS = [
         "architecture and conventions. Preserve what works.\n"
         "\n"
         "STRICT RULES:\n"
-        "- Stay inside the project path the user gave you. Do NOT touch this "
-        "  platform's own source tree (e.g. the agents repo at "
-        "  /Users/.../dt-loco2/repos/agents).\n"
+        "- Stay inside the project path the user gave you.\n"
         "- NEVER start a dev server or probe HTTP ports. Verification uses "
         "  STATIC commands only: `npm run build`, `tsc`, `pytest`, `cargo "
         "  build`, etc.\n"

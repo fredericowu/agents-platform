@@ -40,10 +40,6 @@ export default function App() {
   return (
     <div className="flex h-full">
       <aside className="w-56 border-r border-line bg-bg-2 flex flex-col">
-        <div className="px-4 py-4 border-b border-line">
-          <div className="text-lg font-semibold text-accent">agents</div>
-          <div className="text-xs text-muted">platform · v0.1</div>
-        </div>
         <nav className="flex-1 py-2">
           {NAV.map(({ path, label, icon: Icon, exact }) => (
             <NavLink
@@ -62,9 +58,6 @@ export default function App() {
             </NavLink>
           ))}
         </nav>
-        <div className="px-4 py-3 text-xs text-muted border-t border-line">
-          <div>API: <span className="kbd">localhost:8765</span></div>
-        </div>
       </aside>
       <main className="flex-1 overflow-auto">
         <Routes>

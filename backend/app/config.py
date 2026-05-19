@@ -10,7 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 REPO_ROOT = Path(__file__).resolve().parents[2]          # repos/agents/
 # Guard against shallow paths when running inside Docker (e.g. WORKDIR=/app → parents[1] DNE)
 try:
-    WORKSPACE_ROOT = REPO_ROOT.parents[1]                 # workspace root (.../dt-loco2)
+    WORKSPACE_ROOT = REPO_ROOT.parents[1]
 except IndexError:
     WORKSPACE_ROOT = REPO_ROOT                            # fallback: container root
 
@@ -22,8 +22,8 @@ class Settings(BaseSettings):
     repo_root: Path = REPO_ROOT
     workspace_root: Path = WORKSPACE_ROOT
 
-    # Database
-    database_url: str = f"sqlite:///{REPO_ROOT / 'data' / 'agents.db'}"
+    # Database (PostgreSQL — shared aw-postgres instance)
+    database_url: str = "postgresql://postgres:postgres@localhost:5432/agents_platform"
 
     # MCP discovery
     mcp_json_path: Path = WORKSPACE_ROOT / ".mcp.json"

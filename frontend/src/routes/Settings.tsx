@@ -242,7 +242,7 @@ export default function Settings() {
         <div className="text-xs text-muted mb-3">
           Configures where lessons learned are <b>stored</b> (as markdown documents) and <b>semantically searched</b>.
           The structured side (effectiveness, tags, applications) always stays in the platform's <code>target_lessons</code> table —
-          this setting controls the vector / RAG side. Default points at the local <code>loco-knowledge-base</code> via its HTTP API.
+          this setting controls the vector / RAG side. Default points at the local <code>aw-knowledge-base</code> via its HTTP API.
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-3">
@@ -252,7 +252,7 @@ export default function Settings() {
           </div>
           <div className="card" style={{ padding: 10 }}>
             <div className="text-xs text-muted uppercase">Backend</div>
-            <div className="font-mono mt-1 text-sm">{s.rag_provider?.name || "loco-knowledge-base"}</div>
+            <div className="font-mono mt-1 text-sm">{s.rag_provider?.name || "aw-knowledge-base"}</div>
             <div className="text-xs text-muted">{s.rag_provider?.base_url}</div>
           </div>
           <div className="card" style={{ padding: 10 }}>
@@ -303,7 +303,7 @@ export default function Settings() {
           <summary className="text-xs text-muted cursor-pointer">📘 supported `kind` values + example config</summary>
           <div className="text-xs text-muted mt-2 space-y-2">
             <div><b>disabled</b> — no RAG. Lessons live only in <code>target_lessons</code> SQL table. <code>search_lessons</code> falls back to tag/SQL only.</div>
-            <div><b>http</b> — generic HTTP backend with templated endpoints. Default for loco-knowledge-base. Endpoint paths can interpolate <code>$path</code> / <code>$query</code> / <code>$n_results</code> / <code>$content</code>.</div>
+            <div><b>http</b> — generic HTTP backend with templated endpoints. Default for aw-knowledge-base. Endpoint paths can interpolate <code>$path</code> / <code>$query</code> / <code>$n_results</code> / <code>$content</code>.</div>
             <div><b>mcp</b> — future: dispatch to an MCP server. Not implemented yet.</div>
           </div>
         </details>

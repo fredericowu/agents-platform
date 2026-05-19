@@ -22,13 +22,11 @@ frontend/node_modules/
 frontend/.vite/
 
 # ── Runtime data / databases ──────────────────────────────────────────────────
+data/
 *.db
 *.db.*
 *.sqlite
 *.sqlite3
-data/*.log
-data/*.bak*
-data/*.bak-*
 
 # ── Secrets & environment ──────────────────────────────────────────────────────
 .env

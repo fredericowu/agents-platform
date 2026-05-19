@@ -7,7 +7,7 @@ name = "agents-platform"
 version = "0.1.0"
 description = "Multi-agent platform: LangGraph orchestration, UI, CLI, MCP server"
 requires-python = ">=3.11"
-authors = [{ name = "Fred", email = "fred.diaswu@coxautoinc.com" }]
+authors = [{ name = "Frederico Wu", email = "fredericowu@gmail.com" }]
 dependencies = [
   # Web
   "fastapi>=0.115",

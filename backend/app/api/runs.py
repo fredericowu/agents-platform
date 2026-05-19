@@ -297,13 +297,18 @@ async def run_agents_parallel(body: _ParallelDispatch, s: Session = Depends(get_
     if len(body.agents) > 20:
         raise HTTPException(400, "max 20 parallel agents per dispatch")
 
-    # Resolve target
+    # Resolve target — fall back to "agents-platform" default if not supplied
     target_id = body.target_id
     if target_id is None and body.target_slug:
         t = s.query(Target).filter(Target.slug == body.target_slug).first()
         if t is None:
             raise HTTPException(404, f"target slug '{body.target_slug}' not found")
         target_id = t.id
+    if target_id is None:
+        default = s.query(Target).filter(Target.slug == "agents-platform").first()
+        target_id = default.id if default else None
+    if target_id is None:
+        raise HTTPException(400, "target_slug is required for parallel dispatch")
 
     # Validate every agent slug up front
     for spec in body.agents:

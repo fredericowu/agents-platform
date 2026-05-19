@@ -40,7 +40,7 @@ class Agent(Base):
     system_prompt: Mapped[str] = mapped_column(Text, default="")
     use_cases: Mapped[list[str]] = mapped_column(JSON, default=list)       # ["Greenfield product research", "Domain investigation"] — when to pick this agent
     model_slug: Mapped[str | None] = mapped_column(String, ForeignKey("models.slug"), nullable=True)
-    tool_specs: Mapped[list[Any]] = mapped_column(JSON, default=list)      # ["code.read_file", "mcp.cai-mcp.searchCode", ...]
+    tool_specs: Mapped[list[Any]] = mapped_column(JSON, default=list)      # ["code.read_file", ...]
     skill_slugs: Mapped[list[str]] = mapped_column(JSON, default=list)
     params: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)     # {temperature, max_tokens, ...}
     builtin: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -89,8 +89,7 @@ class Run(Base):
     model_slug: Mapped[str | None] = mapped_column(String, nullable=True)     # model actually used at runtime
 
     # Target — first-class umbrella linking a tree of runs to an overall goal.
-    # Nullable for legacy/standalone runs not associated with a Target.
-    target_id: Mapped[str | None] = mapped_column(String, ForeignKey("targets.id"), nullable=True, index=True)
+    target_id: Mapped[str] = mapped_column(String, ForeignKey("targets.id"), nullable=False, index=True)
 
     retro_score_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 

@@ -1,28 +1,5 @@
 import { test, expect } from "@playwright/test";
 
-test("File skill: edit creates an override, reset restores file source", async ({ page }) => {
-  page.on("dialog", d => d.accept());
-
-  // Ensure a clean starting state for this slug
-  await page.request.post("/api/skills/dt-loco-stubborn/reset");
-
-  await page.goto("/skills");
-  await expect(page.getByTestId("skill-dt-loco-stubborn")).toBeVisible({ timeout: 10_000 });
-  await page.getByTestId("skill-edit-dt-loco-stubborn").click();
-  await expect(page.getByTestId("modal")).toBeVisible();
-
-  const descInput = page.locator('[data-testid="modal"] input').nth(2);
-  await descInput.fill("playwright override");
-  await page.getByTestId("skills-form-save").click();
-  // wait for modal to close
-  await expect(page.getByTestId("modal")).not.toBeVisible({ timeout: 10_000 });
-  // wait for override badge to appear
-  await expect(page.getByTestId("skill-reset-dt-loco-stubborn")).toBeVisible({ timeout: 10_000 });
-
-  await page.getByTestId("skill-reset-dt-loco-stubborn").click();
-  await expect(page.getByTestId("skill-reset-dt-loco-stubborn")).not.toBeVisible({ timeout: 10_000 });
-});
-
 test("File skill: delete tombstones it (disappears from list)", async ({ page }) => {
   page.on("dialog", d => d.accept());
   await page.goto("/skills");

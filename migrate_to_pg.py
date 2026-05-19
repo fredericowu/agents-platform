@@ -17,6 +17,7 @@ import json
 import os
 import sqlite3
 import sys
+from pathlib import Path
 
 # ── Must set before any backend imports — db.py creates the engine at import time ──
 PG_URL = os.environ.get(
@@ -39,7 +40,7 @@ print("Schema ready.\n")
 import psycopg2  # noqa: E402
 from psycopg2.extras import Json  # noqa: E402
 
-SQLITE_PATH = "/app/data/agents.db"
+SQLITE_PATH = os.environ.get("AGENTS_SQLITE_PATH", "/app/data/agents.db")
 
 # Boolean columns per table — SQLite stores 0/1 integers; PG needs True/False
 BOOL_COLS: dict[str, set[str]] = {

@@ -14,7 +14,7 @@ lives in the ``rag_provider`` setting (key/value JSON, default below).
 
 ## Supported `kind` values
 
-* ``http``      — A generic HTTP backend (loco-knowledge-base by default).
+* ``http``      — A generic HTTP backend (aw-knowledge-base by default).
                   Templated endpoints support arbitrary REST-shaped RAGs.
 * ``disabled``  — No RAG. ``search_lessons`` falls back to SQL-only,
                   upserts/deletes are no-ops.
@@ -23,8 +23,8 @@ lives in the ``rag_provider`` setting (key/value JSON, default below).
 
 ## Default config
 
-The default points at the local ``loco-knowledge-base`` service running on
-the loco port (read from .tmp/locoserv_api_key for auth). Set
+The default points at the local ``aw-knowledge-base`` service running on
+the aw port (read from .tmp/awserv_api_key for auth). Set
 ``settings.rag_provider`` to override.
 """
 from __future__ import annotations
@@ -41,13 +41,13 @@ from . import security
 
 # ----- defaults ---------------------------------------------------------------
 
-_LOCO_API_KEY_PATH = "/Users/fred.diaswu/workspace/dt-loco2/.tmp/locoserv_api_key"
-_LOCO_DEFAULT_PORT = 9123
+_aw_API_KEY_PATH = "/opt/agentic-workspace/.tmp/awserv_api_key"
+_aw_DEFAULT_PORT = 9123
 
 
-def _read_loco_api_key() -> str | None:
+def _read_aw_api_key() -> str | None:
     try:
-        return Path(_LOCO_API_KEY_PATH).read_text().strip()
+        return Path(_aw_API_KEY_PATH).read_text().strip()
     except Exception:
         return None
 
@@ -55,13 +55,13 @@ def _read_loco_api_key() -> str | None:
 def _default_provider() -> dict:
     return {
         "kind": "http",
-        "name": "loco-knowledge-base",
-        "base_url": f"http://127.0.0.1:{_LOCO_DEFAULT_PORT}",
+        "name": "aw-knowledge-base",
+        "base_url": f"http://127.0.0.1:{_aw_DEFAULT_PORT}",
         "auth": {
             # The actual key is read at call-time from this file so we don't
             # cache stale keys. If the file is missing, calls go un-keyed.
             "header": "x-api-key",
-            "value_from_file": _LOCO_API_KEY_PATH,
+            "value_from_file": _aw_API_KEY_PATH,
         },
         "lesson_path_prefix": "agent-platform/lessons/",
         "endpoints": {
@@ -200,7 +200,7 @@ class RagProvider:
         except Exception:
             return {"results": [{"path": "(non-json response)", "content": r.text[:500]}]}
 
-        # Normalize: loco's mcp-search returns ``{"results":[{path, content, score}]}``
+        # Normalize: aw's mcp-search returns ``{"results":[{path, content, score}]}``
         # — keep as-is. Other backends may differ; normalize when we add them.
         if op == "search":
             if isinstance(payload, list):

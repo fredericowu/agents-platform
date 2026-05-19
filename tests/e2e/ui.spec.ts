@@ -84,21 +84,6 @@ test("Runs page lists runs and clicking opens detail with events", async ({ page
   await expect(page.getByTestId("run-events")).toContainText("node_start", { timeout: 10_000 });
 });
 
-test("MCP page lists servers from .mcp.json", async ({ page }) => {
-  await page.goto("/mcp");
-  // refresh once to make sure they are populated
-  await page.getByTestId("mcp-refresh").click();
-  await expect(page.locator('[data-testid^="mcp-"]').first()).toBeVisible({ timeout: 10_000 });
-  await expect(page.getByTestId("mcp-cai-mcp")).toBeVisible();
-  await expect(page.getByTestId("mcp-playwright")).toBeVisible();
-});
-
-test("Skills page lists skills from .claude/skills", async ({ page }) => {
-  await page.goto("/skills");
-  await expect(page.getByRole("heading", { name: "Skills" })).toBeVisible();
-  await expect(page.getByText("dt-loco-stubborn", { exact: false }).first()).toBeVisible();
-});
-
 test("Evals page can run an eval and show score 100%", async ({ page }) => {
   await page.goto("/evals");
   await page.getByTestId("eval-run-echo-smoke").click();

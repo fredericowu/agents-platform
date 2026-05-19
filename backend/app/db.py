@@ -75,7 +75,7 @@ def _apply_inline_migrations() -> None:
         ("node_id", "VARCHAR"),
         ("model_slug", "VARCHAR"),
         # First-class target FK — links a tree of runs to an overall delivery goal.
-        ("target_id", "VARCHAR"),
+        ("target_id", "VARCHAR NOT NULL DEFAULT 'unlinked'"),
     ]
     with engine.begin() as conn:
         for col, ddl in additions:

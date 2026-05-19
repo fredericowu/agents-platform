@@ -302,7 +302,7 @@ def rag_health():
 @search_router.post("/rag/resync")
 def rag_resync(s: Session = Depends(get_session)):
     """One-shot full re-sync of every non-deleted lesson into the configured RAG.
-    Useful after switching providers (e.g. moving from loco-kb to a different
+    Useful after switching providers (e.g. moving from aw-kb to a different
     vector store) or after a bulk import."""
     lessons = (s.query(TargetLesson)
                  .filter(TargetLesson.deleted_at.is_(None))

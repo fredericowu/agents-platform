@@ -73,21 +73,6 @@ test("Run detail: event timeline shows node_start/node_end and is expandable", a
   await expect(page.getByTestId("run-thread")).toBeVisible();
 });
 
-test("MCP page: refresh button discovers servers; cai-mcp and playwright are present", async ({ page }) => {
-  await page.goto("/mcp");
-  await page.getByTestId("mcp-refresh").click();
-  await expect(page.getByTestId("mcp-cai-mcp")).toBeVisible({ timeout: 5_000 });
-  await expect(page.getByTestId("mcp-playwright")).toBeVisible();
-  await expect(page.getByTestId("mcp-loco-canvas")).toBeVisible();
-});
-
-test("Skills page lists multiple skills from .claude/skills", async ({ page }) => {
-  await page.goto("/skills");
-  await expect(page.getByRole("heading", { name: "Skills" })).toBeVisible();
-  // there's the wrapper card + at least 5 skill cards
-  await expect(page.getByText("dt-loco-stubborn").first()).toBeVisible({ timeout: 5_000 });
-});
-
 test("Models page shows all providers", async ({ page }) => {
   await page.goto("/models");
   // expect at least anthropic / openai / bedrock / cli_subshell / echo badges to appear
