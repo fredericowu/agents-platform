@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import Page from "../components/Page";
-import { api, type Target, type TargetSummary } from "../lib/api";
+import { api, type Run, type Target, type TargetSummary } from "../lib/api";
 import { ArrowLeft, CheckCircle2, XCircle, Loader2, AlertCircle, Ban, GitPullRequest, ExternalLink } from "lucide-react";
+import { useWsEvent } from "../lib/ws";
 
 const STATUS_BADGE: Record<string, string> = {
   active: "badge-info",
@@ -63,6 +64,23 @@ export default function TargetDetail() {
     }
   }
   useEffect(() => { load(); /* eslint-disable-next-line */ }, [slug]);
+
+  // Live target updates (status changes, github issue write-back, etc.)
+  useWsEvent<Target>("target_update", (data) => {
+    if (data.slug !== slug) return;
+    setTarget(data);
+    // Summary is computed — re-fetch when target changes
+    if (slug) api.getTargetSummary(slug).then(setSummary).catch(() => {});
+  }, [slug]);
+
+  // Live run updates linked to this target
+  useWsEvent<Run>("run_update", (data) => {
+    if (!target || data.target_id !== target.id) return;
+    if (slug) {
+      api.getTargetRuns(slug, 500).then(r => setRuns(r.runs)).catch(() => {});
+      api.getTargetSummary(slug).then(setSummary).catch(() => {});
+    }
+  }, [target?.id, slug]);
 
   async function markStatus(newStatus: string) {
     if (!target) return;

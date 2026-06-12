@@ -162,6 +162,64 @@ async def create_run_issue(
     return None
 
 
+async def _load_run_outcome(run_id: str) -> dict:
+    """Load run output, artefacts and any canvas/PR references from the DB.
+    Returns a dict with keys: output_text, artefacts, canvas_ids, pr_urls.
+    Safe to call — never raises; returns empty values on any error.
+    """
+    result = {"output_text": "", "artefacts": [], "canvas_ids": [], "pr_urls": []}
+    try:
+        from ..db import session_scope
+        from ..models import Run as _Run, RunArtefact as _RunArtefact
+        with session_scope() as s:
+            r = s.query(_Run).filter(_Run.id == run_id).first()
+            if r:
+                # --- extract readable output text ---
+                out = r.output or {}
+                if isinstance(out, dict):
+                    # Common keys agents use for their main response
+                    text = (out.get("text") or out.get("summary") or
+                            out.get("analysis") or out.get("output") or
+                            out.get("result") or out.get("findings") or "")
+                    if not text and out:
+                        # Fall back to a compact JSON representation
+                        text = json.dumps(out, indent=2, default=str)
+                    result["output_text"] = str(text)[:2500]
+
+                    # Canvas IDs that agents surface in their output
+                    for key in ("canvas_id", "plan_canvas_id", "report_canvas_id",
+                                "canvases", "canvas_ids"):
+                        val = out.get(key)
+                        if isinstance(val, str) and val:
+                            result["canvas_ids"].append(val)
+                        elif isinstance(val, list):
+                            result["canvas_ids"].extend(v for v in val if isinstance(v, str))
+
+                    # PR URLs the agent recorded in output
+                    for key in ("pr_url", "pr_urls", "pull_request_url"):
+                        val = out.get(key)
+                        if isinstance(val, str) and val:
+                            result["pr_urls"].append(val)
+                        elif isinstance(val, list):
+                            result["pr_urls"].extend(v for v in val if isinstance(v, str))
+
+            # --- collect artefacts (text + binary) ---
+            artefacts = s.query(_RunArtefact).filter(_RunArtefact.run_id == run_id).all()
+            for a in artefacts:
+                result["artefacts"].append({
+                    "name": a.name,
+                    "mime": a.mime,
+                    "size": a.size,
+                    "is_binary": a.is_binary,
+                })
+                # Canvas artefacts often have "canvas" in the name
+                if "canvas" in a.name.lower() and not a.is_binary:
+                    pass  # content stays in the platform; just surface the name
+    except Exception as e:
+        logger.debug("_load_run_outcome failed for run %s: %s", run_id, e)
+    return result
+
+
 async def update_run_issue(
     issue_number: int,
     status: str,
@@ -170,8 +228,13 @@ async def update_run_issue(
     cost_usd: float,
     error: Optional[str] = None,
     pr_url: Optional[str] = None,
+    run_id: Optional[str] = None,
 ) -> None:
-    """Update a run's GitHub Issue when it completes."""
+    """Update a run's GitHub Issue when it completes.
+
+    Posts a rich outcome comment (output, artefacts, canvases, PR link, errors)
+    before updating the issue body/labels and closing it.
+    """
     if not _gh_sync_enabled() or not issue_number:
         return
 
@@ -183,7 +246,65 @@ async def update_run_issue(
     }.get(status, "status:done")
     await _ensure_label(status_label)
 
-    # Get current body to append result
+    # --- Load enriched outcome from DB ----------------------------------------
+    outcome: dict = {}
+    if run_id:
+        outcome = await _load_run_outcome(run_id)
+
+    output_text: str = outcome.get("output_text", "")
+    artefacts: list = outcome.get("artefacts", [])
+    canvas_ids: list = outcome.get("canvas_ids", [])
+    # Merge PR URLs: explicit param takes precedence, then what the agent recorded
+    all_pr_urls: list[str] = []
+    if pr_url:
+        all_pr_urls.append(pr_url)
+    all_pr_urls.extend(u for u in outcome.get("pr_urls", []) if u not in all_pr_urls)
+
+    # --- Build outcome comment ------------------------------------------------
+    lines: list[str] = [
+        f"## {status_emoji} Outcome — {status.capitalize()}",
+        "",
+        f"**Tokens:** {tokens_in:,} in / {tokens_out:,} out &nbsp;·&nbsp; **Cost:** ${cost_usd:.4f}",
+    ]
+
+    if all_pr_urls:
+        lines += ["", "### Pull Requests"]
+        for url in all_pr_urls:
+            lines.append(f"- {url}")
+
+    if error:
+        lines += ["", "### Error"]
+        lines.append("```")
+        lines.append(error[:600])
+        lines.append("```")
+
+    if output_text:
+        lines += ["", "### Output"]
+        lines.append("<details><summary>Expand</summary>")
+        lines.append("")
+        lines.append("```")
+        lines.append(output_text)
+        lines.append("```")
+        lines.append("</details>")
+
+    if artefacts:
+        lines += ["", "### Artefacts"]
+        for a in artefacts:
+            size_kb = a["size"] / 1024
+            icon = "🖼️" if a["mime"].startswith("image/") else ("📊" if "canvas" in a["name"].lower() else "📄")
+            lines.append(f"- {icon} `{a['name']}` &nbsp; `{a['mime']}` &nbsp; {size_kb:.1f} kB")
+
+    if canvas_ids:
+        lines += ["", "### Canvases"]
+        for cid in canvas_ids:
+            lines.append(f"- `{cid}`")
+
+    comment_body = "\n".join(lines)
+
+    # Post the outcome comment BEFORE closing the issue
+    await _run_gh("issue", "comment", str(issue_number), "--body", comment_body)
+
+    # --- Update issue body (flip status line) ---------------------------------
     current = await _run_gh("issue", "view", str(issue_number), "--json", "body")
     current_body = ""
     if current:
@@ -192,18 +313,10 @@ async def update_run_issue(
         except Exception:
             pass
 
-    result_section = f"""
-## Result
-{status_emoji} **{status.capitalize()}**
-- Tokens: {tokens_in:,} in / {tokens_out:,} out
-- Cost: ${cost_usd:.4f}
-{"- Error: " + error[:200] if error else ""}
-{"- PR: " + pr_url if pr_url else ""}"""
-
-    new_body = current_body.replace("- **Status:** 🔄 Running",
-                                    f"- **Status:** {status_emoji} {status.capitalize()}")
-    if "## Result" not in new_body:
-        new_body += result_section
+    new_body = current_body.replace(
+        "- **Status:** 🔄 Running",
+        f"- **Status:** {status_emoji} {status.capitalize()}",
+    )
 
     await _run_gh("issue", "edit", str(issue_number), "--body", new_body)
     await _run_gh("issue", "edit", str(issue_number),

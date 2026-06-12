@@ -112,8 +112,23 @@ async def create_target(body: TargetIn, s: Session = Depends(get_session)):
                             github_issue_url=f"https://github.com/{repo}/issues/{issue_number}",
                         )
                     )
+                # WS broadcast — re-push target with github issue data
+                try:
+                    with session_scope() as sync_s2:
+                        updated_t = sync_s2.query(Target).filter(Target.slug == _t_slug).first()
+                        if updated_t:
+                            from ..core.events import ws_broadcast, _target_to_ws_dict
+                            await ws_broadcast("target_update", _target_to_ws_dict(updated_t))
+                except Exception:
+                    pass
 
         asyncio.create_task(_sync_new_target())
+    except Exception:
+        pass
+    # WS broadcast — notify clients about the new target
+    try:
+        from ..core.events import ws_broadcast, _target_to_ws_dict
+        asyncio.create_task(ws_broadcast("target_update", _target_to_ws_dict(t)))
     except Exception:
         pass
     return t
@@ -141,6 +156,12 @@ async def update_target(slug: str, body: TargetUpdate, s: Session = Depends(get_
         if new_status and _gh_issue_num:
             from ..core.github_sync import update_target_issue
             asyncio.create_task(update_target_issue(_gh_issue_num, new_status))
+    except Exception:
+        pass
+    # WS broadcast — notify clients about the updated target
+    try:
+        from ..core.events import ws_broadcast, _target_to_ws_dict
+        asyncio.create_task(ws_broadcast("target_update", _target_to_ws_dict(t)))
     except Exception:
         pass
     return t

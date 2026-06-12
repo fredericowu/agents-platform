@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { Crosshair } from "lucide-react";
 import { api, type Target } from "../lib/api";
+import { useWsEvent } from "../lib/ws";
 
 const cache = new Map<string, Target>();
 let fetchPromise: Promise<void> | null = null;
@@ -14,7 +15,7 @@ function warmCache(): Promise<void> {
   return fetchPromise;
 }
 
-export function TargetBadge({ id }: { id: string | null }) {
+export function TargetBadge({ id, slug }: { id: string | null; slug?: string | null }) {
   const [target, setTarget] = useState<Target | null>(
     id ? (cache.get(id) ?? null) : null,
   );
@@ -25,9 +26,23 @@ export function TargetBadge({ id }: { id: string | null }) {
       setTarget(cache.get(id)!);
       return;
     }
+    // Warm the bulk cache first; if still missing, fetch by slug directly.
     warmCache().then(() => {
-      setTarget(cache.get(id) ?? null);
+      if (cache.has(id)) {
+        setTarget(cache.get(id)!);
+      } else if (slug) {
+        api.getTarget(slug).then(t => {
+          cache.set(t.id, t);
+          setTarget(t);
+        }).catch(() => {});
+      }
     });
+  }, [id, slug]);
+
+  // Live updates — keep cache in sync so every badge re-renders on change.
+  useWsEvent<Target>("target_update", (t) => {
+    cache.set(t.id, t);
+    if (t.id === id) setTarget(t);
   }, [id]);
 
   if (!id || !target) return null;

@@ -5,6 +5,7 @@ import Page, { StatusBadge } from "../components/Page";
 import Modal from "../components/Modal";
 import { api, type Run, type RunArtefact, type RunEvent, type RunTree, type RunTreeNode, type Workflow, type RetroScoreSummary, type RetroScoreDimension } from "../lib/api";
 import { graphToReactFlow, deriveNodeStateFromEvents } from "../lib/graphFlow";
+import { useWsEvent } from "../lib/ws";
 
 const KIND_BADGE: Record<string, string> = {
   node_start: "badge-info",
@@ -49,17 +50,24 @@ export default function RunDetail() {
   const [overrideSaving, setOverrideSaving] = useState(false);
   const [expandedEvidence, setExpandedEvidence] = useState<Set<string>>(new Set());
 
+  // Initial load
   useEffect(() => {
     if (!id) return;
-    const load = () => {
-      api.getRun(id).then(setRun);
-      api.getRunEvents(id).then(setEvents);
+    api.getRun(id).then(setRun);
+    api.getRunEvents(id).then(setEvents);
+    api.getRunTree(id).then(setTree).catch(() => {});
+    api.listRunArtefacts(id).then(setArtefacts).catch(() => setArtefacts([]));
+  }, [id]);
+
+  // Live updates via WebSocket — refresh state whenever this run changes
+  useWsEvent<Run>("run_update", (data) => {
+    if (data.id !== id) return;
+    setRun(data);
+    if (id) {
+      api.getRunEvents(id).then(setEvents).catch(() => {});
       api.getRunTree(id).then(setTree).catch(() => {});
       api.listRunArtefacts(id).then(setArtefacts).catch(() => setArtefacts([]));
-    };
-    load();
-    const t = setInterval(load, 2000);
-    return () => clearInterval(t);
+    }
   }, [id]);
 
   useEffect(() => {

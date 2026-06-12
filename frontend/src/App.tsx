@@ -1,4 +1,6 @@
+import { useEffect } from "react";
 import { NavLink, Route, Routes, Navigate } from "react-router-dom";
+import { wsManager } from "./lib/ws";
 import Dashboard from "./routes/Dashboard";
 import Agents from "./routes/Agents";
 import AgentEdit from "./routes/AgentEdit";
@@ -37,6 +39,11 @@ const NAV = [
 ];
 
 export default function App() {
+  useEffect(() => {
+    wsManager.connect();
+    return () => wsManager.disconnect();
+  }, []);
+
   return (
     <div className="flex h-full">
       <aside className="w-56 border-r border-line bg-bg-2 flex flex-col">

@@ -1,4 +1,4 @@
-"""In-process event bus for live observability. Used by orchestrators and surfaced via SSE."""
+"""In-process event bus for live observability. Used by orchestrators and surfaced via SSE/WS."""
 from __future__ import annotations
 
 import asyncio
@@ -9,6 +9,86 @@ from typing import Any, AsyncIterator
 
 from ..db import session_scope
 from ..models import RunEvent
+
+# ---------------------------------------------------------------------------
+# Global WebSocket broadcast hub
+# ---------------------------------------------------------------------------
+# Stores WebSocket.send_json callables registered by api/ws.py.
+# Accessed by executor.py and targets.py to push live updates.
+_ws_clients: set[Any] = set()
+_ws_lock = asyncio.Lock()
+
+
+async def ws_broadcast(kind: str, data: dict[str, Any]) -> None:
+    """Broadcast a typed JSON message to every connected WebSocket client."""
+    message = {"kind": kind, "data": data}
+    async with _ws_lock:
+        clients = list(_ws_clients)
+    dead: list[Any] = []
+    for send_fn in clients:
+        try:
+            await send_fn(message)
+        except Exception:
+            dead.append(send_fn)
+    if dead:
+        async with _ws_lock:
+            for fn in dead:
+                _ws_clients.discard(fn)
+
+
+def _run_to_ws_dict(r: Any) -> dict[str, Any]:
+    """Serialize a Run SQLAlchemy row to a WS-safe dict (call inside session scope)."""
+    return {
+        "id": r.id,
+        "kind": r.kind,
+        "target_slug": r.target_slug,
+        "target_id": r.target_id,
+        "status": r.status,
+        "input": r.input,
+        "output": r.output,
+        "error": r.error,
+        "tokens_in": r.tokens_in or 0,
+        "tokens_out": r.tokens_out or 0,
+        "cost_usd": r.cost_usd or 0.0,
+        "started_at": r.started_at.isoformat() if r.started_at else None,
+        "ended_at": r.ended_at.isoformat() if r.ended_at else None,
+        "parent_run_id": r.parent_run_id,
+        "initiator_kind": r.initiator_kind,
+        "initiator_id": r.initiator_id,
+        "node_id": r.node_id,
+        "model_slug": r.model_slug,
+        "github_issue_number": getattr(r, "github_issue_number", None),
+        "github_issue_url": getattr(r, "github_issue_url", None),
+    }
+
+
+def _target_to_ws_dict(t: Any) -> dict[str, Any]:
+    """Serialize a Target SQLAlchemy row to a WS-safe dict (call inside session scope)."""
+    return {
+        "id": t.id,
+        "slug": t.slug,
+        "name": t.name,
+        "description": t.description,
+        "source_kind": t.source_kind,
+        "source_ref": t.source_ref,
+        "plan_canvas_id": t.plan_canvas_id,
+        "report_canvas_id": t.report_canvas_id,
+        "budget_tokens": t.budget_tokens,
+        "budget_usd": t.budget_usd,
+        "enforce_budget": t.enforce_budget,
+        "status": t.status,
+        "tags": t.tags or [],
+        "notes": t.notes or "",
+        "pr_urls": t.pr_urls or [],
+        "created_by": t.created_by,
+        "deleted_at": t.deleted_at.isoformat() if t.deleted_at else None,
+        "started_at": t.started_at.isoformat() if t.started_at else None,
+        "ended_at": t.ended_at.isoformat() if t.ended_at else None,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+        "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+        "github_issue_number": getattr(t, "github_issue_number", None),
+        "github_issue_url": getattr(t, "github_issue_url", None),
+    }
 
 
 class EventBus:

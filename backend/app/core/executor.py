@@ -228,6 +228,7 @@ async def run_agent(
     else:
         status = "error" if err else "success"
     _gh_issue_number = None
+    _run_ws_data: dict | None = None
     with session_scope() as s:
         r = s.query(Run).filter(Run.id == run_id).first()
         if r:
@@ -239,7 +240,16 @@ async def run_agent(
             r.cost_usd = cost
             r.ended_at = datetime.utcnow()
             _gh_issue_number = getattr(r, "github_issue_number", None)
+            from .events import _run_to_ws_dict
+            _run_ws_data = _run_to_ws_dict(r)
     score_run_terminal(run_id)
+    # WS broadcast — push terminal state to all connected clients
+    try:
+        if _run_ws_data:
+            from .events import ws_broadcast
+            asyncio.create_task(ws_broadcast("run_update", _run_ws_data))
+    except Exception:
+        pass
     try:
         if _gh_issue_number:
             from .github_sync import update_run_issue
@@ -250,6 +260,7 @@ async def run_agent(
                 tokens_out=tout,
                 cost_usd=cost,
                 error=err,
+                run_id=run_id,
             ))
     except Exception:
         pass
@@ -436,6 +447,7 @@ async def run_workflow(
         status = "success"
     # roll-up totals from children
     _wf_gh_issue_number = None
+    _wf_run_ws_data: dict | None = None
     with session_scope() as s:
         children = s.query(Run).filter(Run.parent_run_id == run_id).all()
         rollup_in = sum(c.tokens_in for c in children)
@@ -451,7 +463,16 @@ async def run_workflow(
             r.cost_usd = rollup_cost
             r.ended_at = datetime.utcnow()
             _wf_gh_issue_number = getattr(r, "github_issue_number", None)
+            from .events import _run_to_ws_dict
+            _wf_run_ws_data = _run_to_ws_dict(r)
     score_run_terminal(run_id)
+    # WS broadcast — push terminal state to all connected clients
+    try:
+        if _wf_run_ws_data:
+            from .events import ws_broadcast
+            asyncio.create_task(ws_broadcast("run_update", _wf_run_ws_data))
+    except Exception:
+        pass
     try:
         if _wf_gh_issue_number:
             from .github_sync import update_run_issue
@@ -462,6 +483,7 @@ async def run_workflow(
                 tokens_out=rollup_out,
                 cost_usd=rollup_cost,
                 error=err,
+                run_id=run_id,
             ))
     except Exception:
         pass
@@ -554,6 +576,16 @@ def start_agent_run_bg(agent_slug: str, user_input: str, *,
                 model_slug=model_slug)
         s.add(r); s.flush()
         rid = r.id
+        from .events import _run_to_ws_dict
+        _start_ws_data = _run_to_ws_dict(r)
+
+    # WS broadcast — push "running" state immediately
+    try:
+        from .events import ws_broadcast
+        loop = asyncio.get_running_loop()
+        loop.create_task(ws_broadcast("run_update", _start_ws_data))
+    except Exception:
+        pass
 
     async def _go():
         try:
@@ -631,6 +663,16 @@ def start_workflow_run_bg(workflow_slug: str, user_input: Any, *,
                 target_id=target_id)
         s.add(r); s.flush()
         rid = r.id
+        from .events import _run_to_ws_dict
+        _start_ws_data = _run_to_ws_dict(r)
+
+    # WS broadcast — push "running" state immediately
+    try:
+        from .events import ws_broadcast
+        loop = asyncio.get_running_loop()
+        loop.create_task(ws_broadcast("run_update", _start_ws_data))
+    except Exception:
+        pass
 
     async def _go():
         try:

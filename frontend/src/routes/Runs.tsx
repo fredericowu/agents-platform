@@ -4,6 +4,7 @@ import Page, { StatusBadge } from "../components/Page";
 import { ModelBadge } from "../components/ModelBadge";
 import { TargetBadge } from "../components/TargetBadge";
 import { api, type Run, type RetroScoreSummary } from "../lib/api";
+import { useWsEvent } from "../lib/ws";
 
 function ScoreBadge({ summary }: { summary?: RetroScoreSummary | null }) {
   const score = summary?.overall ?? null;
@@ -25,7 +26,22 @@ export default function Runs() {
   async function load() {
     setRuns(await api.listRuns(100, kind || undefined, { q: q || undefined, rootsOnly }));
   }
-  useEffect(() => { load(); const t = setInterval(load, 3000); return () => clearInterval(t); }, [kind, q, rootsOnly]);
+  // Initial load + reload when filters change
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, [kind, q, rootsOnly]);
+
+  // Live run updates via WebSocket — upsert or prepend new runs
+  useWsEvent<Run>("run_update", (newRun) => {
+    setRuns(prev => {
+      const idx = prev.findIndex(r => r.id === newRun.id);
+      if (idx >= 0) {
+        const next = [...prev];
+        next[idx] = { ...next[idx], ...newRun };
+        return next;
+      }
+      // New run — prepend (cap at 100)
+      return [newRun, ...prev.slice(0, 99)];
+    });
+  }, []);
 
   return (
     <Page title="Runs" subtitle="Recent executions"
@@ -86,7 +102,7 @@ export default function Runs() {
                 </td>
                 <td className="py-2 pr-2"><span className="badge badge-info">{r.kind}</span></td>
                 <td className="py-2 pr-2 font-medium">{r.target_slug}</td>
-                <td className="py-2 pr-2"><TargetBadge id={r.target_id} /></td>
+                <td className="py-2 pr-2"><TargetBadge id={r.target_id} slug={r.target_slug} /></td>
                 <td className="py-2 pr-2 text-xs">
                   <span className="badge">{r.initiator_kind}</span>
                   {r.initiator_id && r.initiator_id !== r.target_slug && (
