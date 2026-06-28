@@ -6,7 +6,7 @@ import { api, type Agent, type Model, type ToolItem, type Skill } from "../lib/a
 const BLANK: Agent = {
   slug: "", name: "", description: "", system_prompt: "",
   model_slug: "claude-cli", tool_specs: [], skill_slugs: [],
-  params: {}, icon: "bot", color: "#58a6ff",
+  params: {}, mcp_config: {}, icon: "bot", color: "#58a6ff",
 };
 
 export default function AgentEdit() {
@@ -20,6 +20,8 @@ export default function AgentEdit() {
   const [resettableSet, setResettableSet] = useState<Set<string>>(new Set());
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [slugLocked, setSlugLocked] = useState(false);
+  const [editedSlug, setEditedSlug] = useState("");
   const [runOutput, setRunOutput] = useState<string>("");
   const [runStatus, setRunStatus] = useState<string>("");
   const [runInput, setRunInput] = useState("hello");
@@ -32,8 +34,9 @@ export default function AgentEdit() {
     if (!slug) return;
     if (isNew) {
       setA({ ...BLANK });
+      api.generateSlug("agent").then(r => setA(prev => prev ? { ...prev, slug: r.slug } : prev));
     } else {
-      api.getAgent(slug).then(setA);
+      api.getAgent(slug).then(a => { setA(a); setEditedSlug(a.slug); });
     }
   }, [slug, isNew]);
 
@@ -51,15 +54,21 @@ export default function AgentEdit() {
           slug: a.slug, name: a.name || a.slug, description: a.description,
           system_prompt: a.system_prompt, model_slug: a.model_slug,
           tool_specs: a.tool_specs, skill_slugs: a.skill_slugs,
-          params: a.params, color: a.color, icon: a.icon,
+          params: a.params, mcp_config: a.mcp_config, color: a.color, icon: a.icon,
         });
         nav(`/agents/${created.slug}`);
       } else if (slug) {
-        await api.saveAgent(slug, {
+        // rename first if slug changed
+        const targetSlug = editedSlug.trim() || slug;
+        if (targetSlug !== slug) {
+          await api.renameAgent(slug, targetSlug);
+        }
+        await api.saveAgent(targetSlug, {
           name: a.name, description: a.description, system_prompt: a.system_prompt,
           model_slug: a.model_slug, tool_specs: a.tool_specs, skill_slugs: a.skill_slugs,
-          params: a.params, color: a.color, icon: a.icon,
+          params: a.params, mcp_config: a.mcp_config, color: a.color, icon: a.icon,
         });
+        if (targetSlug !== slug) nav(`/agents/${targetSlug}`);
       }
     } catch (e: any) { setError(String(e.message || e)); }
     finally { setSaving(false); }
@@ -139,15 +148,28 @@ export default function AgentEdit() {
         <div className="col-span-2 space-y-4">
           <div className="card">
             <h2 className="text-base font-semibold mb-3">Configuration</h2>
-            {isNew && (
-              <>
-                <label className="block text-xs text-muted mb-1">slug</label>
-                <input value={a.slug} onChange={e => setA({ ...a, slug: e.target.value })}
-                       data-testid="agent-slug" />
-              </>
+            <label className="block text-xs text-muted mb-1">name</label>
+            <input value={a.name}
+                   onChange={e => {
+                     const name = e.target.value;
+                     setA({ ...a, name });
+                     if (isNew && !slugLocked) {
+                       api.generateSlug("agent", name).then(r =>
+                         setA(prev => prev ? { ...prev, name, slug: r.slug } : prev)
+                       ).catch(() => {});
+                     }
+                   }}
+                   data-testid="agent-name" />
+            <label className="block text-xs text-muted mt-3 mb-1">slug</label>
+            {isNew ? (
+              <input value={a.slug}
+                     onChange={e => { setSlugLocked(true); setA({ ...a, slug: e.target.value }); }}
+                     data-testid="agent-slug" className="font-mono" />
+            ) : (
+              <input value={editedSlug}
+                     onChange={e => setEditedSlug(e.target.value)}
+                     data-testid="agent-slug" className="font-mono" />
             )}
-            <label className="block text-xs text-muted mt-3 mb-1">name</label>
-            <input value={a.name} onChange={e => setA({ ...a, name: e.target.value })} data-testid="agent-name" />
             <label className="block text-xs text-muted mt-3 mb-1">description</label>
             <input value={a.description} onChange={e => setA({ ...a, description: e.target.value })} />
             <label className="block text-xs text-muted mt-3 mb-1">system prompt</label>
@@ -216,6 +238,56 @@ export default function AgentEdit() {
                           setA({ ...a, params: p });
                         }} />
             </div>
+          </div>
+
+          {/* ───── MCP Config ───── */}
+          <div className="card">
+            <h2 className="text-base font-semibold mb-1">MCP servers</h2>
+            <p className="text-xs text-muted mb-3">
+              When this agent runs in a Docker container, these servers are injected via{" "}
+              <code>--mcp-config</code>. Use <code>http://host.docker.internal:9123/mcp</code>{" "}
+              to point at the AW Gateway.
+            </p>
+            {/* Server list */}
+            {Object.entries(a.mcp_config?.servers ?? {}).map(([name, srv]) => (
+              <div key={name} className="border border-line rounded p-3 mb-2 space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-mono font-semibold">{name}</span>
+                  <button className="btn btn-danger text-xs py-0.5 px-2"
+                    onClick={() => {
+                      const next = { ...a.mcp_config, servers: { ...(a.mcp_config?.servers ?? {}) } };
+                      delete next.servers![name];
+                      setA({ ...a, mcp_config: next });
+                    }}>remove</button>
+                </div>
+                <div>
+                  <label className="block text-xs text-muted mb-0.5">URL</label>
+                  <input className="text-xs font-mono" value={srv.url}
+                    onChange={e => {
+                      const next = { ...a.mcp_config, servers: { ...(a.mcp_config?.servers ?? {}), [name]: { ...srv, url: e.target.value } } };
+                      setA({ ...a, mcp_config: next });
+                    }} />
+                </div>
+                <div>
+                  <label className="block text-xs text-muted mb-0.5">Authorization header (Bearer token)</label>
+                  <input className="text-xs font-mono"
+                    value={srv.headers?.["Authorization"]?.replace("Bearer ", "") ?? ""}
+                    placeholder="paste token here"
+                    onChange={e => {
+                      const tok = e.target.value.trim();
+                      const h: Record<string, string> = tok ? { Authorization: `Bearer ${tok}` } : {};
+                      const next = { ...a.mcp_config, servers: { ...(a.mcp_config?.servers ?? {}), [name]: { ...srv, headers: h } } };
+                      setA({ ...a, mcp_config: next });
+                    }} />
+                </div>
+              </div>
+            ))}
+            <button className="btn text-xs mt-1"
+              onClick={() => {
+                const newName = `server-${Date.now()}`;
+                const next = { servers: { ...(a.mcp_config?.servers ?? {}), [newName]: { type: "streamable-http", url: "http://host.docker.internal:9123/mcp", headers: {} } } };
+                setA({ ...a, mcp_config: next });
+              }}>+ add server</button>
           </div>
 
           <div className="card">

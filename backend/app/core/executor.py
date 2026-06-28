@@ -41,6 +41,14 @@ def _agent_to_runtime(s: Session, agent: Agent) -> dict[str, Any]:
             params = dict(m.params or {})
             model_slug = m.slug
     params.update(agent.params or {})
+    # If the agent has an MCP config, inject the config dir for Docker mode
+    if agent.mcp_config and agent.mcp_config.get("servers"):
+        import os as _os
+        base = _os.environ.get("AW_BASE_DIR", "/opt/agentic-workspace")
+        mcp_dir = f"{base}/data/agents-platform/{agent.id}"
+        params.setdefault("docker_mcp_config_dir", mcp_dir)
+    # Always inject agent_id so docker cwd isolation can use it
+    params["agent_id"] = agent.id
     return {"provider": provider, "model_id": model_id, "model_slug": model_slug,
             "params": params,
             "system_prompt": agent.system_prompt or "",
@@ -60,6 +68,7 @@ async def run_agent(
     node_id: str | None = None,
     target_id: str | None = None,
     extra_messages: list[dict] | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """Run an agent and return ``{run_id, text, status, error, tokens_in, tokens_out}``.
 
@@ -102,7 +111,8 @@ async def run_agent(
                     initiator_id=initiator_id,
                     node_id=node_id,
                     target_id=target_id,
-                    model_slug=runtime["model_slug"])
+                    model_slug=runtime["model_slug"],
+                    source_slug=agent_slug)
             s.add(r); s.flush()
             run_id = r.id
         else:
@@ -115,7 +125,8 @@ async def run_agent(
                         initiator_id=initiator_id,
                         node_id=node_id,
                         target_id=target_id,
-                        model_slug=runtime["model_slug"])
+                        model_slug=runtime["model_slug"],
+                        source_slug=agent_slug)
                 s.add(r)
 
     ev_ids = {run_id}
@@ -150,6 +161,19 @@ async def run_agent(
         if extra_messages:
             messages.extend(extra_messages)
         messages.append({"role": "user", "content": user_input})
+
+        # Inject runtime context for session isolation and resumption.
+        runtime["params"]["target_id"] = target_id
+        runtime["params"]["run_id"] = run_id
+        if session_id:
+            runtime["params"]["session_id"] = session_id
+            # Reuse the original run's isolated cwd so --resume can find the session file.
+            # The session file lives in ~/.claude/projects/{encoded_original_cwd}/,
+            # so the resumed run must use that same cwd (not a new isolated one).
+            with session_scope() as _ss:
+                _orig = _ss.query(Run).filter(Run.session_id == session_id).first()
+                if _orig:
+                    runtime["params"]["resume_run_id"] = _orig.id
 
         # Tag this run for subprocess registry (cli_subshell only — harmless otherwise).
         from .models.cli_subshell import current_run_id
@@ -188,6 +212,14 @@ async def run_agent(
                     meta_payload = getattr(chunk, "meta_payload", None)
                     if meta_kind:
                         await emit(meta_kind, meta_payload or {}, node=node_id or agent_slug)
+                        # Persist session_id from system.init so callers can resume later.
+                        if meta_kind == "system.init" and meta_payload and run_id:
+                            _sid = meta_payload.get("session_id")
+                            if _sid:
+                                with session_scope() as _ss:
+                                    _r = _ss.query(Run).filter(Run.id == run_id).first()
+                                    if _r:
+                                        _r.session_id = _sid
                     if chunk.delta:
                         text += chunk.delta
                         await emit("llm_token", {"delta": chunk.delta}, node=node_id or agent_slug)
@@ -343,7 +375,8 @@ async def run_workflow(
                     parent_run_id=parent_run_id,
                     initiator_kind=initiator_kind,
                     initiator_id=initiator_id or workflow_slug,
-                    target_id=target_id)
+                    target_id=target_id,
+                    source_slug=workflow_slug)
             s.add(r); s.flush()
             run_id = r.id
 
@@ -547,7 +580,8 @@ def start_agent_run_bg(agent_slug: str, user_input: str, *,
                        initiator_id: str | None = None,
                        parent_run_id: str | None = None,
                        node_id: str | None = None,
-                       target_id: str | None = None) -> str:
+                       target_id: str | None = None,
+                       session_id: str | None = None) -> str:
     """Schedule an agent run in the background; return its run_id."""
     if target_id is None and parent_run_id is None:
         raise ValueError("target_id is required for top-level agent runs")
@@ -573,7 +607,8 @@ def start_agent_run_bg(agent_slug: str, user_input: str, *,
                 parent_run_id=parent_run_id,
                 node_id=node_id,
                 target_id=target_id,
-                model_slug=model_slug)
+                model_slug=model_slug,
+                source_slug=agent_slug)
         s.add(r); s.flush()
         rid = r.id
         from .events import _run_to_ws_dict
@@ -591,7 +626,9 @@ def start_agent_run_bg(agent_slug: str, user_input: str, *,
         try:
             await run_agent(agent_slug, user_input, run_id=rid,
                             initiator_kind=initiator_kind,
-                            initiator_id=initiator_id)
+                            initiator_id=initiator_id,
+                            session_id=session_id,
+                            target_id=target_id)
         finally:
             await bus.publish(rid, "done", {})
             await bus.close(rid)
@@ -660,7 +697,8 @@ def start_workflow_run_bg(workflow_slug: str, user_input: Any, *,
                 input={"input": user_input},
                 initiator_kind=initiator_kind,
                 initiator_id=initiator_id or workflow_slug,
-                target_id=target_id)
+                target_id=target_id,
+                source_slug=workflow_slug)
         s.add(r); s.flush()
         rid = r.id
         from .events import _run_to_ws_dict

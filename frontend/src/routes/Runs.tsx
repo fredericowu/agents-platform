@@ -4,6 +4,7 @@ import Page, { StatusBadge } from "../components/Page";
 import { ModelBadge } from "../components/ModelBadge";
 import { TargetBadge } from "../components/TargetBadge";
 import { api, type Run, type RetroScoreSummary } from "../lib/api";
+import type { Agent, Workflow } from "../lib/api";
 import { useWsEvent } from "../lib/ws";
 
 function ScoreBadge({ summary }: { summary?: RetroScoreSummary | null }) {
@@ -22,12 +23,23 @@ export default function Runs() {
   const [kind, setKind] = useState<string>("");
   const [q, setQ] = useState<string>("");
   const [rootsOnly, setRootsOnly] = useState<boolean>(false);
+  const [nameMap, setNameMap] = useState<Record<string, string>>({});
 
   async function load() {
     setRuns(await api.listRuns(100, kind || undefined, { q: q || undefined, rootsOnly }));
   }
   // Initial load + reload when filters change
   useEffect(() => { load(); /* eslint-disable-next-line */ }, [kind, q, rootsOnly]);
+
+  // Load agent + workflow names once for slug→name lookup
+  useEffect(() => {
+    Promise.all([api.listAgents(), api.listWorkflows()]).then(([agents, workflows]) => {
+      const map: Record<string, string> = {};
+      (agents as Agent[]).forEach(a => { map[a.slug] = a.name; });
+      (workflows as Workflow[]).forEach(w => { map[w.slug] = w.name; });
+      setNameMap(map);
+    }).catch(() => {});
+  }, []);
 
   // Live run updates via WebSocket — upsert or prepend new runs
   useWsEvent<Run>("run_update", (newRun) => {
@@ -80,7 +92,7 @@ export default function Runs() {
             <tr className="text-left text-xs text-muted uppercase">
               <th className="py-2 pr-2">id</th>
               <th className="py-2 pr-2">kind</th>
-              <th className="py-2 pr-2">slug</th>
+              <th className="py-2 pr-2">name</th>
               <th className="py-2 pr-2">Target</th>
               <th className="py-2 pr-2">initiator</th>
               <th className="py-2 pr-2">model</th>
@@ -101,7 +113,15 @@ export default function Runs() {
                   )}
                 </td>
                 <td className="py-2 pr-2"><span className="badge badge-info">{r.kind}</span></td>
-                <td className="py-2 pr-2 font-medium">{r.target_slug}</td>
+                <td className="py-2 pr-2 font-medium">
+                  {r.source_slug ? (
+                    <Link to={`/${r.kind === "workflow" ? "workflows" : "agents"}/${r.source_slug}`}>
+                      {nameMap[r.source_slug] ?? r.source_slug}
+                    </Link>
+                  ) : (
+                    <span className="text-muted">—</span>
+                  )}
+                </td>
                 <td className="py-2 pr-2"><TargetBadge id={r.target_id} slug={r.target_slug} /></td>
                 <td className="py-2 pr-2 text-xs">
                   <span className="badge">{r.initiator_kind}</span>

@@ -83,6 +83,7 @@ export default function WorkflowEdit() {
 
   const [editName, setEditName] = useState("");
   const [editSlug, setEditSlug] = useState("");
+  const [slugLocked, setSlugLocked] = useState(false);
   const [editDescription, setEditDescription] = useState("");
   const [editTopology, setEditTopology] = useState<Topology>("nodes");
   const [editGraphText, setEditGraphText] = useState("{}");
@@ -107,7 +108,8 @@ export default function WorkflowEdit() {
     if (isNew) {
       setWf({ slug: "", name: "", description: "", kind: "sequential",
               graph: TOPOLOGY_TEMPLATES.nodes } as any);
-      setEditName(""); setEditSlug(""); setEditDescription("");
+      setEditName(""); setEditDescription("");
+      api.generateSlug("workflow").then(r => setEditSlug(r.slug)).catch(() => {});
       setEditTopology("nodes");
       setEditGraphText(JSON.stringify(TOPOLOGY_TEMPLATES.nodes, null, 2));
       return;
@@ -296,9 +298,14 @@ export default function WorkflowEdit() {
         const created = await api.createWorkflow({ slug: editSlug, ...payload });
         nav(`/workflows/${created.slug}`);
       } else if (slug) {
-        const updated = await api.saveWorkflow(slug, payload);
+        const targetSlug = editSlug.trim() || slug;
+        if (targetSlug !== slug) {
+          await api.renameWorkflow(slug, targetSlug);
+        }
+        const updated = await api.saveWorkflow(targetSlug, payload);
         setWf(updated);
-        setMode("run");
+        if (targetSlug !== slug) nav(`/workflows/${targetSlug}`);
+        else setMode("run");
       }
     } catch (e: any) {
       setEditError(String(e.message || e));
@@ -369,6 +376,7 @@ export default function WorkflowEdit() {
 
       {mode === "run" && !isNew && (
         <>
+          <div className="text-xs font-mono text-muted mb-3">{wf.slug}</div>
           <div className="grid grid-cols-3 gap-4">
             <div className="col-span-2 card p-0 overflow-hidden" style={{ height: 480 }} data-testid="workflow-graph">
               <ReactFlow nodes={rfNodes} edges={rfEdges} fitView proOptions={{ hideAttribution: true }}>
@@ -452,15 +460,21 @@ export default function WorkflowEdit() {
             </h2>
             {editError && <div className="codebox text-err mb-3">{editError}</div>}
             <div className="grid grid-cols-2 gap-4 mb-3">
-              {isNew && (
-                <FormRow label="slug" hint="unique identifier (URL path)">
-                  <input value={editSlug} onChange={e => setEditSlug(e.target.value)}
-                         data-testid="workflow-edit-slug" />
-                </FormRow>
-              )}
               <FormRow label="name">
-                <input value={editName} onChange={e => setEditName(e.target.value)}
+                <input value={editName}
+                       onChange={e => {
+                         const name = e.target.value;
+                         setEditName(name);
+                         if (isNew && !slugLocked) {
+                           api.generateSlug("workflow", name).then(r => setEditSlug(r.slug)).catch(() => {});
+                         }
+                       }}
                        data-testid="workflow-edit-name" />
+              </FormRow>
+              <FormRow label="slug" hint={isNew ? "auto-generated from name, editable" : "editable — rename updates all linked runs"}>
+                <input value={editSlug}
+                       onChange={e => { setSlugLocked(true); setEditSlug(e.target.value); }}
+                       data-testid="workflow-edit-slug" className="font-mono" />
               </FormRow>
             </div>
             <FormRow label="description">

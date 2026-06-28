@@ -73,6 +73,16 @@ class CliSubshellLLM(BaseLLM):
         append_system_prompt: str | None = None,
         timeout_s: int = 900,
         extra_args: list[str] | None = None,
+        # Docker mode — when True, run inside an isolated container via docker_agent
+        docker: bool = False,
+        docker_creds: bool = True,
+        docker_mcp_config_dir: str | None = None,
+        # Session persistence: agent+target for cwd isolation; session_id for --resume
+        agent_id: str | None = None,
+        target_id: str | None = None,
+        run_id: str | None = None,
+        session_id: str | None = None,
+        resume_run_id: str | None = None,
         **_: Any,
     ) -> None:
         self.model_id = model_id
@@ -88,11 +98,78 @@ class CliSubshellLLM(BaseLLM):
         self.append_system_prompt = append_system_prompt
         self.timeout_s = timeout_s
         self.extra_args = list(extra_args or [])
-        if shutil.which(self.cli) is None:
+        self.docker = docker
+        self.docker_creds = docker_creds
+        self.docker_mcp_config_dir = docker_mcp_config_dir
+        self.agent_id = agent_id
+        self.target_id = target_id
+        self.run_id = run_id
+        self.session_id = session_id
+        self.resume_run_id = resume_run_id
+        if not docker and shutil.which(self.cli) is None:
             raise RuntimeError(f"CLI {cli!r} not found on PATH")
 
     def _build_argv(self, prompt: str) -> list[str]:
-        argv: list[str] = [self.cli, "-p", prompt]
+        if self.docker:
+            return self._build_docker_argv(prompt)
+        return self._build_direct_argv(prompt)
+
+    def _build_docker_argv(self, prompt: str) -> list[str]:
+        from pathlib import Path as _Path
+        try:
+            from src.tools.docker_agent import build_docker_argv, CLI_SPECS
+        except ImportError:
+            import sys
+            sys.path.insert(0, "/opt/agentic-workspace")
+            from src.tools.docker_agent import build_docker_argv, CLI_SPECS
+
+        cli = self.cli if self.cli in CLI_SPECS else "claude"
+
+        # Build mounts: cwd + all add_dirs
+        mounts: list[str] = []
+        if self.cwd:
+            mounts.append(self.cwd)
+        for d in self.add_dirs:
+            # add_dirs are passed separately; don't double-mount as plain mounts
+            pass
+
+        extra: list[str] = []
+        if self.allowed_tools:
+            extra += ["--allowed-tools", ",".join(self.allowed_tools)]
+        if self.disallowed_tools:
+            extra += ["--disallowed-tools", ",".join(self.disallowed_tools)]
+        if self.bare:
+            extra.append("--bare")
+        if self.append_system_prompt:
+            extra += ["--append-system-prompt", self.append_system_prompt]
+        extra += self.extra_args
+
+        return build_docker_argv(
+            cli=cli,
+            prompt=prompt,
+            mounts=mounts,
+            skills=False,
+            mcp=False,
+            creds=self.docker_creds,
+            add_dirs=self.add_dirs,
+            env_file=None,
+            forward_env=False,
+            model=self.model,
+            extra_args=extra,
+            tag="latest",
+            image_override=None,
+            mcp_config_dir=self.docker_mcp_config_dir,
+            agent_id=self.agent_id,
+            target_id=self.target_id,
+            run_id=self.resume_run_id or self.run_id,
+            session_id=self.session_id,
+        )
+
+    def _build_direct_argv(self, prompt: str) -> list[str]:
+        argv: list[str] = [self.cli]
+        if self.session_id:
+            argv += ["--resume", self.session_id]
+        argv += ["-p", prompt]
         if self.model:
             argv += ["--model", self.model]
         if self.dangerous_skip_permissions:

@@ -76,11 +76,20 @@ def _apply_inline_migrations() -> None:
         ("model_slug", "VARCHAR"),
         # First-class target FK — links a tree of runs to an overall delivery goal.
         ("target_id", "VARCHAR NOT NULL DEFAULT 'unlinked'"),
+        # Which agent or workflow actually ran — separate from target_slug (the Target).
+        ("source_slug", "VARCHAR"),
     ]
     with engine.begin() as conn:
         for col, ddl in additions:
             if col not in existing:
                 conn.execute(text(f"ALTER TABLE runs ADD COLUMN {col} {ddl}"))
+
+    # mcp_config on agents
+    if "agents" in insp.get_table_names():
+        agent_cols = {c["name"] for c in insp.get_columns("agents")}
+        if "mcp_config" not in agent_cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE agents ADD COLUMN mcp_config JSON DEFAULT '{}'"))
 
     # soft-delete columns on agents and workflows
     for tbl in ("agents", "workflows"):
@@ -131,6 +140,25 @@ def _apply_inline_migrations() -> None:
             s.commit()
 
     # Wave-6: retro_score_summary on runs, status + created_in_run_id on target_lessons
+    # Backfill source_slug for runs created before the column existed.
+    # Heuristic: for runs where source_slug is NULL, try target_slug as agent slug
+    # (works for runs where the executor fell back to agent_slug for target_slug).
+    with engine.begin() as conn:
+        try:
+            conn.execute(text("""
+                UPDATE runs
+                SET source_slug = target_slug
+                WHERE source_slug IS NULL
+                  AND target_slug IN (SELECT slug FROM agents)
+            """))
+            conn.execute(text("""
+                UPDATE runs
+                SET source_slug = target_slug
+                WHERE source_slug IS NULL
+                  AND target_slug IN (SELECT slug FROM workflows)
+            """))
+        except Exception:
+            pass  # non-fatal — new runs will have source_slug populated correctly
     with engine.begin() as conn:
         _ensure_column(conn, "runs", "retro_score_summary", "retro_score_summary JSON")
         if "target_lessons" in insp.get_table_names():
@@ -142,6 +170,7 @@ def _apply_inline_migrations() -> None:
         # GitHub Issues mirror columns
         _ensure_column(conn, "runs", "github_issue_number", "github_issue_number INTEGER")
         _ensure_column(conn, "runs", "github_issue_url", "github_issue_url TEXT")
+        _ensure_column(conn, "runs", "session_id", "session_id VARCHAR")
         if "targets" in insp.get_table_names():
             _ensure_column(conn, "targets", "github_issue_number", "github_issue_number INTEGER")
             _ensure_column(conn, "targets", "github_issue_url", "github_issue_url TEXT")

@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import Page from "../components/Page";
 import { api, type Run, type Target, type TargetSummary } from "../lib/api";
-import { ArrowLeft, CheckCircle2, XCircle, Loader2, AlertCircle, Ban, GitPullRequest, ExternalLink } from "lucide-react";
+import { ArrowLeft, CheckCircle2, XCircle, Loader2, AlertCircle, Ban, GitPullRequest, ExternalLink, Pencil, Check, X } from "lucide-react";
 import { useWsEvent } from "../lib/ws";
+
 
 const STATUS_BADGE: Record<string, string> = {
   active: "badge-info",
@@ -38,11 +39,18 @@ function fmtCost(n: number): string {
 
 export default function TargetDetail() {
   const { slug } = useParams<{ slug: string }>();
+  const nav = useNavigate();
   const [target, setTarget] = useState<Target | null>(null);
   const [summary, setSummary] = useState<TargetSummary | null>(null);
   const [runs, setRuns] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>("");
+  const [editing, setEditing] = useState(false);
+  const [nameVal, setNameVal] = useState("");
+  const [slugVal, setSlugVal] = useState("");
+  const [descVal, setDescVal] = useState("");
+  const [editSaving, setEditSaving] = useState(false);
+  const [editError, setEditError] = useState("");
 
   async function load() {
     if (!slug) return;
@@ -89,6 +97,52 @@ export default function TargetDetail() {
     await load();
   }
 
+  function openEdit() {
+    if (!target) return;
+    setNameVal(target.name);
+    setSlugVal(target.slug);
+    setDescVal(target.description ?? "");
+    setEditError("");
+    setEditing(true);
+  }
+
+  async function saveAll() {
+    if (!target) return;
+    setEditSaving(true);
+    setEditError("");
+    try {
+      const name = nameVal.trim();
+      const desc = descVal.trim();
+      const newSlug = slugVal.trim();
+
+      // name / description — single PATCH
+      if (name && (name !== target.name || desc !== (target.description ?? ""))) {
+        const patch: Record<string, string> = {};
+        if (name !== target.name) patch.name = name;
+        if (desc !== (target.description ?? "")) patch.description = desc;
+        if (Object.keys(patch).length) {
+          const updated = await api.updateTarget(target.slug, patch);
+          setTarget(updated);
+        }
+      }
+
+      // slug rename (separate endpoint)
+      if (newSlug && newSlug !== target.slug) {
+        const updated = await api.renameTarget(target.slug, newSlug);
+        setTarget(updated);
+        setEditing(false);
+        nav(`/targets/${updated.slug}`, { replace: true });
+        return;
+      }
+
+      setEditing(false);
+    } catch (e: any) {
+      setEditError(String(e.message || e));
+    } finally {
+      setEditSaving(false);
+    }
+  }
+
   // Build a chronological list with parent-child indentation
   const orderedRuns = useMemo(() => {
     if (!runs.length) return [];
@@ -112,13 +166,23 @@ export default function TargetDetail() {
   return (
     <Page
       title={target.name}
-      subtitle={target.description || `Target · ${target.slug}`}
+      subtitle={
+        <span className="flex flex-col gap-0.5">
+          <span className="text-muted text-xs">{target.description || <em className="opacity-40">no description</em>}</span>
+          <span className="font-mono text-xs text-muted">{target.slug}</span>
+        </span>
+      }
       actions={
         <div className="flex items-center gap-2">
           <Link to="/targets" className="btn btn-ghost flex items-center gap-1">
             <ArrowLeft size={14} /> All targets
           </Link>
-          {target.status === "active" && (
+          {!editing && (
+            <button className="btn btn-ghost flex items-center gap-1" onClick={openEdit}>
+              <Pencil size={14} /> Edit
+            </button>
+          )}
+          {target.status === "active" && !editing && (
             <>
               <button className="btn btn-success" onClick={() => markStatus("completed")}>
                 Mark completed
@@ -131,6 +195,53 @@ export default function TargetDetail() {
         </div>
       }
     >
+      {/* Inline edit panel */}
+      {editing && (
+        <div className="card mb-6 flex flex-col gap-4">
+          <div className="text-sm font-semibold">Edit target</div>
+          {editError && <div className="text-crit text-xs">{editError}</div>}
+          <label className="flex flex-col gap-1">
+            <span className="text-xs text-muted uppercase tracking-wide">Nome</span>
+            <input
+              autoFocus
+              className="input"
+              value={nameVal}
+              onChange={e => setNameVal(e.target.value)}
+              onKeyDown={e => e.key === "Escape" && setEditing(false)}
+              placeholder="Target name"
+            />
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className="text-xs text-muted uppercase tracking-wide">Descrição</span>
+            <input
+              className="input"
+              value={descVal}
+              onChange={e => setDescVal(e.target.value)}
+              onKeyDown={e => e.key === "Escape" && setEditing(false)}
+              placeholder="Description"
+            />
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className="text-xs text-muted uppercase tracking-wide">Slug</span>
+            <input
+              className="input font-mono"
+              value={slugVal}
+              onChange={e => setSlugVal(e.target.value)}
+              onKeyDown={e => e.key === "Escape" && setEditing(false)}
+              placeholder="slug"
+            />
+            <span className="text-xs text-muted">⚠ Alterar o slug muda a URL e redireciona automaticamente.</span>
+          </label>
+          <div className="flex gap-2">
+            <button className="btn btn-primary flex items-center gap-1" onClick={saveAll} disabled={editSaving}>
+              {editSaving ? <Loader2 size={14} className="animate-spin" /> : <Check size={14} />} Save
+            </button>
+            <button className="btn btn-ghost flex items-center gap-1" onClick={() => setEditing(false)} disabled={editSaving}>
+              <X size={14} /> Cancel
+            </button>
+          </div>
+        </div>
+      )}
       {/* Header strip */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
         <div className="card">

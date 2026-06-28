@@ -31,7 +31,7 @@ class ModelUpdate(BaseModel):
 
 # ----- agents -----
 class AgentIn(BaseModel):
-    slug: str
+    slug: str | None = None  # auto-generated from name if omitted
     name: str
     description: str = ""
     system_prompt: str = ""
@@ -40,6 +40,7 @@ class AgentIn(BaseModel):
     tool_specs: list[Any] = []
     skill_slugs: list[str] = []
     params: dict[str, Any] = {}
+    mcp_config: dict[str, Any] = {}
     icon: str = "bot"
     color: str = "#58a6ff"
 
@@ -53,6 +54,7 @@ class AgentUpdate(BaseModel):
     tool_specs: list[Any] | None = None
     skill_slugs: list[str] | None = None
     params: dict[str, Any] | None = None
+    mcp_config: dict[str, Any] | None = None
     icon: str | None = None
     color: str | None = None
 
@@ -67,6 +69,7 @@ class AgentOut(_Base):
     tool_specs: list[Any]
     skill_slugs: list[str]
     params: dict[str, Any]
+    mcp_config: dict[str, Any] = {}
     icon: str
     color: str
     deleted_at: datetime | None = None
@@ -76,7 +79,7 @@ class AgentOut(_Base):
 
 # ----- workflows -----
 class WorkflowIn(BaseModel):
-    slug: str
+    slug: str | None = None  # auto-generated from name if omitted
     name: str
     description: str = ""
     use_cases: list[str] = []
@@ -109,6 +112,7 @@ class RunInput(BaseModel):
     input: dict[str, Any] = Field(default_factory=dict)
     target_slug: str | None = None   # first-class; takes precedence over input.extra
     target_id: str | None = None     # first-class; takes precedence over input.extra
+    session_id: str | None = None    # resume a prior CLI session (e.g. claude --resume)
 
 
 class RunOut(_Base):
@@ -130,8 +134,10 @@ class RunOut(_Base):
     node_id: str | None = None
     model_slug: str | None = None
     target_id: str | None = None
+    source_slug: str | None = None
     github_issue_number: int | None = None
     github_issue_url: str | None = None
+    session_id: str | None = None
 
 
 class RunEventOut(_Base):

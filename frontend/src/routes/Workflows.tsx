@@ -56,6 +56,7 @@ export default function Workflows() {
                 <div className="text-base font-semibold">{w.name}</div>
                 <span className="badge badge-info">{w.kind}</span>
               </div>
+              <div className="text-xs font-mono text-muted mb-1 pr-44">{w.slug}</div>
               <div className="text-xs text-muted pr-44">{w.description}</div>
             </Link>
             <div className="absolute top-3 right-3 flex gap-1 items-center">

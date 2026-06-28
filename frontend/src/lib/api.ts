@@ -1,6 +1,12 @@
 // API client. Resolves against window.location for dev (vite proxy) or absolute URL in prod.
 const BASE = (import.meta as any).env?.VITE_API_BASE || "";
 
+export type AgentMcpServer = {
+  type: string;        // "streamable-http" | "sse"
+  url: string;
+  headers?: Record<string, string>;
+};
+
 export type Agent = {
   slug: string;
   name: string;
@@ -10,6 +16,7 @@ export type Agent = {
   tool_specs: string[];
   skill_slugs: string[];
   params: Record<string, any>;
+  mcp_config: { servers?: Record<string, AgentMcpServer> };
   icon: string;
   color: string;
 };
@@ -50,6 +57,7 @@ export type Run = {
   node_id: string | null;
   model_slug: string | null;
   target_id: string | null;
+  source_slug: string | null;
   retro_score_summary?: RetroScoreSummary | null;
 };
 
@@ -304,6 +312,12 @@ export const api = {
   resetAgent: (slug: string) =>
     call<Agent>(`/api/agents/${slug}/reset`, { method: "POST" }),
   listResettableAgents: () => call<string[]>("/api/agents/_resettable"),
+  generateSlug: (kind: "agent" | "workflow", name?: string) =>
+    call<{ slug: string }>(`/api/admin/slugs/generate?kind=${kind}${name ? `&name=${encodeURIComponent(name)}` : ""}`),
+  renameAgent: (slug: string, newSlug: string) =>
+    call<Agent>(`/api/agents/${slug}/rename`, { method: "POST", body: JSON.stringify({ new_slug: newSlug }) }),
+  renameWorkflow: (slug: string, newSlug: string) =>
+    call<Workflow>(`/api/workflows/${slug}/rename`, { method: "POST", body: JSON.stringify({ new_slug: newSlug }) }),
 
   listWorkflows: () => call<Workflow[]>("/api/workflows"),
   getWorkflow: (slug: string) => call<Workflow>(`/api/workflows/${slug}`),
@@ -408,6 +422,8 @@ export const api = {
     call<Target>("/api/targets", { method: "POST", body: JSON.stringify(t) }),
   updateTarget: (slug: string, patch: Partial<Target>) =>
     call<Target>(`/api/targets/${slug}`, { method: "PUT", body: JSON.stringify(patch) }),
+  renameTarget: (slug: string, newSlug: string) =>
+    call<Target>(`/api/targets/${slug}/rename`, { method: "POST", body: JSON.stringify({ new_slug: newSlug }) }),
   deleteTarget: (slug: string, hard = false) =>
     call<{ deleted: string }>(`/api/targets/${slug}${hard ? "?hard=true" : ""}`, { method: "DELETE" }),
   restoreTarget: (slug: string) =>

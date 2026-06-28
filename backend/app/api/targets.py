@@ -167,6 +167,31 @@ async def update_target(slug: str, body: TargetUpdate, s: Session = Depends(get_
     return t
 
 
+from pydantic import BaseModel as _BM_T
+class _RenameTarget(_BM_T):
+    new_slug: str
+
+
+@router.post("/{slug}/rename", response_model=TargetOut)
+def rename_target(slug: str, body: _RenameTarget, s: Session = Depends(get_session)):
+    """Rename a target's slug."""
+    t = s.query(Target).filter(Target.slug == slug).first()
+    if not t:
+        raise HTTPException(404, "not found")
+    new_slug = body.new_slug.strip()
+    if not new_slug:
+        raise HTTPException(400, "new_slug is required")
+    if new_slug == slug:
+        return t
+    existing = s.query(Target).filter(Target.slug == new_slug).first()
+    if existing:
+        raise HTTPException(409, f"slug '{new_slug}' is already taken")
+    t.slug = new_slug
+    s.commit()
+    s.refresh(t)
+    return t
+
+
 @router.delete("/{slug}")
 def delete_target(slug: str, hard: bool = Query(False),
                   s: Session = Depends(get_session)):

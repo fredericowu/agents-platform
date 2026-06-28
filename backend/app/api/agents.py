@@ -1,4 +1,9 @@
+from __future__ import annotations
+
+import json
+import os
 from datetime import datetime
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -7,8 +12,84 @@ from ..core.executor import start_agent_run_bg
 from ..db import get_session
 from ..models import Agent
 from ..schemas import AgentIn, AgentOut, AgentUpdate, RunInput
+from ..slug_utils import assert_slug_available, generate_unique_slug
 
 router = APIRouter(prefix="/api/agents", tags=["agents"])
+
+# Where per-agent config files are written. Bind-mounted from host data/ dir so
+# they survive container restarts and are accessible to docker_agent containers.
+_AGENTS_DATA_DIR = Path(
+    os.environ.get("AW_BASE_DIR", "/opt/agentic-workspace")
+) / "data" / "agents-platform"
+
+
+def _current_gateway_token() -> str | None:
+    """Return the current AW MCP gateway token (from aw.json mcp_gateway.token)."""
+    base = os.environ.get("AW_BASE_DIR", "/opt/agentic-workspace")
+    p = Path(base) / "src" / "config" / "aw.json"
+    try:
+        import json as _json
+        cfg = _json.loads(p.read_text())
+        return cfg.get("mcp_gateway", {}).get("token") or None
+    except Exception:
+        return None
+
+
+def _inject_gateway_token(cfg: dict) -> dict:
+    """Replace stale bearer tokens on AW gateway URLs with the current one."""
+    url = cfg.get("url", "")
+    # Detect AW gateway (host.docker.internal or localhost on port 9200)
+    if not ("host.docker.internal:9200" in url or "localhost:9200" in url or "127.0.0.1:9200" in url):
+        return cfg
+    token = _current_gateway_token()
+    if not token:
+        return cfg
+    updated = dict(cfg)
+    updated["headers"] = {**(cfg.get("headers") or {}), "Authorization": f"Bearer {token}"}
+    return updated
+
+
+def _write_agent_mcp_config(agent: Agent, cli: str | None = None) -> None:
+    """Generate CLI-specific MCP config files in data/agents-platform/{agent.id}/."""
+    mcp = agent.mcp_config or {}
+    servers: dict = mcp.get("servers") or {}
+    if not servers:
+        return
+
+    agent_dir = _AGENTS_DATA_DIR / agent.id
+    agent_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Claude format (used for --mcp-config flag) ─────────────────────────
+    claude_mcp = {
+        "mcpServers": {
+            name: {
+                "type": cfg.get("type", "streamable-http"),
+                "url": cfg["url"],
+                **({"headers": h} if (h := _inject_gateway_token(cfg).get("headers")) else {}),
+            }
+            for name, cfg in servers.items()
+            if cfg.get("url")
+        }
+    }
+    (agent_dir / "mcp.json").write_text(json.dumps(claude_mcp, indent=2))
+
+    # ── Gemini / Cursor format (.gemini/settings.json / .cursor/mcp.json) ──
+    # Same structure as claude but different wrapping — we reuse the same file.
+
+    # ── Codex format (TOML) ─────────────────────────────────────────────────
+    lines = ["[mcp_servers]"]
+    for name, cfg in servers.items():
+        if not cfg.get("url"):
+            continue
+        lines.append(f"[mcp_servers.{name}]")
+        lines.append(f'type = "{cfg.get("type", "streamable-http")}"')
+        lines.append(f'url = "{cfg["url"]}"')
+        if cfg.get("headers"):
+            for k, v in cfg["headers"].items():
+                lines.append(f'[mcp_servers.{name}.headers]')
+                lines.append(f'{k} = "{v}"')
+                break  # only first header section needed
+    (agent_dir / "mcp_codex.toml").write_text("\n".join(lines) + "\n")
 
 
 @router.get("/_resettable")
@@ -56,19 +137,27 @@ def get_agent(slug: str, include_deleted: bool = Query(False),
 
 @router.post("", response_model=AgentOut)
 def create_agent(body: AgentIn, s: Session = Depends(get_session)):
-    """Create a new agent. If a soft-deleted agent with the same slug exists,
-    creation fails with 409 — restore it via POST /:slug/restore instead, or
-    pick a different slug."""
-    existing = s.query(Agent).filter(Agent.slug == body.slug).first()
+    """Create a new agent. Slug is auto-generated from name if not supplied.
+    Slugs are unique across agents AND workflows.  If a soft-deleted agent with
+    the same slug exists, creation fails with 409 — restore it first."""
+    slug = (body.slug or "").strip() or generate_unique_slug("agent", s, body.name)
+    existing = s.query(Agent).filter(Agent.slug == slug).first()
     if existing is not None:
         if existing.deleted_at is not None:
             raise HTTPException(409,
                 "slug exists but is soft-deleted — restore it or pick another slug")
         raise HTTPException(409, "slug already exists")
-    a = Agent(**body.model_dump())
+    try:
+        assert_slug_available(slug, s)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    data = body.model_dump()
+    data["slug"] = slug
+    a = Agent(**data)
     s.add(a)
     s.commit()
     s.refresh(a)
+    _write_agent_mcp_config(a)
     return a
 
 
@@ -83,6 +172,7 @@ def update_agent(slug: str, body: AgentUpdate, s: Session = Depends(get_session)
         setattr(a, k, v)
     s.commit()
     s.refresh(a)
+    _write_agent_mcp_config(a)
     return a
 
 
@@ -102,6 +192,34 @@ def delete_agent(slug: str, hard: bool = Query(False),
         a.deleted_at = datetime.utcnow()
         s.commit()
     return {"deleted": slug, "soft": True, "deleted_at": a.deleted_at}
+
+
+from pydantic import BaseModel as _BM2
+class _RenameAgent(_BM2):
+    new_slug: str
+
+
+@router.post("/{slug}/rename", response_model=AgentOut)
+def rename_agent(slug: str, body: _RenameAgent, s: Session = Depends(get_session)):
+    """Rename an agent's slug. Also updates Run.source_slug for all existing runs."""
+    a = s.query(Agent).filter(Agent.slug == slug).first()
+    if not a:
+        raise HTTPException(404, "not found")
+    new_slug = body.new_slug.strip()
+    if not new_slug:
+        raise HTTPException(400, "new_slug is required")
+    if new_slug == slug:
+        return a
+    try:
+        assert_slug_available(new_slug, s)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    from ..models import Run
+    s.query(Run).filter(Run.source_slug == slug).update(
+        {"source_slug": new_slug}, synchronize_session=False)
+    a.slug = new_slug
+    s.commit(); s.refresh(a)
+    return a
 
 
 @router.post("/{slug}/restore", response_model=AgentOut)
@@ -219,6 +337,7 @@ async def run_agent_ep(slug: str, body: RunInput, s: Session = Depends(get_sessi
     extra = body.input.get("extra", {}) if isinstance(body.input, dict) else {}
     target_id = body.target_id or (extra.get("target_id") if isinstance(extra, dict) else None)
     target_slug = body.target_slug or (extra.get("target_slug") if isinstance(extra, dict) else None)
+    session_id = body.session_id or (extra.get("session_id") if isinstance(extra, dict) else None)
     if target_id is None and target_slug:
         from ..models import Target
         t = s.query(Target).filter(Target.slug == target_slug).first()
@@ -228,7 +347,7 @@ async def run_agent_ep(slug: str, body: RunInput, s: Session = Depends(get_sessi
     if target_id is None:
         raise HTTPException(400, "target_slug is required — pass a target_slug to link this run to a delivery Target")
     try:
-        rid = start_agent_run_bg(slug, payload, target_id=target_id)
+        rid = start_agent_run_bg(slug, payload, target_id=target_id, session_id=session_id)
     except __import__("backend.app.core.executor", fromlist=["TargetBudgetExceeded"]).TargetBudgetExceeded as e:
         raise HTTPException(429, f"target budget exceeded: {e}")
     return {"run_id": rid, "target_id": target_id}

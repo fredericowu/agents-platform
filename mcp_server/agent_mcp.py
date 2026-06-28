@@ -405,7 +405,9 @@ async def _list_tools() -> list[Tool]:
                                          "input": {"type": "string"},
                                          "target_slug": {"type": "string",
                                                          "description": "Slug of the Target this run is delivering against. REQUIRED."},
-                                         "target_id": {"type": ["string", "null"]}},
+                                         "target_id": {"type": ["string", "null"]},
+                                         "session_id": {"type": ["string", "null"],
+                                                        "description": "Resume a prior CLI session. Pass the session_id from a previous run's result to continue the conversation."}},
                           "required": ["slug", "input", "target_slug"]}),
         Tool(name="run_workflow_async",
              description=("Start a workflow run in the background and return its run_id.\n\n"
@@ -1130,6 +1132,8 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
                 body["target_id"] = args["target_id"]
             if args.get("target_slug"):
                 body["target_slug"] = args["target_slug"]
+            if args.get("session_id"):
+                body["session_id"] = args["session_id"]
             r = await c.post(f"{BASE}/api/agents/{args['slug']}/run", json=body)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "run_workflow_async":

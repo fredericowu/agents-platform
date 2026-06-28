@@ -43,6 +43,7 @@ class Agent(Base):
     tool_specs: Mapped[list[Any]] = mapped_column(JSON, default=list)      # ["code.read_file", ...]
     skill_slugs: Mapped[list[str]] = mapped_column(JSON, default=list)
     params: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)     # {temperature, max_tokens, ...}
+    mcp_config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict) # {servers: {name: {type, url, headers}}}
     builtin: Mapped[bool] = mapped_column(Boolean, default=False)
     icon: Mapped[str] = mapped_column(String, default="bot")
     color: Mapped[str] = mapped_column(String, default="#58a6ff")
@@ -87,6 +88,7 @@ class Run(Base):
     initiator_id: Mapped[str | None] = mapped_column(String, nullable=True)   # e.g. chat session id, eval id
     node_id: Mapped[str | None] = mapped_column(String, nullable=True)        # which workflow node spawned us
     model_slug: Mapped[str | None] = mapped_column(String, nullable=True)     # model actually used at runtime
+    source_slug: Mapped[str | None] = mapped_column(String, nullable=True, index=True)  # slug of the agent or workflow that ran
 
     # Target — first-class umbrella linking a tree of runs to an overall goal.
     target_id: Mapped[str] = mapped_column(String, ForeignKey("targets.id"), nullable=False, index=True)
@@ -94,6 +96,8 @@ class Run(Base):
     retro_score_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     github_issue_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     github_issue_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    # CLI session ID (captured from system.init event; used for --resume on next run)
+    session_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
     events: Mapped[list["RunEvent"]] = relationship(back_populates="run", cascade="all, delete-orphan")
     children: Mapped[list["Run"]] = relationship("Run",

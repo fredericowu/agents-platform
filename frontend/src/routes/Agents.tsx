@@ -64,6 +64,7 @@ export default function Agents() {
               <div className="flex items-center justify-between mb-2 pr-32">
                 <div className="text-base font-semibold" style={{ color: a.color }}>{a.name}</div>
               </div>
+              <div className="text-xs font-mono text-muted mb-1 pr-32">{a.slug}</div>
               <div className="text-xs text-muted mb-3 line-clamp-2 min-h-[2lh] pr-32">{a.description}</div>
               <div className="flex items-center justify-between text-xs">
                 <span className="kbd">{a.model_slug || "—"}</span>

@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 
 export default function Page({
   title, subtitle, actions, children,
-}: { title: string; subtitle?: string; actions?: ReactNode; children: ReactNode }) {
+}: { title: ReactNode; subtitle?: ReactNode; actions?: ReactNode; children: ReactNode }) {
   return (
     <div className="p-6 max-w-[1400px] mx-auto">
       <header className="flex items-end justify-between border-b border-line pb-4 mb-6">

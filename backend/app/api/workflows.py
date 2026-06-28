@@ -8,6 +8,7 @@ from ..core.orchestrators import derive_kind_from_graph
 from ..db import get_session
 from ..models import Workflow
 from ..schemas import RunInput, WorkflowIn, WorkflowOut, WorkflowUpdate
+from ..slug_utils import assert_slug_available, generate_unique_slug
 
 router = APIRouter(prefix="/api/workflows", tags=["workflows"])
 
@@ -58,13 +59,21 @@ def _normalize_kind(payload: dict) -> dict:
 
 @router.post("", response_model=WorkflowOut)
 def create_workflow(body: WorkflowIn, s: Session = Depends(get_session)):
-    existing = s.query(Workflow).filter(Workflow.slug == body.slug).first()
+    """Create a workflow. Slug is auto-generated from name if not supplied.
+    Slugs are unique across agents AND workflows."""
+    slug = (body.slug or "").strip() or generate_unique_slug("workflow", s, body.name)
+    existing = s.query(Workflow).filter(Workflow.slug == slug).first()
     if existing is not None:
         if existing.deleted_at is not None:
             raise HTTPException(409,
                 "slug exists but is soft-deleted — restore it or pick another slug")
         raise HTTPException(409, "slug already exists")
+    try:
+        assert_slug_available(slug, s)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
     data = _normalize_kind(body.model_dump())
+    data["slug"] = slug
     w = Workflow(**data)
     s.add(w)
     s.commit()
@@ -103,6 +112,34 @@ def delete_workflow(slug: str, hard: bool = Query(False),
         w.deleted_at = datetime.utcnow()
         s.commit()
     return {"deleted": slug, "soft": True, "deleted_at": w.deleted_at}
+
+
+from pydantic import BaseModel as _BM2
+class _RenameWorkflow(_BM2):
+    new_slug: str
+
+
+@router.post("/{slug}/rename", response_model=WorkflowOut)
+def rename_workflow(slug: str, body: _RenameWorkflow, s: Session = Depends(get_session)):
+    """Rename a workflow's slug. Also updates Run.source_slug for all existing runs."""
+    w = s.query(Workflow).filter(Workflow.slug == slug).first()
+    if not w:
+        raise HTTPException(404, "not found")
+    new_slug = body.new_slug.strip()
+    if not new_slug:
+        raise HTTPException(400, "new_slug is required")
+    if new_slug == slug:
+        return w
+    try:
+        assert_slug_available(new_slug, s)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    from ..models import Run
+    s.query(Run).filter(Run.source_slug == slug).update(
+        {"source_slug": new_slug}, synchronize_session=False)
+    w.slug = new_slug
+    s.commit(); s.refresh(w)
+    return w
 
 
 @router.post("/{slug}/restore", response_model=WorkflowOut)
