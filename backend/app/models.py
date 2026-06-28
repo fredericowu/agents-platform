@@ -23,7 +23,7 @@ class Model(Base):
     __tablename__ = "models"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
     slug: Mapped[str] = mapped_column(String, unique=True, index=True)
-    provider: Mapped[str] = mapped_column(String, index=True)  # anthropic|openai|bedrock|cli_subshell|echo
+    provider: Mapped[str] = mapped_column(String, index=True)  # anthropic|openai|bedrock|cli|echo
     model_id: Mapped[str] = mapped_column(String)              # e.g. claude-sonnet-4-5, gpt-4o
     display_name: Mapped[str] = mapped_column(String)
     params: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)

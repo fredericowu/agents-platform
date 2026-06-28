@@ -6,8 +6,8 @@ import { api, type Model } from "../lib/api";
 type ProviderInfo = Record<string, { label: string; fields: string[]; env?: string[]; kind?: string }>;
 
 const KIND_BADGE_CLASS: Record<string, string> = {
-  api: "badge-success",      // platform tool-binding (LangChain)
-  binary: "badge-warn",      // host CLI subshell — native tools
+  api: "badge-success",      // platform tool-binding via API (LangChain)
+  cli: "badge-warn",         // CLI Docker container — native tools
   stub: "badge",             // echo / fake — no LLM
 };
 
@@ -113,9 +113,9 @@ export default function Models() {
                   {providers[m.provider]?.kind && (
                     <span className={`badge ${KIND_BADGE_CLASS[providers[m.provider].kind!] || "badge"} ml-1`}
                           title={providers[m.provider].kind === "api"
-                                 ? "tool calls run platform tools via LangChain"
-                                 : providers[m.provider].kind === "binary"
-                                 ? "tool calls run inside the host CLI binary"
+                                 ? "tool calls via LangChain (API direct)"
+                                 : providers[m.provider].kind === "cli"
+                                 ? "tool calls run inside Docker CLI container"
                                  : "no LLM"}>
                       {providers[m.provider].kind}
                     </span>

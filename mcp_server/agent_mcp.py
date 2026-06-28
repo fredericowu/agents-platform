@@ -407,7 +407,9 @@ async def _list_tools() -> list[Tool]:
                                                          "description": "Slug of the Target this run is delivering against. REQUIRED."},
                                          "target_id": {"type": ["string", "null"]},
                                          "session_id": {"type": ["string", "null"],
-                                                        "description": "Resume a prior CLI session. Pass the session_id from a previous run's result to continue the conversation."}},
+                                                        "description": "Resume a prior CLI session. Pass the session_id from a previous run's result to continue the conversation."},
+                                         "notion_task_id": {"type": ["string", "null"],
+                                                            "description": "Notion page ID of the Kanban card that originated this run. When set, the agent receives NOTION_TASK_ID env var and awserv sends a Telegram notification on completion."}},
                           "required": ["slug", "input", "target_slug"]}),
         Tool(name="run_workflow_async",
              description=("Start a workflow run in the background and return its run_id.\n\n"
@@ -1134,6 +1136,8 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
                 body["target_slug"] = args["target_slug"]
             if args.get("session_id"):
                 body["session_id"] = args["session_id"]
+            if args.get("notion_task_id"):
+                body["notion_task_id"] = args["notion_task_id"]
             r = await c.post(f"{BASE}/api/agents/{args['slug']}/run", json=body)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "run_workflow_async":

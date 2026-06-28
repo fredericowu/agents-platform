@@ -42,6 +42,10 @@ export default function AgentEdit() {
 
   const enabledToolIds = useMemo(() => new Set(a?.tool_specs ?? []), [a]);
   const enabledSkills  = useMemo(() => new Set(a?.skill_slugs ?? []), [a]);
+  const isDockerCli = useMemo(() => {
+    const m = models.find(m => m.slug === a?.model_slug);
+    return m?.provider === "cli";
+  }, [a?.model_slug, models]);
 
   if (!a) return <Page title="Agent">…loading…</Page>;
 
@@ -119,8 +123,34 @@ export default function AgentEdit() {
     setA({ ...a, skill_slugs: next });
   }
 
+  const inlineDescription = !isNew ? (
+    <input
+      value={a.description}
+      onChange={e => setA({ ...a, description: e.target.value })}
+      placeholder="Add a description…"
+      title="Click to edit description"
+      className="inline-edit-subtitle"
+      style={{
+        background: "transparent",
+        border: "none",
+        borderBottom: "1px dashed transparent",
+        outline: "none",
+        color: "inherit",
+        font: "inherit",
+        fontSize: "inherit",
+        width: "100%",
+        padding: "0",
+        cursor: "text",
+      }}
+      onMouseEnter={e => (e.currentTarget.style.borderBottomColor = "var(--color-muted, #666)")}
+      onMouseLeave={e => { if (document.activeElement !== e.currentTarget) e.currentTarget.style.borderBottomColor = "transparent"; }}
+      onFocus={e => (e.currentTarget.style.borderBottomColor = "var(--color-accent, #58a6ff)")}
+      onBlur={e => (e.currentTarget.style.borderBottomColor = "transparent")}
+    />
+  ) : "Define a new agent profile.";
+
   return (
-    <Page title={isNew ? "New agent" : a.name} subtitle={isNew ? "Define a new agent profile." : a.description}
+    <Page title={isNew ? "New agent" : a.name} subtitle={inlineDescription}
           actions={
             <>
               <Link to="/agents" className="btn">← back</Link>
@@ -170,8 +200,6 @@ export default function AgentEdit() {
                      onChange={e => setEditedSlug(e.target.value)}
                      data-testid="agent-slug" className="font-mono" />
             )}
-            <label className="block text-xs text-muted mt-3 mb-1">description</label>
-            <input value={a.description} onChange={e => setA({ ...a, description: e.target.value })} />
             <label className="block text-xs text-muted mt-3 mb-1">system prompt</label>
             <textarea rows={6} value={a.system_prompt}
                       onChange={e => setA({ ...a, system_prompt: e.target.value })}
@@ -290,8 +318,11 @@ export default function AgentEdit() {
               }}>+ add server</button>
           </div>
 
-          <div className="card">
-            <h2 className="text-base font-semibold mb-3">Tools ({a.tool_specs.length} selected)</h2>
+          <div className={`card${isDockerCli ? " opacity-50 pointer-events-none select-none" : ""}`}>
+            <h2 className="text-base font-semibold mb-3">
+              Tools ({a.tool_specs.length} selected)
+              {isDockerCli && <span className="ml-2 text-xs font-normal text-muted normal-case">(managed by Docker image)</span>}
+            </h2>
             <div className="space-y-3">
               {["builtin", "mcp", "skill"].map(kind => (
                 <div key={kind}>
@@ -301,7 +332,8 @@ export default function AgentEdit() {
                       <label key={t.id} className="flex items-center gap-2 py-1 cursor-pointer text-xs">
                         <input type="checkbox" className="w-auto"
                                checked={enabledToolIds.has(t.id)}
-                               onChange={() => toggleTool(t.id)} />
+                               disabled={isDockerCli}
+                               onChange={() => !isDockerCli && toggleTool(t.id)} />
                         <span className="font-mono">{t.id}</span>
                       </label>
                     ))}

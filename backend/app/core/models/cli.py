@@ -1,4 +1,9 @@
-"""Invoke the installed ``claude`` (or any compatible) CLI as the LLM.
+"""Invoke a CLI agent inside an isolated Docker container.
+
+All runs go through ``docker_agent.build_docker_argv`` — there is no direct
+(non-Docker) execution path. This ensures consistent isolation, credential
+mounting, and per-run cwd for session persistence regardless of which agent
+or model is in use.
 
 When ``stream_json=True`` (default for the "claude" CLI) we use
 ``--output-format stream-json`` to get *every* event emitted by the agentic
@@ -12,8 +17,6 @@ import asyncio
 import contextvars
 import json
 import os
-import shutil
-from pathlib import Path
 from typing import Any, AsyncIterator
 
 from . import BaseLLM, ChatChunk
@@ -54,15 +57,15 @@ async def kill_run(run_id: str) -> int:
     return n
 
 
-class CliSubshellLLM(BaseLLM):
-    provider = "cli_subshell"
+class CliLLM(BaseLLM):
+    provider = "cli"
 
     def __init__(
         self,
         model_id: str,
         *,
         cli: str = "claude",
-        model: str | None = None,            # passed to `claude --model <name>`
+        model: str | None = None,
         cwd: str | None = None,
         add_dirs: list[str] | None = None,
         allowed_tools: list[str] | None = None,
@@ -73,16 +76,14 @@ class CliSubshellLLM(BaseLLM):
         append_system_prompt: str | None = None,
         timeout_s: int = 900,
         extra_args: list[str] | None = None,
-        # Docker mode — when True, run inside an isolated container via docker_agent
-        docker: bool = False,
         docker_creds: bool = True,
         docker_mcp_config_dir: str | None = None,
-        # Session persistence: agent+target for cwd isolation; session_id for --resume
         agent_id: str | None = None,
         target_id: str | None = None,
         run_id: str | None = None,
         session_id: str | None = None,
         resume_run_id: str | None = None,
+        notion_task_id: str | None = None,
         **_: Any,
     ) -> None:
         self.model_id = model_id
@@ -98,7 +99,6 @@ class CliSubshellLLM(BaseLLM):
         self.append_system_prompt = append_system_prompt
         self.timeout_s = timeout_s
         self.extra_args = list(extra_args or [])
-        self.docker = docker
         self.docker_creds = docker_creds
         self.docker_mcp_config_dir = docker_mcp_config_dir
         self.agent_id = agent_id
@@ -106,32 +106,16 @@ class CliSubshellLLM(BaseLLM):
         self.run_id = run_id
         self.session_id = session_id
         self.resume_run_id = resume_run_id
-        if not docker and shutil.which(self.cli) is None:
-            raise RuntimeError(f"CLI {cli!r} not found on PATH")
+        self.notion_task_id = notion_task_id
 
     def _build_argv(self, prompt: str) -> list[str]:
-        if self.docker:
-            return self._build_docker_argv(prompt)
-        return self._build_direct_argv(prompt)
-
-    def _build_docker_argv(self, prompt: str) -> list[str]:
-        from pathlib import Path as _Path
-        try:
-            from src.tools.docker_agent import build_docker_argv, CLI_SPECS
-        except ImportError:
-            import sys
-            sys.path.insert(0, "/opt/agentic-workspace")
-            from src.tools.docker_agent import build_docker_argv, CLI_SPECS
+        from ..tools.docker_agent import build_docker_argv, CLI_SPECS
 
         cli = self.cli if self.cli in CLI_SPECS else "claude"
 
-        # Build mounts: cwd + all add_dirs
         mounts: list[str] = []
         if self.cwd:
             mounts.append(self.cwd)
-        for d in self.add_dirs:
-            # add_dirs are passed separately; don't double-mount as plain mounts
-            pass
 
         extra: list[str] = []
         if self.allowed_tools:
@@ -144,6 +128,9 @@ class CliSubshellLLM(BaseLLM):
             extra += ["--append-system-prompt", self.append_system_prompt]
         extra += self.extra_args
 
+        _extra_env: dict[str, str] = {}
+        if self.notion_task_id:
+            _extra_env["NOTION_TASK_ID"] = self.notion_task_id
         return build_docker_argv(
             cli=cli,
             prompt=prompt,
@@ -163,34 +150,10 @@ class CliSubshellLLM(BaseLLM):
             target_id=self.target_id,
             run_id=self.resume_run_id or self.run_id,
             session_id=self.session_id,
+            extra_docker_env=_extra_env or None,
         )
 
-    def _build_direct_argv(self, prompt: str) -> list[str]:
-        argv: list[str] = [self.cli]
-        if self.session_id:
-            argv += ["--resume", self.session_id]
-        argv += ["-p", prompt]
-        if self.model:
-            argv += ["--model", self.model]
-        if self.dangerous_skip_permissions:
-            argv.append("--dangerously-skip-permissions")
-        if self.bare:
-            argv.append("--bare")
-        if self.append_system_prompt:
-            argv += ["--append-system-prompt", self.append_system_prompt]
-        for d in self.add_dirs:
-            argv += ["--add-dir", d]
-        if self.allowed_tools:
-            argv += ["--allowed-tools", ",".join(self.allowed_tools)]
-        if self.disallowed_tools:
-            argv += ["--disallowed-tools", ",".join(self.disallowed_tools)]
-        if self.stream_json:
-            argv += ["--output-format", "stream-json", "--verbose"]
-        argv += self.extra_args
-        return argv
-
     async def astream(self, messages: list[dict], **params: Any) -> AsyncIterator[ChatChunk]:
-        # Collapse messages → one prompt (the CLI runs the agent loop itself)
         parts: list[str] = []
         for m in messages:
             r = m.get("role", "user")
@@ -204,21 +167,13 @@ class CliSubshellLLM(BaseLLM):
         prompt = "\n".join(parts).strip()
         argv = self._build_argv(prompt)
 
-        cwd = self.cwd or os.getcwd()
-        if self.cwd:
-            Path(self.cwd).mkdir(parents=True, exist_ok=True)
-
-        # ``limit`` controls the asyncio StreamReader buffer per line. claude CLI's
-        # stream-json events can include tool_use blocks with large file payloads
-        # and a system.init event listing every tool — both routinely > 64KB.
-        # Bump to 10MB so we don't blow up with LimitOverrunError ("Separator …
-        # chunk exceeds the limit").
+        # Bump to 10MB — claude CLI stream-json events (system.init, tool payloads) exceed 64KB default
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=cwd, env={**os.environ},
+            cwd=os.getcwd(), env={**os.environ},
             limit=10 * 1024 * 1024,
         )
         rid: str | None = current_run_id.get()
@@ -228,14 +183,11 @@ class CliSubshellLLM(BaseLLM):
         tin = tout = 0
         cost = 0.0
         final_text = ""
+
         async def _read_line(stream: asyncio.StreamReader) -> bytes | None:
-            """Read one newline-terminated line, surviving LimitOverrunError by
-            draining until the next newline. Returns None at EOF."""
             try:
                 return await stream.readline()
             except asyncio.LimitOverrunError as e:
-                # consume up to `e.consumed` from the buffer and keep reading
-                # the rest of the oversized line as raw bytes, then return it.
                 head = await stream.readexactly(e.consumed)
                 rest = b""
                 while True:
@@ -260,14 +212,11 @@ class CliSubshellLLM(BaseLLM):
                     try:
                         evt = json.loads(line)
                     except json.JSONDecodeError:
-                        # not json — emit as plain text
                         yield ChatChunk(delta=line + "\n")
                         continue
                     et = evt.get("type")
                     if et == "system" and evt.get("subtype") == "init":
-                        yield ChatChunk(delta="", finish=False, tokens_in=0, tokens_out=0,
-                                        cost_usd=0.0)  # marker; metadata via .meta below
-                        # Use a special chunk with a payload via the .meta hack:
+                        yield ChatChunk(delta="", finish=False, tokens_in=0, tokens_out=0, cost_usd=0.0)
                         yield _meta_chunk("system.init", {
                             "session_id": evt.get("session_id"),
                             "model": evt.get("model"),
@@ -340,7 +289,6 @@ class CliSubshellLLM(BaseLLM):
 
 
 def _meta_chunk(kind: str, payload: dict) -> ChatChunk:
-    """ChatChunk variant: ``.delta`` empty, with metadata attached via attributes."""
     c = ChatChunk(delta="", finish=False)
     c.meta_kind = kind          # type: ignore[attr-defined]
     c.meta_payload = payload    # type: ignore[attr-defined]
@@ -348,7 +296,6 @@ def _meta_chunk(kind: str, payload: dict) -> ChatChunk:
 
 
 def _redact(value: Any) -> Any:
-    """Truncate big payloads in tool call inputs for log readability."""
     if isinstance(value, str):
         return value if len(value) < 800 else value[:800] + "…[trunc]"
     if isinstance(value, dict):

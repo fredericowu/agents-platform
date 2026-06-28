@@ -174,10 +174,7 @@ async def wait_run(run_id: str,
             from datetime import datetime as _dt
             from ..core.cancel import mark_cancelled
             from ..core.events import bus
-            try:
-                from ..core.models.cli_subshell import kill_run
-            except Exception:
-                kill_run = None  # type: ignore
+            from ..core.models.cli import kill_run
 
             with session_scope() as s2:
                 root = s2.query(Run).filter(Run.id == run_id).first()
@@ -538,7 +535,7 @@ async def cancel_all(s: Session = Depends(get_session)):
     from datetime import datetime
     from ..core.cancel import mark_cancelled
     from ..core.events import bus
-    from ..core.models.cli_subshell import kill_run
+    from ..core.models.cli import kill_run
 
     # Roots first — cancelling them cascades to descendants via the orchestrator.
     roots = (s.query(Run)
@@ -585,7 +582,7 @@ async def cancel_run(run_id: str, s: Session = Depends(get_session)):
         raise HTTPException(404, "not found")
     from datetime import datetime
     from ..core.events import bus
-    from ..core.models.cli_subshell import kill_run
+    from ..core.models.cli import kill_run
 
     from ..core.cancel import mark_cancelled
 

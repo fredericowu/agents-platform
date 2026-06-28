@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
     # Default provider/model when unspecified
-    default_provider: Literal["anthropic", "openai", "bedrock", "cli_subshell", "echo"] = "echo"
+    default_provider: Literal["anthropic", "openai", "bedrock", "cli", "echo"] = "echo"
     default_model: str = "claude-sonnet-4-5"
 
     # Limits

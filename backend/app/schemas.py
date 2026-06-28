@@ -113,6 +113,7 @@ class RunInput(BaseModel):
     target_slug: str | None = None   # first-class; takes precedence over input.extra
     target_id: str | None = None     # first-class; takes precedence over input.extra
     session_id: str | None = None    # resume a prior CLI session (e.g. claude --resume)
+    notion_task_id: str | None = None  # Notion page ID of the kanban card that originated this run
 
 
 class RunOut(_Base):

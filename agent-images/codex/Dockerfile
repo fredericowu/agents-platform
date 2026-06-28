@@ -1,0 +1,46 @@
+FROM ubuntu:24.04
+
+ARG TARGETARCH
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=UTC \
+    NPM_CONFIG_PREFIX=/opt/agent-npm \
+    PATH="/opt/agent-npm/bin:$PATH"
+
+# ── Minimal system packages ───────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git openssh-client \
+    curl wget unzip \
+    ca-certificates gnupg \
+    build-essential procps sudo less \
+    jq sqlite3 \
+    python3 python3-pip python3-venv \
+    tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── GitHub CLI ────────────────────────────────────────────────────────────────
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+
+# ── Node.js LTS ───────────────────────────────────────────────────────────────
+RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# ── Runtime user ──────────────────────────────────────────────────────────────
+RUN echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers && \
+    ln -sf /usr/bin/python3 /usr/local/bin/python && \
+    mkdir -p /opt/agent-npm && \
+    chown -R ubuntu:ubuntu /opt/agent-npm
+
+# ── Codex CLI ────────────────────────────────────────────────────────────────
+USER ubuntu
+RUN npm install -g @openai/codex@latest && codex --version
+
+WORKDIR /workspace
+CMD ["codex", "--version"]

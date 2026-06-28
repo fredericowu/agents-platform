@@ -69,8 +69,8 @@ class EchoLLM(BaseLLM):
 def make_llm(provider: str, model_id: str, **params: Any) -> BaseLLM:
     """Factory. Falls back to EchoLLM if a real provider can't be initialized.
 
-    Security: when the effective security_mode is ``secure``, the claude CLI
-    subshell loses ``--dangerously-skip-permissions`` and gains
+    Security: when the effective security_mode is ``secure``, the CLI agent
+    loses ``--dangerously-skip-permissions`` and gains
     ``--disallowed-tools Bash`` so the inner agent can't shell out.
     """
     provider = (provider or settings.default_provider).lower()
@@ -84,21 +84,18 @@ def make_llm(provider: str, model_id: str, **params: Any) -> BaseLLM:
         if provider == "bedrock":
             from .bedrock_p import BedrockLLM
             return BedrockLLM(model_id=model_id, **params)
-        if provider == "cli_subshell":
-            from .cli_subshell import CliSubshellLLM
+        if provider == "cli":
+            from .cli import CliLLM
             from .. import security
-            # Resolve effective mode using the agent's params (already merged
-            # into **params**) and apply gating to the CLI invocation.
             eff = security.effective_for_agent(params)
             params = dict(params)   # avoid mutating caller's dict
             if eff["mode"] == "secure":
                 params["dangerous_skip_permissions"] = False
-                # Append to any existing disallowed_tools list — don't replace.
                 disallowed = list(params.get("disallowed_tools") or [])
                 if "Bash" not in disallowed:
                     disallowed.append("Bash")
                 params["disallowed_tools"] = disallowed
-            return CliSubshellLLM(model_id=model_id, **params)
+            return CliLLM(model_id=model_id, **params)
     except Exception as e:
         print(f"[models] provider {provider} init failed ({e}); falling back to echo")
     return EchoLLM(model_id=model_id, **params)

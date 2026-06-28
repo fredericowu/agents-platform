@@ -12,7 +12,7 @@ router = APIRouter(prefix="/api/models", tags=["models"])
 
 class ModelIn(BaseModel):
     slug: str
-    provider: str          # echo|anthropic|openai|bedrock|cli_subshell
+    provider: str          # echo|anthropic|openai|bedrock|cli|fake
     model_id: str
     display_name: str
     params: dict[str, Any] = {}
@@ -91,7 +91,7 @@ def provider_info():
         "bedrock":      {"label": "AWS Bedrock (Converse API, tools supported)", "kind": "api",
                          "fields": ["region", "temperature"],
                          "env": ["AWS_REGION", "AWS_PROFILE"]},
-        "cli_subshell": {"label": "Installed CLI (subshell, native tools)", "kind": "binary",
+        "cli":          {"label": "CLI Agent (Docker container, native tools)", "kind": "cli",
                          "fields": ["cli", "model", "cwd", "add_dirs",
                                     "allowed_tools", "disallowed_tools",
                                     "dangerous_skip_permissions", "stream_json",

@@ -56,6 +56,36 @@ def _agent_to_runtime(s: Session, agent: Agent) -> dict[str, Any]:
             "skill_slugs": list(agent.skill_slugs or [])}
 
 
+async def _notify_kanban_run_done(*, run_id: str, agent_slug: str,
+                                   notion_task_id: str, status: str, text: str) -> None:
+    """Fire-and-forget: tell awserv that a Notion-linked run finished."""
+    import os as _os
+    try:
+        import httpx as _httpx
+        awserv = _os.environ.get("AWSERV_BASE", "http://127.0.0.1:9123")
+        # Read awserv API key for internal call auth
+        api_key = ""
+        try:
+            key_path = _os.path.join(_os.environ.get("AW_BASE_DIR", "/opt/agentic-workspace"), ".tmp", "awserv_api_key")
+            with open(key_path) as _f:
+                api_key = _f.read().strip()
+        except Exception:
+            pass
+        headers = {"X-Api-Key": api_key} if api_key else {}
+        async with _httpx.AsyncClient(timeout=10.0) as c:
+            await c.post(f"{awserv}/api/workspace-agent/notify",
+                         json={
+                             "run_id": run_id,
+                             "agent_slug": agent_slug,
+                             "notion_task_id": notion_task_id,
+                             "status": status,
+                             "summary": text,
+                         },
+                         headers=headers)
+    except Exception:
+        pass
+
+
 async def run_agent(
     agent_slug: str,
     user_input: str,
@@ -69,6 +99,7 @@ async def run_agent(
     target_id: str | None = None,
     extra_messages: list[dict] | None = None,
     session_id: str | None = None,
+    notion_task_id: str | None = None,
 ) -> dict[str, Any]:
     """Run an agent and return ``{run_id, text, status, error, tokens_in, tokens_out}``.
 
@@ -165,6 +196,8 @@ async def run_agent(
         # Inject runtime context for session isolation and resumption.
         runtime["params"]["target_id"] = target_id
         runtime["params"]["run_id"] = run_id
+        if notion_task_id:
+            runtime["params"]["notion_task_id"] = notion_task_id
         if session_id:
             runtime["params"]["session_id"] = session_id
             # Reuse the original run's isolated cwd so --resume can find the session file.
@@ -175,8 +208,7 @@ async def run_agent(
                 if _orig:
                     runtime["params"]["resume_run_id"] = _orig.id
 
-        # Tag this run for subprocess registry (cli_subshell only — harmless otherwise).
-        from .models.cli_subshell import current_run_id
+        from .models.cli import current_run_id
         from .tools.code import current_agent_params
         token = current_run_id.set(run_id)
         # Make the agent's params visible to the run_command gate so per-agent
@@ -280,6 +312,19 @@ async def run_agent(
         if _run_ws_data:
             from .events import ws_broadcast
             asyncio.create_task(ws_broadcast("run_update", _run_ws_data))
+    except Exception:
+        pass
+    # Notion Kanban post-run notification: if this run was triggered from a Notion card,
+    # notify awserv so it can update the card status and send Telegram confirmation.
+    try:
+        if notion_task_id and run_id:
+            asyncio.create_task(_notify_kanban_run_done(
+                run_id=run_id,
+                agent_slug=agent_slug,
+                notion_task_id=notion_task_id,
+                status=status,
+                text=text[:500] if text else "",
+            ))
     except Exception:
         pass
     try:
@@ -581,7 +626,8 @@ def start_agent_run_bg(agent_slug: str, user_input: str, *,
                        parent_run_id: str | None = None,
                        node_id: str | None = None,
                        target_id: str | None = None,
-                       session_id: str | None = None) -> str:
+                       session_id: str | None = None,
+                       notion_task_id: str | None = None) -> str:
     """Schedule an agent run in the background; return its run_id."""
     if target_id is None and parent_run_id is None:
         raise ValueError("target_id is required for top-level agent runs")
@@ -600,8 +646,11 @@ def start_agent_run_bg(agent_slug: str, user_input: str, *,
             _t = s.query(_Target).filter(_Target.id == target_id).first()
             if _t:
                 _run_target_slug = _t.slug
+        _run_input = {"input": user_input}
+        if notion_task_id:
+            _run_input["notion_task_id"] = notion_task_id
         r = Run(kind="agent", target_slug=_run_target_slug, status="running",
-                input={"input": user_input},
+                input=_run_input,
                 initiator_kind=initiator_kind,
                 initiator_id=initiator_id,
                 parent_run_id=parent_run_id,
@@ -628,7 +677,8 @@ def start_agent_run_bg(agent_slug: str, user_input: str, *,
                             initiator_kind=initiator_kind,
                             initiator_id=initiator_id,
                             session_id=session_id,
-                            target_id=target_id)
+                            target_id=target_id,
+                            notion_task_id=notion_task_id)
         finally:
             await bus.publish(rid, "done", {})
             await bus.close(rid)

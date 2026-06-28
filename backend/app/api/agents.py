@@ -338,6 +338,7 @@ async def run_agent_ep(slug: str, body: RunInput, s: Session = Depends(get_sessi
     target_id = body.target_id or (extra.get("target_id") if isinstance(extra, dict) else None)
     target_slug = body.target_slug or (extra.get("target_slug") if isinstance(extra, dict) else None)
     session_id = body.session_id or (extra.get("session_id") if isinstance(extra, dict) else None)
+    notion_task_id = body.notion_task_id or (extra.get("notion_task_id") if isinstance(extra, dict) else None)
     if target_id is None and target_slug:
         from ..models import Target
         t = s.query(Target).filter(Target.slug == target_slug).first()
@@ -347,7 +348,8 @@ async def run_agent_ep(slug: str, body: RunInput, s: Session = Depends(get_sessi
     if target_id is None:
         raise HTTPException(400, "target_slug is required — pass a target_slug to link this run to a delivery Target")
     try:
-        rid = start_agent_run_bg(slug, payload, target_id=target_id, session_id=session_id)
+        rid = start_agent_run_bg(slug, payload, target_id=target_id, session_id=session_id,
+                                 notion_task_id=notion_task_id)
     except __import__("backend.app.core.executor", fromlist=["TargetBudgetExceeded"]).TargetBudgetExceeded as e:
         raise HTTPException(429, f"target budget exceeded: {e}")
     return {"run_id": rid, "target_id": target_id}

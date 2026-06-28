@@ -187,7 +187,7 @@ def create_wf(slug, name, kind, graph, description):
 @create_.command("model")
 @click.option("--slug", required=True)
 @click.option("--provider", required=True,
-              type=click.Choice(["echo", "anthropic", "openai", "bedrock", "cli_subshell"]))
+              type=click.Choice(["echo", "anthropic", "openai", "bedrock", "cli"]))
 @click.option("--model-id", required=True)
 @click.option("--display-name", default="")
 @click.option("--params", default="{}", help="JSON for provider-specific params")
