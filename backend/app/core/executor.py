@@ -289,6 +289,11 @@ async def run_agent(
                                     _r = _ss.query(Run).filter(Run.id == run_id).first()
                                     if _r:
                                         _r.session_id = _sid
+                                from ..models import CliSession as _CliSession
+                                from ..db import session_scope as _scope
+                                with _scope() as _cs:
+                                    if not _cs.query(_CliSession).filter(_CliSession.session_id == _sid).first():
+                                        _cs.add(_CliSession(session_id=_sid, name="", description=""))
                     if chunk.delta:
                         if _t_first_token is None:
                             _t_first_token = _time.perf_counter()

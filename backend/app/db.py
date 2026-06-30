@@ -177,6 +177,29 @@ def _apply_inline_migrations() -> None:
         if "targets" in insp.get_table_names():
             _ensure_column(conn, "targets", "github_issue_number", "github_issue_number INTEGER")
             _ensure_column(conn, "targets", "github_issue_url", "github_issue_url TEXT")
+        if "telegram_sessions" in insp.get_table_names():
+            _ensure_column(conn, "telegram_sessions", "agent_slug_override",
+                           "agent_slug_override VARCHAR")
+
+    # Backfill cli_sessions from existing runs.session_id values
+    if "cli_sessions" in insp.get_table_names() and "runs" in insp.get_table_names():
+        with engine.begin() as conn:
+            try:
+                conn.execute(text("""
+                    INSERT OR IGNORE INTO cli_sessions (id, session_id, name, description, created_at, updated_at)
+                    SELECT
+                        lower(hex(randomblob(16))),
+                        session_id,
+                        '',
+                        '',
+                        MIN(started_at),
+                        MAX(started_at)
+                    FROM runs
+                    WHERE session_id IS NOT NULL AND session_id != ''
+                    GROUP BY session_id
+                """))
+            except Exception:
+                pass  # non-fatal — runs without session_id simply won't appear
 
 
 def _backfill_lesson_evidence_runs(conn) -> None:

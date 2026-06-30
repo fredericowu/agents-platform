@@ -268,6 +268,18 @@ export type Lesson = {
   updated_at: string;
 };
 
+export type CliSession = {
+  id: string;
+  session_id: string;
+  name: string;
+  description: string;
+  run_count: number;
+  last_run_at: string | null;
+  last_status: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type TelegramBot = {
   id: string;
   name: string;
@@ -519,6 +531,18 @@ export const api = {
     }),
   recomputeRetroScore: (runId: string) =>
     call<RetroScoreSummary>(`/api/runs/${runId}/retro-scores/recompute`, { method: "POST" }),
+
+  // CLI Sessions
+  listSessions: (opts: { q?: string; limit?: number } = {}) => {
+    const p = new URLSearchParams();
+    if (opts.q) p.set("q", opts.q);
+    if (opts.limit) p.set("limit", String(opts.limit));
+    return call<CliSession[]>(`/api/sessions${p.toString() ? "?" + p : ""}`);
+  },
+  updateSession: (session_id: string, patch: { name?: string; description?: string }) =>
+    call<CliSession>(`/api/sessions/${session_id}`, { method: "PATCH", body: JSON.stringify(patch) }),
+  deleteSession: (session_id: string) =>
+    call<{ deleted: string }>(`/api/sessions/${session_id}`, { method: "DELETE" }),
 
   // Telegram bots
   listTelegramBots: () => call<TelegramBot[]>("/api/telegram/bots"),

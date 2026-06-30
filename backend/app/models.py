@@ -395,6 +395,17 @@ class TelegramBot(Base):
     )
 
 
+class CliSession(Base):
+    """Named CLI session — tracks a claude --resume session_id with a human-friendly name."""
+    __tablename__ = "cli_sessions"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(String, unique=True, index=True)  # claude CLI session ID
+    name: Mapped[str] = mapped_column(String, default="")
+    description: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
 class TelegramSession(Base):
     """Tracks the last Claude session_id per (bot, chat) for conversation continuity."""
     __tablename__ = "telegram_sessions"
@@ -404,6 +415,7 @@ class TelegramSession(Base):
     chat_id: Mapped[str] = mapped_column(String, index=True)
     session_id: Mapped[str | None] = mapped_column(String, nullable=True)  # claude --resume id
     target_id: Mapped[str | None] = mapped_column(String, nullable=True)   # AP Target.id
+    agent_slug_override: Mapped[str | None] = mapped_column(String, nullable=True)  # per-chat agent override
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
     bot: Mapped["TelegramBot"] = relationship(back_populates="sessions")

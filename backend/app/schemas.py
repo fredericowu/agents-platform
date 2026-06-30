@@ -113,6 +113,24 @@ class WorkflowOut(_Base):
     updated_at: datetime
 
 
+# ----- cli sessions -----
+class CliSessionOut(_Base):
+    id: str
+    session_id: str
+    name: str
+    description: str
+    run_count: int = 0
+    last_run_at: datetime | None = None
+    last_status: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class CliSessionUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+
+
 # ----- runs -----
 class RunInput(BaseModel):
     input: dict[str, Any] = Field(default_factory=dict)

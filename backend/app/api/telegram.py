@@ -539,6 +539,114 @@ def _save_telegram_upload(token: str, message: dict) -> str | None:
     return local_path
 
 
+# ---------------------------------------------------------------------------
+# Agent Picker helpers
+# ---------------------------------------------------------------------------
+
+def _list_agents_for_picker() -> list[dict]:
+    """Return all non-deleted agents ordered by name."""
+    with session_scope() as s:
+        from ..models import Agent as _Agent
+        rows = (s.query(_Agent)
+                .filter(_Agent.deleted_at.is_(None))
+                .order_by(_Agent.name)
+                .all())
+        return [{"slug": r.slug, "name": r.name or r.slug} for r in rows]
+
+
+def _list_sessions_for_agent(agent_slug: str, limit: int = 8) -> list[dict]:
+    """Return recent CliSessions that have at least one Run from agent_slug."""
+    with session_scope() as s:
+        from ..models import CliSession as _CS, Run as _Run
+        rows = (s.query(_CS)
+                .join(_Run, _Run.session_id == _CS.session_id)
+                .filter(_Run.source_slug == agent_slug)
+                .order_by(_CS.updated_at.desc())
+                .distinct()
+                .limit(limit)
+                .all())
+        return [{"session_id": r.session_id, "name": r.name or ""} for r in rows]
+
+
+def _get_agent_slug_for_chat(bot: TelegramBot, bot_id: str, chat_id: str) -> str:
+    """Return the effective agent slug for this chat (override > bot default)."""
+    with session_scope() as s:
+        row = (s.query(TelegramSession)
+               .filter(TelegramSession.bot_id == bot_id,
+                       TelegramSession.chat_id == chat_id)
+               .first())
+        if row and row.agent_slug_override:
+            return row.agent_slug_override
+    return bot.agent_slug or ""
+
+
+def _set_agent_slug_override(bot_id: str, chat_id: str, agent_slug: str) -> None:
+    """Persist a per-chat agent override; creates the TelegramSession row if needed."""
+    with session_scope() as s:
+        row = (s.query(TelegramSession)
+               .filter(TelegramSession.bot_id == bot_id,
+                       TelegramSession.chat_id == chat_id)
+               .first())
+        if row:
+            row.agent_slug_override = agent_slug
+            row.session_id = None  # reset session so the new agent starts fresh
+        else:
+            s.add(TelegramSession(
+                bot_id=bot_id, chat_id=chat_id,
+                agent_slug_override=agent_slug, session_id=None,
+            ))
+
+
+def _set_session_override(bot_id: str, chat_id: str, session_id: str | None) -> None:
+    """Switch the active session for this chat (None = start fresh)."""
+    with session_scope() as s:
+        row = (s.query(TelegramSession)
+               .filter(TelegramSession.bot_id == bot_id,
+                       TelegramSession.chat_id == chat_id)
+               .first())
+        if row:
+            row.session_id = session_id
+
+
+def _send_agent_picker(token: str, chat_id: str) -> None:
+    """Send the Agent Picker inline keyboard."""
+    agents = _list_agents_for_picker()
+    if not agents:
+        _send_message(token, chat_id, "⚠️ No agents configured in the Agents Platform.")
+        return
+    keyboard = []
+    for ag in agents:
+        label = ag["name"][:30]
+        cb = f"ap_agent:{ag['slug']}"
+        if len(cb) > 64:
+            cb = cb[:64]
+        keyboard.append([{"text": label, "callback_data": cb}])
+    _send_message(
+        token, chat_id,
+        "🤖 <b>Agent Picker</b>\n\nChoose an agent:",
+        reply_markup={"inline_keyboard": keyboard},
+    )
+
+
+def _send_session_picker(token: str, chat_id: str, agent_slug: str, agent_name: str) -> None:
+    """Send the Session Picker inline keyboard for the chosen agent."""
+    sessions = _list_sessions_for_agent(agent_slug)
+    keyboard = []
+    for sess in sessions:
+        label = sess["name"] or sess["session_id"][:12] + "…"
+        label = label[:30]
+        cb = f"ap_sess:{sess['session_id']}"
+        if len(cb) > 64:
+            cb = f"ap_sess:{sess['session_id'][:55]}"
+        keyboard.append([{"text": label, "callback_data": cb}])
+    keyboard.append([{"text": "➕ New session", "callback_data": "ap_sess:__new__"}])
+    _send_message(
+        token, chat_id,
+        f"✅ Agent set to <b>{_md_to_html(agent_name)}</b>\n\nPick a session:",
+        reply_markup={"inline_keyboard": keyboard},
+    )
+
+
 # Per-chat serialization: one active dispatch per (bot_id, chat_id)
 _CHAT_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 _CHAT_LOCKS_META = threading.Lock()
@@ -757,11 +865,11 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
               t_enqueue: float | None = None) -> None:
     t_dispatch = _time.perf_counter()
     token = bot.token
-    agent_slug = bot.agent_slug
+    agent_slug = _get_agent_slug_for_chat(bot, bot.id, chat_id)
 
     if not agent_slug:
         _send_message(token, chat_id,
-                      "⚠️ This bot has no agent configured in the Agents Platform.")
+                      "⚠️ This bot has no agent configured. Use /agent to pick one.")
         return
 
     # Verify agent exists
@@ -769,7 +877,7 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
         agent = s.query(Agent).filter(Agent.slug == agent_slug).first()
         if not agent:
             _send_message(token, chat_id,
-                          f"⚠️ Agent <code>{agent_slug}</code> not found.")
+                          f"⚠️ Agent <code>{agent_slug}</code> not found. Use /agent to pick another.")
             return
 
     # Ordering + serialization is owned by the per-chat FIFO worker
@@ -1142,6 +1250,45 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
             _enqueue_dispatch(bot_snapshot, cq_chat_id, cq_user_id,
                               option_text, False, "")
 
+        elif cq_data.startswith("ap_agent:") and cq_chat_id:
+            # Agent Picker: user chose an agent
+            chosen_slug = cq_data[len("ap_agent:"):]
+            _answer_callback_query(bot.token, cq_id)
+            # Resolve display name
+            agents_all = _list_agents_for_picker()
+            chosen_name = next((a["name"] for a in agents_all if a["slug"] == chosen_slug),
+                               chosen_slug)
+            # Persist the override + reset session
+            _set_agent_slug_override(bot_id, cq_chat_id, chosen_slug)
+            # Collapse the picker message
+            msg_id = cq_msg.get("message_id")
+            if msg_id:
+                _edit_message_text(bot.token, cq_chat_id, msg_id,
+                                   f"🤖 <b>Agent Picker</b>\n\n✅ <b>{_md_to_html(chosen_name)}</b> selected")
+            # Show session picker
+            _send_session_picker(bot.token, cq_chat_id, chosen_slug, chosen_name)
+
+        elif cq_data.startswith("ap_sess:") and cq_chat_id:
+            # Session Picker: user chose a session (or "new")
+            chosen_sid = cq_data[len("ap_sess:"):]
+            _answer_callback_query(bot.token, cq_id)
+            msg_id = cq_msg.get("message_id")
+            if chosen_sid == "__new__":
+                _set_session_override(bot_id, cq_chat_id, None)
+                if msg_id:
+                    _edit_message_text(bot.token, cq_chat_id, msg_id,
+                                       "➕ Starting a <b>new session</b> — previous context cleared.")
+                _send_message(bot.token, cq_chat_id,
+                              "🟢 Ready! Send a message to start a new conversation.")
+            else:
+                _set_session_override(bot_id, cq_chat_id, chosen_sid)
+                short = chosen_sid[:8] + "…"
+                if msg_id:
+                    _edit_message_text(bot.token, cq_chat_id, msg_id,
+                                       f"✅ Resumed session <code>{short}</code>")
+                _send_message(bot.token, cq_chat_id,
+                              f"🔄 Session <code>{short}</code> resumed. Send a message to continue.")
+
         return {"ok": True, "reason": "callback_query handled"}
 
     # ── Regular message ───────────────────────────────────────────────────
@@ -1189,6 +1336,10 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
         cmd = _head.lstrip("/").split("@", 1)[0].lower()
         args = _args.strip()
 
+        if cmd in ("agent", "agents", "pick"):
+            _send_agent_picker(bot.token, chat_id)
+            return {"ok": True, "reason": "slash /agent"}
+
         if cmd in ("new", "newsession", "reset"):
             existed = False
             with session_scope() as ss:
@@ -1218,19 +1369,21 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
                                TelegramSession.chat_id == chat_id)
                        .first())
                 sid = row.session_id if row else None
-            agent_slug = bot.agent_slug or "(none)"
+                slug_override = row.agent_slug_override if row else None
+            effective_slug = slug_override or bot.agent_slug or "(none)"
+            override_note = " (override)" if slug_override else ""
             name = _current_target_name(bot_id, chat_id)
             if not sid:
                 _send_message(bot.token, chat_id,
                               "📭 No active session.\n"
-                              f"Agent: <code>{agent_slug}</code>\n"
+                              f"Agent: <code>{effective_slug}</code>{override_note}\n"
                               "Send any message to start one.")
             else:
                 name_line = f"Name: <code>{_md_to_html(name)}</code>\n" if name else ""
                 _send_message(bot.token, chat_id,
                               "📊 <b>Session status</b>\n"
                               f"{name_line}"
-                              f"Agent: <code>{agent_slug}</code>\n"
+                              f"Agent: <code>{effective_slug}</code>{override_note}\n"
                               f"Session id: <code>{sid[:8]}…</code>")
             return {"ok": True, "reason": "slash /status"}
 
@@ -1257,6 +1410,7 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
         if cmd in ("help", "?"):
             _send_message(bot.token, chat_id,
                           "🤖 <b>Agents Platform commands</b>\n"
+                          "/agent — pick an agent and session\n"
                           "/new — start a fresh conversation (clears context)\n"
                           "/start — greet and start a fresh session\n"
                           "/status — show active session info\n"
