@@ -10,8 +10,12 @@ Lineage:
 from __future__ import annotations
 
 import asyncio
+import logging
+import time as _time
 from datetime import datetime
 from typing import Any
+
+_exec_log = logging.getLogger("ap.executor")
 
 from sqlalchemy.orm import Session
 
@@ -49,9 +53,27 @@ def _agent_to_runtime(s: Session, agent: Agent) -> dict[str, Any]:
         params.setdefault("docker_mcp_config_dir", mcp_dir)
     # Always inject agent_id so docker cwd isolation can use it
     params["agent_id"] = agent.id
+    # Resolve inherited system_prompt and extra_volumes (one level deep — no recursive loops)
+    system_prompt = agent.system_prompt or ""
+    extra_volumes = list(agent.extra_volumes or [])
+    if agent.inherit_from:
+        parent = s.query(Agent).filter(Agent.slug == agent.inherit_from,
+                                       Agent.deleted_at.is_(None)).first()
+        if parent:
+            if not system_prompt:
+                system_prompt = parent.system_prompt or ""
+            # Prepend parent volumes; child volumes take precedence (dedup by container path)
+            parent_vols = list(parent.extra_volumes or [])
+            seen_container = {v.split(":", 1)[-1] for v in extra_volumes}
+            for pv in parent_vols:
+                container = pv.split(":", 1)[-1]
+                if container not in seen_container:
+                    extra_volumes.insert(0, pv)
+    if extra_volumes:
+        params["extra_volumes"] = extra_volumes
     return {"provider": provider, "model_id": model_id, "model_slug": model_slug,
             "params": params,
-            "system_prompt": agent.system_prompt or "",
+            "system_prompt": system_prompt,
             "tool_specs": list(agent.tool_specs or []),
             "skill_slugs": list(agent.skill_slugs or [])}
 
@@ -179,6 +201,11 @@ async def run_agent(
     tin = tout = 0
     cost = 0.0
     err: str | None = None
+    _t_run_start = _time.perf_counter()
+    _t_llm_invoke: float | None = None
+    _t_system_init: float | None = None
+    _t_first_token: float | None = None
+    _t_finalizing: float | None = None
     try:
         from .skills import load_skill
         sys_blocks = [runtime["system_prompt"]] if runtime["system_prompt"] else []
@@ -204,7 +231,14 @@ async def run_agent(
             # The session file lives in ~/.claude/projects/{encoded_original_cwd}/,
             # so the resumed run must use that same cwd (not a new isolated one).
             with session_scope() as _ss:
-                _orig = _ss.query(Run).filter(Run.session_id == session_id).first()
+                # Order by created_at ASC to get the ORIGINAL run that created
+                # the session. Multiple runs can share the same session_id when
+                # subsequent runs resume the same conversation; the session file
+                # lives in the project dir of the FIRST run.
+                _orig = (_ss.query(Run)
+                         .filter(Run.session_id == session_id)
+                         .order_by(Run.started_at.asc())
+                         .first())
                 if _orig:
                     runtime["params"]["resume_run_id"] = _orig.id
 
@@ -238,6 +272,7 @@ async def run_agent(
                 cost = max(cost, res.cost_usd)
             else:
                 # ───── CLI subshell + echo path (text-only stream) ─────
+                _t_llm_invoke = _time.perf_counter()
                 llm = make_llm(runtime["provider"], runtime["model_id"], **runtime["params"])
                 async for chunk in llm.astream(messages):
                     meta_kind = getattr(chunk, "meta_kind", None)
@@ -246,6 +281,8 @@ async def run_agent(
                         await emit(meta_kind, meta_payload or {}, node=node_id or agent_slug)
                         # Persist session_id from system.init so callers can resume later.
                         if meta_kind == "system.init" and meta_payload and run_id:
+                            if _t_system_init is None:
+                                _t_system_init = _time.perf_counter()
                             _sid = meta_payload.get("session_id")
                             if _sid:
                                 with session_scope() as _ss:
@@ -253,6 +290,8 @@ async def run_agent(
                                     if _r:
                                         _r.session_id = _sid
                     if chunk.delta:
+                        if _t_first_token is None:
+                            _t_first_token = _time.perf_counter()
                         text += chunk.delta
                         await emit("llm_token", {"delta": chunk.delta}, node=node_id or agent_slug)
                     if chunk.tokens_in:
@@ -272,6 +311,7 @@ async def run_agent(
 
     # Marker: streaming done, status flip imminent. Lets clients stop watching
     # for new llm_token events and start expecting a terminal status.
+    _t_finalizing = _time.perf_counter()
     await emit("finalizing", {"tokens_in": tin, "tokens_out": tout, "cost_usd": cost},
                node=node_id or agent_slug)
 
@@ -323,7 +363,7 @@ async def run_agent(
                 agent_slug=agent_slug,
                 notion_task_id=notion_task_id,
                 status=status,
-                text=text[:500] if text else "",
+                text=text[:10000] if text else "",
             ))
     except Exception:
         pass
@@ -341,11 +381,36 @@ async def run_agent(
             ))
     except Exception:
         pass
-    await emit("node_end", {"text": text[:500], "tokens_in": tin, "tokens_out": tout,
+    await emit("node_end", {"text": text[:10000], "tokens_in": tin, "tokens_out": tout,
                             "cost_usd": cost, "run_id": run_id},
                node=node_id or agent_slug)
+
+    # Build timing dict for callers that want observability (e.g. telegram dispatcher).
+    _t_end = _time.perf_counter()
+    _timing: dict[str, float | None] = {}
+    if _t_llm_invoke is not None:
+        _timing["llm_total_s"] = (_t_finalizing or _t_end) - _t_llm_invoke
+    if _t_llm_invoke is not None and _t_system_init is not None:
+        _timing["docker_ready_s"] = _t_system_init - _t_llm_invoke
+    if _t_llm_invoke is not None and _t_first_token is not None:
+        _timing["first_token_s"] = _t_first_token - _t_llm_invoke
+    if _t_system_init is not None and _t_first_token is not None:
+        _timing["docker_to_first_token_s"] = _t_first_token - _t_system_init
+    _timing["run_total_s"] = _t_end - _t_run_start
+
+    if _t_llm_invoke is not None:
+        _exec_log.info(
+            "[TIMING] run=%s agent=%s | llm_invoke→system_init=%s "
+            "system_init→first_token=%s llm_total=%.2fs run_total=%.2fs",
+            (run_id or "?")[:8], agent_slug,
+            f"{_timing['docker_ready_s']:.2f}s" if "docker_ready_s" in _timing else "n/a",
+            f"{_timing['docker_to_first_token_s']:.2f}s" if "docker_to_first_token_s" in _timing else "n/a",
+            _timing.get("llm_total_s") or 0,
+            _timing["run_total_s"],
+        )
+
     return {"run_id": run_id, "text": text, "status": status, "error": err,
-            "tokens_in": tin, "tokens_out": tout, "cost_usd": cost}
+            "tokens_in": tin, "tokens_out": tout, "cost_usd": cost, "timing": _timing}
 
 
 # ---------------- workflow execution ----------------

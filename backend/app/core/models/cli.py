@@ -16,8 +16,12 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import json
+import logging
 import os
+import secrets
 from typing import Any, AsyncIterator
+
+log = logging.getLogger("ap.cli")
 
 from . import BaseLLM, ChatChunk
 
@@ -84,6 +88,7 @@ class CliLLM(BaseLLM):
         session_id: str | None = None,
         resume_run_id: str | None = None,
         notion_task_id: str | None = None,
+        extra_volumes: list[str] | None = None,
         **_: Any,
     ) -> None:
         self.model_id = model_id
@@ -107,8 +112,9 @@ class CliLLM(BaseLLM):
         self.session_id = session_id
         self.resume_run_id = resume_run_id
         self.notion_task_id = notion_task_id
+        self.extra_volumes = list(extra_volumes or [])
 
-    def _build_argv(self, prompt: str) -> list[str]:
+    def _build_argv(self, prompt: str, ws_token: str | None = None) -> list[str]:
         from ..tools.docker_agent import build_docker_argv, CLI_SPECS
 
         cli = self.cli if self.cli in CLI_SPECS else "claude"
@@ -131,6 +137,11 @@ class CliLLM(BaseLLM):
         _extra_env: dict[str, str] = {}
         if self.notion_task_id:
             _extra_env["NOTION_TASK_ID"] = self.notion_task_id
+        if ws_token:
+            rid = self.resume_run_id or self.run_id or current_run_id.get() or ""
+            _extra_env["AW_RUN_ID"] = rid
+            _extra_env["AW_AGENT_TOKEN"] = ws_token
+            _extra_env["AW_WS_URL"] = "ws://host.docker.internal:9123/ws/agent"
         return build_docker_argv(
             cli=cli,
             prompt=prompt,
@@ -151,6 +162,8 @@ class CliLLM(BaseLLM):
             run_id=self.resume_run_id or self.run_id,
             session_id=self.session_id,
             extra_docker_env=_extra_env or None,
+            ws_mode=ws_token is not None,
+            extra_volumes=self.extra_volumes or None,
         )
 
     async def astream(self, messages: list[dict], **params: Any) -> AsyncIterator[ChatChunk]:
@@ -165,125 +178,162 @@ class CliLLM(BaseLLM):
             else:
                 parts.append(f"[USER]\n{c}\n")
         prompt = "\n".join(parts).strip()
-        argv = self._build_argv(prompt)
 
-        # Bump to 10MB — claude CLI stream-json events (system.init, tool payloads) exceed 64KB default
+        rid: str | None = current_run_id.get()
+
+        # ── Streaming mode selection ──────────────────────────────────────────
+        # Default: read the container's stdout DIRECTLY from the host-side docker
+        # process. The CLI runs unwrapped inside docker (--output-format
+        # stream-json on stdout); this process captures each line. No in-container
+        # aw-connector, no WebSocket hop back through awserv:9123 — which is what
+        # contended with the MCP streamable-http handshake on the same port and
+        # left runs empty / the container apparently dead.
+        #
+        # Opt-in legacy WS mode (AP_CLI_WS_STREAM=1): the container is wrapped
+        # with aw-connector, which streams stdout back over a WebSocket into a
+        # registered queue. Kept for future remote-docker / reconnect scenarios.
+        use_ws = os.environ.get("AP_CLI_WS_STREAM") == "1"
+
+        q = None
+        register_run = unregister_run = None
+        if use_ws:
+            ws_token = secrets.token_hex(32)
+            from ..ws_agent_registry import register_run, unregister_run
+            q = register_run(rid or "unknown", ws_token)
+            argv = self._build_argv(prompt, ws_token=ws_token)
+            stdout_target = asyncio.subprocess.DEVNULL  # events arrive via WS
+        else:
+            argv = self._build_argv(prompt, ws_token=None)  # no aw-connector wrapper
+            stdout_target = asyncio.subprocess.PIPE  # read CLI stdout directly
+
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stdout=stdout_target,
+            stderr=asyncio.subprocess.DEVNULL,
             cwd=os.getcwd(), env={**os.environ},
-            limit=10 * 1024 * 1024,
+            limit=10 * 1024 * 1024,  # raise StreamReader cap for large init lines
         )
-        rid: str | None = current_run_id.get()
         if rid:
             await _register(rid, proc)
+
+        # Monitor process exit. In WS mode, inject the done sentinel if docker
+        # dies before aw-connector sends "done" so astream() doesn't hang.
+        done_event = asyncio.Event()
+
+        async def _proc_monitor():
+            rc = await proc.wait()
+            if rc != 0:
+                log.warning("cli docker exited rc=%d run=%s", rc, rid)
+            if not done_event.is_set() and q is not None:
+                await q.put(None)  # fallback sentinel on unexpected exit (WS mode)
+
+        monitor_task = asyncio.create_task(_proc_monitor())
+
+        # Unified line source: yields each raw CLI JSON line, or None when done.
+        async def _next_line() -> str | None:
+            if use_ws:
+                return await asyncio.wait_for(q.get(), timeout=self.timeout_s)
+            assert proc.stdout is not None
+            raw = await asyncio.wait_for(proc.stdout.readline(), timeout=self.timeout_s)
+            if not raw:
+                return None  # EOF — container closed stdout
+            return raw.decode("utf-8", errors="replace").rstrip("\n")
 
         tin = tout = 0
         cost = 0.0
         final_text = ""
 
-        async def _read_line(stream: asyncio.StreamReader) -> bytes | None:
-            try:
-                return await stream.readline()
-            except asyncio.LimitOverrunError as e:
-                head = await stream.readexactly(e.consumed)
-                rest = b""
-                while True:
-                    try:
-                        chunk = await stream.readuntil(b"\n")
-                        return head + rest + chunk
-                    except asyncio.LimitOverrunError as e2:
-                        rest += await stream.readexactly(e2.consumed)
-                    except asyncio.IncompleteReadError as ie:
-                        return head + rest + ie.partial
-
         try:
-            if self.stream_json:
-                assert proc.stdout
-                while True:
-                    raw = await _read_line(proc.stdout)
-                    if not raw:
-                        break
-                    line = raw.decode(errors="replace").strip()
-                    if not line:
-                        continue
-                    try:
-                        evt = json.loads(line)
-                    except json.JSONDecodeError:
-                        yield ChatChunk(delta=line + "\n")
-                        continue
-                    et = evt.get("type")
-                    if et == "system" and evt.get("subtype") == "init":
-                        yield ChatChunk(delta="", finish=False, tokens_in=0, tokens_out=0, cost_usd=0.0)
-                        yield _meta_chunk("system.init", {
-                            "session_id": evt.get("session_id"),
-                            "model": evt.get("model"),
-                            "cwd": evt.get("cwd"),
-                            "tools": evt.get("tools", [])[:30],
-                            "permission_mode": evt.get("permissionMode"),
-                        })
-                    elif et == "assistant":
-                        for block in (evt.get("message", {}).get("content") or []):
-                            bt = block.get("type")
-                            if bt == "thinking":
-                                t = block.get("thinking", "")
-                                if t:
-                                    yield _meta_chunk("thinking", {"text": t[:1500]})
-                            elif bt == "tool_use":
-                                yield _meta_chunk("tool_call", {
-                                    "id": block.get("id"),
-                                    "name": block.get("name"),
-                                    "input": _redact(block.get("input")),
-                                })
-                            elif bt == "text":
-                                txt = block.get("text", "")
-                                if txt:
-                                    final_text += txt
-                                    yield ChatChunk(delta=txt)
-                        usage = evt.get("message", {}).get("usage") or {}
-                        if usage:
-                            tin = usage.get("input_tokens", 0) + usage.get("cache_creation_input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
-                            tout = usage.get("output_tokens", 0) or tout
-                    elif et == "user":
-                        for block in (evt.get("message", {}).get("content") or []):
-                            if block.get("type") == "tool_result":
-                                content = block.get("content")
-                                if isinstance(content, list):
-                                    text_blocks = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
-                                    content_text = "\n".join(text_blocks)[:1500]
-                                else:
-                                    content_text = str(content)[:1500]
-                                yield _meta_chunk("tool_result", {
-                                    "tool_use_id": block.get("tool_use_id"),
-                                    "content": content_text,
-                                })
-                    elif et == "result":
-                        cost = evt.get("total_cost_usd", 0.0) or 0.0
-                        usage = evt.get("usage") or {}
-                        if usage:
-                            tin = usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
-                            tout = usage.get("output_tokens", 0) or tout
-                        if not final_text:
-                            final_text = evt.get("result", "") or ""
-                        if evt.get("subtype") != "success":
-                            yield _meta_chunk("cli.error", {"subtype": evt.get("subtype"),
-                                                            "is_error": evt.get("is_error")})
-            else:
-                assert proc.stdout
-                async for raw in proc.stdout:
-                    line = raw.decode(errors="replace")
-                    final_text += line
-                    yield ChatChunk(delta=line)
+            while True:
+                try:
+                    line = await _next_line()
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    yield _meta_chunk("cli.timeout", {"timeout_s": self.timeout_s})
+                    break
+
+                if line is None:  # done sentinel (WS) or stdout EOF (direct)
+                    done_event.set()
+                    break
+
+                # Process the raw CLI JSON line exactly like the old stdout path
+                if not line.strip():
+                    continue
+                try:
+                    evt = json.loads(line)
+                except json.JSONDecodeError:
+                    yield ChatChunk(delta=line + "\n")
+                    continue
+
+                et = evt.get("type")
+                if et == "system" and evt.get("subtype") == "init":
+                    yield ChatChunk(delta="", finish=False, tokens_in=0, tokens_out=0, cost_usd=0.0)
+                    yield _meta_chunk("system.init", {
+                        "session_id": evt.get("session_id"),
+                        "model": evt.get("model"),
+                        "cwd": evt.get("cwd"),
+                        "tools": evt.get("tools", [])[:30],
+                        "permission_mode": evt.get("permissionMode"),
+                    })
+                elif et == "assistant":
+                    for block in (evt.get("message", {}).get("content") or []):
+                        bt = block.get("type")
+                        if bt == "thinking":
+                            t = block.get("thinking", "")
+                            if t:
+                                yield _meta_chunk("thinking", {"text": t[:20000]})
+                        elif bt == "tool_use":
+                            yield _meta_chunk("tool_call", {
+                                "id": block.get("id"),
+                                "name": block.get("name"),
+                                "input": _redact(block.get("input")),
+                            })
+                        elif bt == "text":
+                            txt = block.get("text", "")
+                            if txt:
+                                final_text += txt
+                                yield ChatChunk(delta=txt)
+                    usage = evt.get("message", {}).get("usage") or {}
+                    if usage:
+                        tin = usage.get("input_tokens", 0) + usage.get("cache_creation_input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
+                        tout = usage.get("output_tokens", 0) or tout
+                elif et == "user":
+                    for block in (evt.get("message", {}).get("content") or []):
+                        if block.get("type") == "tool_result":
+                            content = block.get("content")
+                            if isinstance(content, list):
+                                text_blocks = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+                                content_text = "\n".join(text_blocks)[:20000]
+                            else:
+                                content_text = str(content)[:20000]
+                            yield _meta_chunk("tool_result", {
+                                "tool_use_id": block.get("tool_use_id"),
+                                "content": content_text,
+                            })
+                elif et == "result":
+                    cost = evt.get("total_cost_usd", 0.0) or 0.0
+                    usage = evt.get("usage") or {}
+                    if usage:
+                        tin = usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
+                        tout = usage.get("output_tokens", 0) or tout
+                    if not final_text:
+                        final_text = evt.get("result", "") or ""
+                    if evt.get("subtype") != "success":
+                        yield _meta_chunk("cli.error", {"subtype": evt.get("subtype"),
+                                                        "is_error": evt.get("is_error")})
         finally:
+            done_event.set()
+            monitor_task.cancel()
+            # Give the docker process a moment to exit cleanly
             try:
-                await asyncio.wait_for(proc.wait(), timeout=self.timeout_s)
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
             except asyncio.TimeoutError:
                 proc.kill()
-                yield _meta_chunk("cli.timeout", {"timeout_s": self.timeout_s})
             if rid:
                 await _unregister(rid, proc)
+            if unregister_run is not None:
+                unregister_run(rid or "unknown")
 
         yield ChatChunk(delta="", finish=True, tokens_in=tin, tokens_out=tout, cost_usd=cost)
 
@@ -297,7 +347,7 @@ def _meta_chunk(kind: str, payload: dict) -> ChatChunk:
 
 def _redact(value: Any) -> Any:
     if isinstance(value, str):
-        return value if len(value) < 800 else value[:800] + "…[trunc]"
+        return value if len(value) < 8000 else value[:8000] + "…[trunc]"
     if isinstance(value, dict):
         return {k: _redact(v) for k, v in value.items()}
     if isinstance(value, list):
