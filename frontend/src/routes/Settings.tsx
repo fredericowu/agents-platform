@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import React, { useEffect, useState } from "react";
+import { Laptop2, Trash2, Check, Copy, Eye, EyeOff, RefreshCcw, FolderOpen, FileText, Play } from "lucide-react";
 import Page from "../components/Page";
 import { FormRow } from "../components/Modal";
 import { api, type PlatformSettings, type RagHealth, type RagProviderConfig } from "../lib/api";
@@ -35,6 +36,12 @@ export default function Settings() {
   );
   const [retroSaving, setRetroSaving] = useState(false);
   const [retroMsg, setRetroMsg] = useState("");
+
+  // Remote Agents MCP settings
+  const [raApiKey, setRaApiKey] = useState("");
+  const [raApiKeyMasked, setRaApiKeyMasked] = useState(true);
+  const [raApiKeyCopied, setRaApiKeyCopied] = useState(false);
+  const [raRegenerating, setRaRegenerating] = useState(false);
 
   async function load() {
     setError("");
@@ -108,7 +115,10 @@ export default function Settings() {
     } catch (e: any) { setError(String(e.message || e)); }
     finally { setSaving(""); }
   }
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+    fetch("/api/config").then(r => r.json()).then((d: { mcp_api_key?: string }) => setRaApiKey(d.mcp_api_key || "")).catch(() => {});
+  }, []);
 
   async function save(key: string, value: any) {
     setSaving(key); setError(""); setMsg("");
@@ -402,6 +412,81 @@ export default function Settings() {
               {ghTestResult.output}
             </span>
           )}
+        </div>
+      </div>
+
+      {/* ─────── Remote Agents ─────── */}
+      <div className="card mb-4">
+        <h2 className="text-base font-semibold mb-1">Remote Agents</h2>
+        <div className="text-xs text-muted mb-4">
+          The <code className="font-mono">aw-remote-agent</code> MCP server lets AI agents control remote machines.
+          Windows / macOS / Linux agents connect via WebSocket and expose file and command tools.
+        </div>
+
+        <FormRow label="MCP API Key" hint="Pass this key in every tool call. Shown masked — toggle to reveal.">
+          <div className="flex items-center gap-2">
+            <code className="font-mono text-sm flex-1 min-w-0"
+                  style={{ background: "var(--bg-2)", padding: "5px 10px", borderRadius: 6, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--ok)" }}>
+              {raApiKey
+                ? (raApiKeyMasked ? raApiKey.slice(0, 8) + "•".repeat(Math.max(0, raApiKey.length - 8)) : raApiKey)
+                : "loading…"}
+            </code>
+            <button className="btn btn-ghost btn-icon" title={raApiKeyMasked ? "Show" : "Hide"}
+                    onClick={() => setRaApiKeyMasked(m => !m)}>
+              {raApiKeyMasked ? <Eye size={14} /> : <EyeOff size={14} />}
+            </button>
+            <button className="btn btn-ghost btn-icon" title="Copy"
+                    onClick={() => { navigator.clipboard.writeText(raApiKey); setRaApiKeyCopied(true); setTimeout(() => setRaApiKeyCopied(false), 1500); }}>
+              {raApiKeyCopied ? <Check size={14} style={{ color: "var(--ok)" }} /> : <Copy size={14} />}
+            </button>
+            <button className="btn btn-ghost btn-danger" disabled={raRegenerating}
+                    onClick={async () => {
+                      if (!confirm("Regenerate the MCP API key? Existing connections using the old key will stop working.")) return;
+                      setRaRegenerating(true);
+                      try {
+                        const res = await fetch("/api/config/regenerate", { method: "POST" });
+                        const d: { mcp_api_key?: string } = await res.json();
+                        setRaApiKey(d.mcp_api_key || "");
+                      } finally { setRaRegenerating(false); }
+                    }}>
+              <RefreshCcw size={13} />{raRegenerating ? "Regenerating…" : "Regenerate"}
+            </button>
+          </div>
+        </FormRow>
+
+        <FormRow label="MCP Gateway Endpoint" hint="Use this URL when adding the aw-remote-agent server to your MCP client.">
+          <code className="font-mono text-sm" style={{ color: "var(--accent)" }}>
+            {(() => {
+              try {
+                const h = window.location.host.replace(/:\d+$/, "");
+                return `${window.location.protocol}//${h}:9200/mcp`;
+              } catch { return "http://…:9200/mcp"; }
+            })()}
+          </code>
+          <span className="text-xs text-muted ml-3">
+            Server: <code className="font-mono">aw-remote-agent</code> · Tools: <code className="font-mono">aw_remote_agent__*</code>
+          </span>
+        </FormRow>
+
+        <div className="mt-3">
+          <div className="text-xs font-semibold uppercase text-muted mb-2">Available Tools</div>
+          <div className="flex flex-col gap-1">
+            {([
+              [<Laptop2 size={13} />,   "list_remote_agents",  "List all agents, status, hardware info"],
+              [<Play size={13} />,      "execute_command",      "Run a command on the remote machine"],
+              [<FileText size={13} />,  "read_file",            "Read a file from the remote machine"],
+              [<FileText size={13} />,  "write_file",           "Write/create a file on the remote machine"],
+              [<FolderOpen size={13}/>, "list_directory",       "List a directory on the remote machine"],
+              [<Trash2 size={13} />,    "delete_file",          "Delete a file on the remote machine"],
+              [<FolderOpen size={13}/>, "create_directory",     "Create a directory on the remote machine"],
+            ] as [React.ReactNode, string, string][]).map(([icon, name, desc]) => (
+              <div key={name} className="flex items-center gap-3 py-1 border-b border-line text-sm">
+                <span className="text-muted shrink-0">{icon}</span>
+                <code className="font-mono text-xs shrink-0 w-40" style={{ color: "var(--ok)" }}>{name}</code>
+                <span className="text-muted text-xs">{desc}</span>
+              </div>
+            ))}
+          </div>
         </div>
       </div>
 

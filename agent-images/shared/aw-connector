@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""aw-connector — wraps a CLI and streams its stdout to agents-platform via WebSocket.
+
+Usage (injected by docker_agent.py when ws_mode=True):
+    aw-connector <cli-binary> [cli-args...]
+
+Required env vars:
+    AW_RUN_ID       — run ID to announce to the backend
+    AW_AGENT_TOKEN  — per-run auth token for the WS endpoint
+    AW_WS_URL       — WS URL base, e.g. ws://host.docker.internal:9123/ws/agent
+
+The connector:
+1. Connects to {AW_WS_URL}/{AW_RUN_ID}?token={AW_AGENT_TOKEN} (with reconnect)
+2. Spawns the CLI as a subprocess
+3. Reads each stdout line and sends {"type": "stdout", "line": "<raw line>"}
+4. When the CLI exits sends {"type": "done", "returncode": N} and closes
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+
+
+async def run() -> None:
+    run_id = os.environ.get("AW_RUN_ID", "")
+    ws_base = os.environ.get("AW_WS_URL", "ws://host.docker.internal:9123/ws/agent")
+    token = os.environ.get("AW_AGENT_TOKEN", "")
+    cli_args = sys.argv[1:]
+
+    if not cli_args:
+        print("aw-connector: no CLI args provided", file=sys.stderr)
+        sys.exit(1)
+
+    ws_url = f"{ws_base}/{run_id}?token={token}"
+
+    # Start the CLI subprocess
+    proc = await asyncio.create_subprocess_exec(
+        *cli_args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        limit=10 * 1024 * 1024,
+    )
+
+    # Collect all stdout lines so we can replay on reconnect
+    lines: list[str] = []
+    proc_done = asyncio.Event()
+    returncode_holder: list[int] = [0]
+
+    async def read_proc() -> None:
+        assert proc.stdout
+        while True:
+            try:
+                raw = await proc.stdout.readline()
+            except Exception:
+                break
+            if not raw:
+                break
+            line = raw.decode("utf-8", errors="replace").rstrip("\n")
+            lines.append(line)
+        returncode_holder[0] = await proc.wait()
+        proc_done.set()
+
+    read_task = asyncio.create_task(read_proc())
+
+    sent_up_to = 0  # index into `lines` of next line to send
+
+    try:
+        import websockets
+    except ImportError:
+        print("aw-connector: 'websockets' not installed", file=sys.stderr)
+        read_task.cancel()
+        sys.exit(1)
+
+    async def stream_to_ws() -> None:
+        nonlocal sent_up_to
+        backoff = 0.5
+        while True:
+            try:
+                async with websockets.connect(ws_url, open_timeout=10) as ws:
+                    backoff = 0.5  # reset on successful connect
+                    # Send any lines accumulated before this connection
+                    while sent_up_to < len(lines):
+                        await ws.send(json.dumps({"type": "stdout", "line": lines[sent_up_to]}))
+                        sent_up_to += 1
+
+                    # Stream new lines as they arrive
+                    while not (proc_done.is_set() and sent_up_to >= len(lines)):
+                        # Wait briefly for new lines
+                        await asyncio.sleep(0.01)
+                        while sent_up_to < len(lines):
+                            await ws.send(json.dumps({"type": "stdout", "line": lines[sent_up_to]}))
+                            sent_up_to += 1
+
+                    # All lines sent — send done and close
+                    await ws.send(json.dumps({"type": "done", "returncode": returncode_holder[0]}))
+                    return  # clean exit
+
+            except websockets.exceptions.InvalidStatus as e:
+                # 403/4003/4004 = permanent rejection (bad token or run expired) — stop retrying
+                status_code = getattr(e.response, 'status_code', None)
+                if status_code in (403, 401) or (hasattr(e, 'response') and
+                        getattr(e.response, 'status_code', 0) in (4003, 4004)):
+                    print(f"aw-connector: WS rejected ({e}) — exiting", file=sys.stderr)
+                    read_task.cancel()
+                    sys.exit(0)
+                print(f"aw-connector: WS error ({e}), retrying in {backoff}s", file=sys.stderr)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 10)
+            except (OSError, ConnectionRefusedError, websockets.exceptions.WebSocketException) as e:
+                if proc_done.is_set() and sent_up_to >= len(lines):
+                    # Process already finished and we've sent everything — just retry done
+                    pass
+                print(f"aw-connector: WS error ({e}), retrying in {backoff}s", file=sys.stderr)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 10)
+
+    await asyncio.gather(read_task, stream_to_ws())
+
+
+if __name__ == "__main__":
+    asyncio.run(run())

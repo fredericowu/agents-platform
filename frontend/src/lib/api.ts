@@ -12,11 +12,13 @@ export type Agent = {
   name: string;
   description: string;
   system_prompt: string;
+  inherit_from: string | null;
   model_slug: string | null;
   tool_specs: string[];
   skill_slugs: string[];
   params: Record<string, any>;
   mcp_config: { servers?: Record<string, AgentMcpServer> };
+  extra_volumes: string[];
   icon: string;
   color: string;
 };
@@ -266,6 +268,16 @@ export type Lesson = {
   updated_at: string;
 };
 
+export type TelegramBot = {
+  id: string;
+  name: string;
+  token: string;
+  webhook_secret: string;
+  enabled: boolean;
+  agent_slug: string | null;
+  admin_user_ids: string[];
+};
+
 export type ConsolidationCluster = {
   confidence: number;
   lessons: Lesson[];
@@ -507,6 +519,17 @@ export const api = {
     }),
   recomputeRetroScore: (runId: string) =>
     call<RetroScoreSummary>(`/api/runs/${runId}/retro-scores/recompute`, { method: "POST" }),
+
+  // Telegram bots
+  listTelegramBots: () => call<TelegramBot[]>("/api/telegram/bots"),
+  createTelegramBot: (b: any) =>
+    call<TelegramBot>("/api/telegram/bots", { method: "POST", body: JSON.stringify(b) }),
+  updateTelegramBot: (id: string, patch: any) =>
+    call<TelegramBot>(`/api/telegram/bots/${id}`, { method: "PUT", body: JSON.stringify(patch) }),
+  deleteTelegramBot: (id: string) =>
+    call<void>(`/api/telegram/bots/${id}`, { method: "DELETE" }),
+  registerTelegramWebhook: (id: string) =>
+    call<{ ok: boolean; message: string }>(`/api/telegram/bots/${id}/register-webhook`, { method: "POST" }),
 };
 
 // SSE helper

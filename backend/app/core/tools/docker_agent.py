@@ -142,6 +142,8 @@ def build_docker_argv(
     run_id: str | None = None,
     session_id: str | None = None,
     extra_docker_env: dict[str, str] | None = None,
+    extra_volumes: list[str] | None = None,
+    ws_mode: bool = False,
 ) -> list[str]:
     spec = CLI_SPECS[cli]
     image = image_override or f"{REGISTRY}/{IMAGE_PREFIX}-{cli}:{tag}"
@@ -223,6 +225,14 @@ def build_docker_argv(
         if not _cwd_set:
             argv.extend(["-w", "/home/ubuntu"])
 
+    # Per-agent extra volumes (e.g. ["/var/run/docker.sock:/var/run/docker.sock"])
+    for vol in (extra_volumes or []):
+        if ":" in vol:
+            h, c = vol.split(":", 1)
+            add_mount(h, c)
+        else:
+            add_mount(vol, vol)
+
     # ── Environment ────────────────────────────────────────────────────────────
     if env_file:
         argv.extend(["--env-file", env_file])
@@ -240,6 +250,11 @@ def build_docker_argv(
     argv.append(image)
 
     # ── CLI command ────────────────────────────────────────────────────────────
+    # In ws_mode aw-connector wraps the CLI, streams stdout back via WebSocket,
+    # and exits when the CLI exits.  Env vars (AW_RUN_ID, AW_AGENT_TOKEN,
+    # AW_WS_URL) were already injected above via extra_docker_env.
+    if ws_mode:
+        argv.append("aw-connector")
     argv.append(spec["bin"])
     if spec.get("subcmd"):
         argv.append(spec["subcmd"])

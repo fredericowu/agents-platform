@@ -103,7 +103,7 @@ def get_events(run_id: str,
                kinds: str | None = Query(None,
                    description="Comma-separated list of event kinds to keep "
                                "(e.g. 'node_start,error,done'). Omit to keep all."),
-               limit: int = Query(2000, ge=1, le=20000),
+               limit: int = Query(10000, ge=1, le=50000),
                s: Session = Depends(get_session)):
     qry = s.query(RunEvent).filter(RunEvent.run_id == run_id)
     if after_ts is not None:

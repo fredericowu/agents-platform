@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { NavLink, Route, Routes, Navigate } from "react-router-dom";
+import { NavLink, Route, Routes, Navigate, useSearchParams } from "react-router-dom";
 import { wsManager } from "./lib/ws";
 import Dashboard from "./routes/Dashboard";
 import Agents from "./routes/Agents";
@@ -17,10 +17,12 @@ import SkillsPage from "./routes/Skills";
 import Evals from "./routes/Evals";
 import Settings from "./routes/Settings";
 import Lessons from "./routes/Lessons";
+import TelegramBots from "./routes/TelegramBots";
+import RemoteAgents from "./routes/RemoteAgents";
 import {
   LayoutDashboard, Bot, Workflow as WfIcon, MessageCircle,
   Activity, Cpu, Plug, Sparkles, GaugeCircle, Settings as SettingsIcon,
-  Crosshair, BookOpen,
+  Crosshair, BookOpen, Send, Monitor,
 } from "lucide-react";
 
 const NAV = [
@@ -35,10 +37,17 @@ const NAV = [
   { path: "/models", label: "Models", icon: Cpu },
   { path: "/mcp", label: "MCP", icon: Plug },
   { path: "/skills", label: "Skills", icon: Sparkles },
+  { path: "/telegram", label: "Telegram", icon: Send },
+  { path: "/remote-agents", label: "Remote Agents", icon: Monitor },
   { path: "/settings", label: "Settings", icon: SettingsIcon },
 ];
 
 export default function App() {
+  // Embedded/clean mode (e.g. Telegram "View progress" deep-link):
+  // ?view=telegram hides the sidebar so a single run fills the viewport.
+  const [params] = useSearchParams();
+  const embedded = params.get("view") === "telegram";
+
   useEffect(() => {
     wsManager.connect();
     return () => wsManager.disconnect();
@@ -46,6 +55,7 @@ export default function App() {
 
   return (
     <div className="flex h-full">
+      {!embedded && (
       <aside className="w-56 border-r border-line bg-bg-2 flex flex-col">
         <nav className="flex-1 py-2">
           {NAV.map(({ path, label, icon: Icon, exact }) => (
@@ -66,6 +76,7 @@ export default function App() {
           ))}
         </nav>
       </aside>
+      )}
       <main className="flex-1 overflow-auto">
         <Routes>
           <Route path="/" element={<Dashboard />} />
@@ -83,6 +94,8 @@ export default function App() {
           <Route path="/models" element={<Models />} />
           <Route path="/mcp" element={<McpPage />} />
           <Route path="/skills" element={<SkillsPage />} />
+          <Route path="/telegram" element={<TelegramBots />} />
+          <Route path="/remote-agents" element={<RemoteAgents />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

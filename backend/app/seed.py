@@ -91,7 +91,7 @@ SEED_MODELS = [
     # ============================================================
     # Claude CLI — `claude` (Anthropic)
     # ============================================================
-    {"slug": "claude-cli", "provider": "cli", "model_id": "claude-cli",
+    {"slug": "claude-cli-sonnet", "provider": "cli", "model_id": "claude-cli-sonnet",
      "display_name": "Claude CLI – Sonnet 4 (default, full perms)",
      "params": {"cli": "claude", "model": "sonnet", "cwd": WORKSPACE,
                 "add_dirs": ["/tmp", WORKSPACE], "dangerous_skip_permissions": True,
@@ -185,7 +185,7 @@ SEED_MODELS = [
 #   • Mentions tools available, not specific paths
 #   • Says "the user will tell you what / where" rather than assuming
 
-DEFAULT_MODEL = "claude-cli"     # real LLM for real work
+DEFAULT_MODEL = "claude-cli-sonnet"     # real LLM for real work
 READONLY_MODEL = "claude-cli-readonly"
 OPUS_MODEL = "claude-cli-opus"   # decision-tier (planner, reviewer, project-manager, retro)
 
@@ -720,6 +720,63 @@ def _insert_if_missing(s: Session, cls, key: str, defaults: dict):
 _upsert = _insert_if_missing
 
 
+def _migrate_telegram_agents(s: Session) -> None:
+    """One-time migration: rename the AW Agents Platform (Telegram) agent to
+    'Telegram - Sonnet' and create Opus/Haiku variants with inherit_from."""
+    # Find by old name — idempotent (won't create duplicates)
+    sonnet = s.query(Agent).filter(Agent.slug == "telegram-sonnet",
+                                   Agent.deleted_at.is_(None)).first()
+    if sonnet is None:
+        # Look for the original agent by name
+        original = s.query(Agent).filter(
+            Agent.name == "AW Agents Platform (Telegram)",
+            Agent.deleted_at.is_(None)
+        ).first()
+        if original is None:
+            return  # agent doesn't exist yet, nothing to migrate
+        # Rename it
+        original.name = "Telegram - Sonnet"
+        original.slug = "telegram-sonnet"
+        s.flush()
+        sonnet = original
+
+    # Create Opus variant if missing
+    if not s.query(Agent).filter(Agent.slug == "telegram-opus").first():
+        s.add(Agent(
+            slug="telegram-opus",
+            name="Telegram - Opus",
+            description=sonnet.description,
+            system_prompt="",
+            inherit_from="telegram-sonnet",
+            model_slug="claude-cli-opus",
+            tool_specs=list(sonnet.tool_specs or []),
+            skill_slugs=list(sonnet.skill_slugs or []),
+            params=dict(sonnet.params or {}),
+            mcp_config=dict(sonnet.mcp_config or {}),
+            extra_volumes=list(sonnet.extra_volumes or []),
+            icon=sonnet.icon,
+            color="#b794f4",
+        ))
+
+    # Create Haiku variant if missing
+    if not s.query(Agent).filter(Agent.slug == "telegram-haiku").first():
+        s.add(Agent(
+            slug="telegram-haiku",
+            name="Telegram - Haiku",
+            description=sonnet.description,
+            system_prompt="",
+            inherit_from="telegram-sonnet",
+            model_slug="claude-cli-haiku",
+            tool_specs=list(sonnet.tool_specs or []),
+            skill_slugs=list(sonnet.skill_slugs or []),
+            params=dict(sonnet.params or {}),
+            mcp_config=dict(sonnet.mcp_config or {}),
+            extra_volumes=list(sonnet.extra_volumes or []),
+            icon=sonnet.icon,
+            color="#2dd4bf",
+        ))
+
+
 def seed_all() -> dict:
     """Idempotent seed. Ensures every slug in SEED_* exists. Never updates
     existing rows — your edits always win. To restore a seed slug to its
@@ -737,6 +794,7 @@ def seed_all() -> dict:
             _insert_if_missing(s, Workflow, "slug", w); counts["workflows"] += 1
         for e in SEED_EVALS:
             _insert_if_missing(s, Eval, "slug", e); counts["evals"] += 1
+        _migrate_telegram_agents(s)
     return counts
 
 

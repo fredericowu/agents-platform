@@ -44,6 +44,8 @@ class Agent(Base):
     skill_slugs: Mapped[list[str]] = mapped_column(JSON, default=list)
     params: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)     # {temperature, max_tokens, ...}
     mcp_config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict) # {servers: {name: {type, url, headers}}}
+    extra_volumes: Mapped[list[str]] = mapped_column(JSON, default=list)   # ["host:container", ...] extra -v flags for docker run
+    inherit_from: Mapped[str | None] = mapped_column(String, nullable=True)  # slug of parent agent to inherit system_prompt from
     builtin: Mapped[bool] = mapped_column(Boolean, default=False)
     icon: Mapped[str] = mapped_column(String, default="bot")
     color: Mapped[str] = mapped_column(String, default="#58a6ff")
@@ -373,3 +375,35 @@ class RetroScoreWeights(Base):
     weights_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class TelegramBot(Base):
+    """A Telegram bot whose inbound messages are dispatched to an AP agent."""
+    __tablename__ = "telegram_bots"
+    id: Mapped[str] = mapped_column(String, primary_key=True)           # e.g. "aw-17"
+    name: Mapped[str] = mapped_column(String, default="")
+    token: Mapped[str] = mapped_column(String)                          # Telegram Bot API token
+    webhook_secret: Mapped[str] = mapped_column(String, default="")     # HMAC secret set on Telegram webhook
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    agent_slug: Mapped[str | None] = mapped_column(String, nullable=True)  # AP agent to dispatch to
+    admin_user_ids: Mapped[list[str]] = mapped_column(JSON, default=list)  # allowed Telegram user IDs
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+    sessions: Mapped[list["TelegramSession"]] = relationship(
+        back_populates="bot", cascade="all, delete-orphan"
+    )
+
+
+class TelegramSession(Base):
+    """Tracks the last Claude session_id per (bot, chat) for conversation continuity."""
+    __tablename__ = "telegram_sessions"
+    __table_args__ = (UniqueConstraint("bot_id", "chat_id", name="uq_tg_session_bot_chat"),)
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    bot_id: Mapped[str] = mapped_column(String, ForeignKey("telegram_bots.id"), index=True)
+    chat_id: Mapped[str] = mapped_column(String, index=True)
+    session_id: Mapped[str | None] = mapped_column(String, nullable=True)  # claude --resume id
+    target_id: Mapped[str | None] = mapped_column(String, nullable=True)   # AP Target.id
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+    bot: Mapped["TelegramBot"] = relationship(back_populates="sessions")

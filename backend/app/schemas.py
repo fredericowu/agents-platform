@@ -35,12 +35,14 @@ class AgentIn(BaseModel):
     name: str
     description: str = ""
     system_prompt: str = ""
+    inherit_from: str | None = None  # slug of parent agent to inherit system_prompt from
     use_cases: list[str] = []
     model_slug: str | None = None
     tool_specs: list[Any] = []
     skill_slugs: list[str] = []
     params: dict[str, Any] = {}
     mcp_config: dict[str, Any] = {}
+    extra_volumes: list[str] = []
     icon: str = "bot"
     color: str = "#58a6ff"
 
@@ -49,12 +51,14 @@ class AgentUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
     system_prompt: str | None = None
+    inherit_from: str | None = None
     use_cases: list[str] | None = None
     model_slug: str | None = None
     tool_specs: list[Any] | None = None
     skill_slugs: list[str] | None = None
     params: dict[str, Any] | None = None
     mcp_config: dict[str, Any] | None = None
+    extra_volumes: list[str] | None = None
     icon: str | None = None
     color: str | None = None
 
@@ -64,12 +68,14 @@ class AgentOut(_Base):
     name: str
     description: str
     system_prompt: str
+    inherit_from: str | None = None
     use_cases: list[str] = []
     model_slug: str | None
     tool_specs: list[Any]
     skill_slugs: list[str]
     params: dict[str, Any]
     mcp_config: dict[str, Any] = {}
+    extra_volumes: list[str] = []
     icon: str
     color: str
     deleted_at: datetime | None = None

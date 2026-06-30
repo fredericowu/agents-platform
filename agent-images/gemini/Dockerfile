@@ -16,7 +16,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq sqlite3 \
     python3 python3-pip python3-venv \
     tzdata \
+    iputils-ping telnet netcat-openbsd dnsutils traceroute \
     && rm -rf /var/lib/apt/lists/*
+
+# ── Docker CLI ────────────────────────────────────────────────────────────────
+RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+        | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+        > /etc/apt/sources.list.d/docker.list && \
+    apt-get update && apt-get install -y --no-install-recommends docker-ce-cli && \
+    rm -rf /var/lib/apt/lists/*
 
 # ── GitHub CLI ────────────────────────────────────────────────────────────────
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -37,6 +46,11 @@ RUN echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers && \
     ln -sf /usr/bin/python3 /usr/local/bin/python && \
     mkdir -p /opt/agent-npm && \
     chown -R ubuntu:ubuntu /opt/agent-npm
+
+# ── aw-connector (WS event streamer) ─────────────────────────────────────────
+RUN pip3 install --no-cache-dir --break-system-packages websockets
+COPY shared/aw-connector /usr/local/bin/aw-connector
+RUN chmod +x /usr/local/bin/aw-connector
 
 # ── Gemini CLI ───────────────────────────────────────────────────────────────
 USER ubuntu

@@ -5,8 +5,8 @@ import { api, type Agent, type Model, type ToolItem, type Skill } from "../lib/a
 
 const BLANK: Agent = {
   slug: "", name: "", description: "", system_prompt: "",
-  model_slug: "claude-cli", tool_specs: [], skill_slugs: [],
-  params: {}, mcp_config: {}, icon: "bot", color: "#58a6ff",
+  inherit_from: null, model_slug: "claude-cli-sonnet", tool_specs: [], skill_slugs: [],
+  params: {}, mcp_config: {}, extra_volumes: [], icon: "bot", color: "#58a6ff",
 };
 
 export default function AgentEdit() {
@@ -18,6 +18,7 @@ export default function AgentEdit() {
   const [tools, setTools] = useState<ToolItem[]>([]);
   const [skills, setSkills] = useState<Skill[]>([]);
   const [resettableSet, setResettableSet] = useState<Set<string>>(new Set());
+  const [allAgents, setAllAgents] = useState<Agent[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [slugLocked, setSlugLocked] = useState(false);
@@ -30,6 +31,7 @@ export default function AgentEdit() {
     api.listModels().then(setModels);
     api.listTools().then(setTools);
     api.listSkills().then(setSkills);
+    api.listAgents().then(setAllAgents).catch(() => {});
     api.listResettableAgents().then(r => setResettableSet(new Set(r))).catch(() => {});
     if (!slug) return;
     if (isNew) {
@@ -56,9 +58,10 @@ export default function AgentEdit() {
       if (isNew) {
         const created = await api.createAgent({
           slug: a.slug, name: a.name || a.slug, description: a.description,
-          system_prompt: a.system_prompt, model_slug: a.model_slug,
-          tool_specs: a.tool_specs, skill_slugs: a.skill_slugs,
-          params: a.params, mcp_config: a.mcp_config, color: a.color, icon: a.icon,
+          system_prompt: a.system_prompt, inherit_from: a.inherit_from || null,
+          model_slug: a.model_slug, tool_specs: a.tool_specs, skill_slugs: a.skill_slugs,
+          params: a.params, mcp_config: a.mcp_config, extra_volumes: a.extra_volumes,
+          color: a.color, icon: a.icon,
         });
         nav(`/agents/${created.slug}`);
       } else if (slug) {
@@ -69,8 +72,10 @@ export default function AgentEdit() {
         }
         await api.saveAgent(targetSlug, {
           name: a.name, description: a.description, system_prompt: a.system_prompt,
-          model_slug: a.model_slug, tool_specs: a.tool_specs, skill_slugs: a.skill_slugs,
-          params: a.params, mcp_config: a.mcp_config, color: a.color, icon: a.icon,
+          inherit_from: a.inherit_from || null, model_slug: a.model_slug,
+          tool_specs: a.tool_specs, skill_slugs: a.skill_slugs,
+          params: a.params, mcp_config: a.mcp_config, extra_volumes: a.extra_volumes,
+          color: a.color, icon: a.icon,
         });
         if (targetSlug !== slug) nav(`/agents/${targetSlug}`);
       }
@@ -200,9 +205,28 @@ export default function AgentEdit() {
                      onChange={e => setEditedSlug(e.target.value)}
                      data-testid="agent-slug" className="font-mono" />
             )}
-            <label className="block text-xs text-muted mt-3 mb-1">system prompt</label>
+            <label className="block text-xs text-muted mt-3 mb-1">inherit instructions from</label>
+            <select value={a.inherit_from ?? ""}
+                    onChange={e => setA({ ...a, inherit_from: e.target.value || null })}
+                    data-testid="agent-inherit-from">
+              <option value="">(none — use own system prompt)</option>
+              {allAgents
+                .filter(ag => ag.slug !== (slug === "new" ? undefined : slug))
+                .map(ag => (
+                  <option key={ag.slug} value={ag.slug}>{ag.name} ({ag.slug})</option>
+                ))}
+            </select>
+            <label className="block text-xs text-muted mt-3 mb-1">
+              system prompt
+              {a.inherit_from && (
+                <span className="ml-2 text-[10px] text-muted italic">
+                  (inherited from <strong>{a.inherit_from}</strong> when left blank)
+                </span>
+              )}
+            </label>
             <textarea rows={6} value={a.system_prompt}
                       onChange={e => setA({ ...a, system_prompt: e.target.value })}
+                      placeholder={a.inherit_from ? `Inheriting from "${a.inherit_from}". Enter text here to override.` : ""}
                       data-testid="agent-prompt" />
             <label className="block text-xs text-muted mt-3 mb-1">model</label>
             <select value={a.model_slug ?? ""} onChange={e => setA({ ...a, model_slug: e.target.value || null })}
@@ -266,6 +290,33 @@ export default function AgentEdit() {
                           setA({ ...a, params: p });
                         }} />
             </div>
+          </div>
+
+          {/* ───── Extra Volumes ───── */}
+          <div className="card">
+            <h2 className="text-base font-semibold mb-1">Extra volumes</h2>
+            <p className="text-xs text-muted mb-3">
+              Docker volume mounts injected when this agent runs in a container.
+              One entry per line in <code>host:container</code> format
+              (e.g. <code>/var/run/docker.sock:/var/run/docker.sock</code>).
+              {a.inherit_from && (
+                <span className="ml-1">
+                  Volumes from <strong>{a.inherit_from}</strong> are prepended automatically.
+                </span>
+              )}
+            </p>
+            <textarea rows={4}
+                      className="font-mono text-xs"
+                      placeholder={a.inherit_from
+                        ? `(leave blank to use only inherited volumes from "${a.inherit_from}")`
+                        : "/var/run/docker.sock:/var/run/docker.sock"}
+                      data-testid="agent-volumes"
+                      value={(a.extra_volumes || []).join("\n")}
+                      onChange={e => {
+                        const lines = e.target.value.split("\n")
+                          .map(l => l.trim()).filter(Boolean);
+                        setA({ ...a, extra_volumes: lines });
+                      }} />
           </div>
 
           {/* ───── MCP Config ───── */}

@@ -84,12 +84,15 @@ def _apply_inline_migrations() -> None:
             if col not in existing:
                 conn.execute(text(f"ALTER TABLE runs ADD COLUMN {col} {ddl}"))
 
-    # mcp_config on agents
+    # mcp_config + inherit_from on agents
     if "agents" in insp.get_table_names():
         agent_cols = {c["name"] for c in insp.get_columns("agents")}
         if "mcp_config" not in agent_cols:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE agents ADD COLUMN mcp_config JSON DEFAULT '{}'"))
+        if "inherit_from" not in agent_cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE agents ADD COLUMN inherit_from VARCHAR"))
 
     # soft-delete columns on agents and workflows
     for tbl in ("agents", "workflows"):
