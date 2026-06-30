@@ -26,6 +26,8 @@ export default function AgentEdit() {
   const [runOutput, setRunOutput] = useState<string>("");
   const [runStatus, setRunStatus] = useState<string>("");
   const [runInput, setRunInput] = useState("hello");
+  const [flowiseChatflows, setFlowiseChatflows] = useState<{ id: string; name: string }[]>([]);
+  const [flowiseError, setFlowiseError] = useState("");
 
   useEffect(() => {
     api.listModels().then(setModels);
@@ -44,10 +46,49 @@ export default function AgentEdit() {
 
   const enabledToolIds = useMemo(() => new Set(a?.tool_specs ?? []), [a]);
   const enabledSkills  = useMemo(() => new Set(a?.skill_slugs ?? []), [a]);
+  const cliModels = useMemo(() => models.filter(m => m.provider === "cli"), [models]);
   const isDockerCli = useMemo(() => {
     const m = models.find(m => m.slug === a?.model_slug);
     return m?.provider === "cli";
   }, [a?.model_slug, models]);
+
+  const agentType: "standard" | "cli" | "flowise" = useMemo(() => {
+    if ((a?.params as any)?.flowise_flow_id) return "flowise";
+    const m = models.find(m => m.slug === a?.model_slug);
+    if (m?.provider === "cli") return "cli";
+    return "standard";
+  }, [a?.model_slug, a?.params, models]);
+
+  function setAgentType(type: "standard" | "cli" | "flowise") {
+    if (!a) return;
+    if (type === "cli") {
+      const firstCli = cliModels[0];
+      const newParams = { ...a.params } as any;
+      delete newParams.flowise_flow_id;
+      setA({ ...a, model_slug: firstCli?.slug ?? a.model_slug, params: newParams });
+    } else if (type === "flowise") {
+      const newParams = { ...a.params } as any;
+      if (!newParams.flowise_flow_id) newParams.flowise_flow_id = "";
+      setA({ ...a, model_slug: null, params: newParams });
+      if (flowiseChatflows.length === 0) {
+        api.listFlowiseChatflows()
+          .then(flows => setFlowiseChatflows(flows))
+          .catch(e => setFlowiseError(String(e.message || e)));
+      }
+    } else {
+      const newParams = { ...a.params } as any;
+      delete newParams.flowise_flow_id;
+      const firstStandard = models.find(m => m.provider !== "cli");
+      setA({ ...a, model_slug: firstStandard?.slug ?? a.model_slug, params: newParams });
+    }
+  }
+
+  function loadFlowiseChatflows() {
+    setFlowiseError("");
+    api.listFlowiseChatflows()
+      .then(flows => setFlowiseChatflows(flows))
+      .catch(e => setFlowiseError(String(e.message || e)));
+  }
 
   if (!a) return <Page title="Agent">…loading…</Page>;
 
@@ -183,6 +224,65 @@ export default function AgentEdit() {
         <div className="col-span-2 space-y-4">
           <div className="card">
             <h2 className="text-base font-semibold mb-3">Configuration</h2>
+
+            {/* ───── Agent type ───── */}
+            <label className="block text-xs text-muted mb-1">agent type</label>
+            <div className="flex gap-2 mb-4">
+              {(["standard", "cli", "flowise"] as const).map(t => (
+                <button
+                  key={t}
+                  type="button"
+                  onClick={() => setAgentType(t)}
+                  className={`btn text-xs px-3 py-1 ${agentType === t ? "btn-primary" : ""}`}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+
+            {agentType === "cli" && (
+              <div className="mb-4 p-3 border border-line rounded space-y-2">
+                <label className="block text-xs text-muted mb-1">CLI</label>
+                <select
+                  value={a.model_slug ?? ""}
+                  onChange={e => setA({ ...a, model_slug: e.target.value || null })}
+                  data-testid="agent-cli-select"
+                >
+                  {cliModels.map(m => (
+                    <option key={m.slug} value={m.slug}>{m.display_name}</option>
+                  ))}
+                  {cliModels.length === 0 && <option value="">no CLI models found</option>}
+                </select>
+              </div>
+            )}
+
+            {agentType === "flowise" && (
+              <div className="mb-4 p-3 border border-line rounded space-y-2">
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-xs text-muted">Flowise workflow</label>
+                  <button className="btn text-xs py-0.5 px-2" onClick={loadFlowiseChatflows}>↻ refresh</button>
+                </div>
+                {flowiseError && <div className="text-xs text-err">{flowiseError}</div>}
+                <select
+                  value={(a.params as any)?.flowise_flow_id ?? ""}
+                  onChange={e => {
+                    const p = { ...(a.params || {}) } as any;
+                    p.flowise_flow_id = e.target.value;
+                    setA({ ...a, params: p });
+                  }}
+                  data-testid="agent-flowise-select"
+                >
+                  <option value="">— select a flow —</option>
+                  {flowiseChatflows.map(f => (
+                    <option key={f.id} value={f.id}>{f.name}</option>
+                  ))}
+                </select>
+                {flowiseChatflows.length === 0 && !flowiseError && (
+                  <p className="text-xs text-muted">Click ↻ refresh to load flows from Flowise.</p>
+                )}
+              </div>
+            )}
+
             <label className="block text-xs text-muted mb-1">name</label>
             <input value={a.name}
                    onChange={e => {
@@ -228,14 +328,18 @@ export default function AgentEdit() {
                       onChange={e => setA({ ...a, system_prompt: e.target.value })}
                       placeholder={a.inherit_from ? `Inheriting from "${a.inherit_from}". Enter text here to override.` : ""}
                       data-testid="agent-prompt" />
-            <label className="block text-xs text-muted mt-3 mb-1">model</label>
-            <select value={a.model_slug ?? ""} onChange={e => setA({ ...a, model_slug: e.target.value || null })}
-                    data-testid="agent-model">
-              <option value="">(none)</option>
-              {models.map(m => (
-                <option key={m.slug} value={m.slug}>{m.display_name}</option>
-              ))}
-            </select>
+            {agentType === "standard" && (
+              <>
+                <label className="block text-xs text-muted mt-3 mb-1">model</label>
+                <select value={a.model_slug ?? ""} onChange={e => setA({ ...a, model_slug: e.target.value || null })}
+                        data-testid="agent-model">
+                  <option value="">(none)</option>
+                  {models.filter(m => m.provider !== "cli").map(m => (
+                    <option key={m.slug} value={m.slug}>{m.display_name}</option>
+                  ))}
+                </select>
+              </>
+            )}
             <div className="grid grid-cols-2 gap-3 mt-3">
               <div>
                 <label className="block text-xs text-muted mb-1">color</label>

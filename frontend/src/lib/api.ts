@@ -544,6 +544,9 @@ export const api = {
   deleteSession: (session_id: string) =>
     call<{ deleted: string }>(`/api/sessions/${session_id}`, { method: "DELETE" }),
 
+  // Flowise
+  listFlowiseChatflows: () => call<{ id: string; name: string; deployed?: boolean }[]>("/api/flowise/chatflows"),
+
   // Telegram bots
   listTelegramBots: () => call<TelegramBot[]>("/api/telegram/bots"),
   createTelegramBot: (b: any) =>
