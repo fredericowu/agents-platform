@@ -25,7 +25,7 @@ cd "$(dirname "$0")"
 
 PUSH=false
 NO_CACHE=false
-REGISTRY="${REGISTRY:-docker.io}"
+REGISTRY="${REGISTRY:-ghcr.io}"
 IMAGE_PREFIX="${IMAGE_PREFIX:-fredericowu/aw-sandbox-agent-cli}"
 TAG="${TAG:-latest}"
 SELECTED_CLI=""

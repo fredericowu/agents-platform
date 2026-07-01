@@ -36,7 +36,10 @@ from pathlib import Path
 # Prefer the AW_BASE_DIR env var so nothing breaks if the directory layout changes.
 BASE_DIR = Path(os.environ.get("AW_BASE_DIR", "/opt/agentic-workspace"))
 
-REGISTRY = os.environ.get("AW_AGENT_REGISTRY", "docker.io")
+# Images live in ghcr.io (private packages, built by the build-agent-images CI
+# workflow with the workflow-scoped GITHUB_TOKEN). Pulls use the ghcr.io read
+# token already in the container's ~/.docker/config.json. Override via env.
+REGISTRY = os.environ.get("AW_AGENT_REGISTRY", "ghcr.io")
 IMAGE_PREFIX = os.environ.get("AW_AGENT_IMAGE_PREFIX", "fredericowu/aw-sandbox-agent-cli")
 DEFAULT_TAG = os.environ.get("AW_AGENT_TAG", "latest")
 

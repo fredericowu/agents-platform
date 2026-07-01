@@ -1586,10 +1586,18 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
                        .first())
                 existed = bool(row and row.session_id)
             _reset_session(bot_id, chat_id)
-            _set_bot_display_name(bot.token, "")  # back to the bot's base name
-            _send_message(bot.token, chat_id,
-                          "🔄 Started a fresh conversation. Previous context cleared." if existed
-                          else "🟢 Ready to start a new conversation.")
+            base_msg = ("🔄 Started a fresh conversation. Previous context cleared." if existed
+                        else "🟢 Ready to start a new conversation.")
+            if args:
+                # "/new <name>" also names the session, same UX as /rename.
+                _ensure_target(bot_id, chat_id)
+                ok = _apply_rename(bot.token, bot_id, chat_id, args)
+                _send_message(bot.token, chat_id,
+                              f"{base_msg}\nSession named <b>{_md_to_html(args.strip()[:80])}</b>." if ok
+                              else base_msg)
+            else:
+                _set_bot_display_name(bot.token, "")  # back to the bot's base name
+                _send_message(bot.token, chat_id, base_msg)
             return {"ok": True, "reason": "slash /new"}
 
         if cmd == "start":
@@ -1710,7 +1718,7 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
             _send_message(bot.token, chat_id,
                           "🤖 <b>Agents Platform commands</b>\n"
                           "/agent — pick an agent and session\n"
-                          "/new — start a fresh conversation (clears context)\n"
+                          "/new [name] — start a fresh conversation (clears context; optional name also renames the session)\n"
                           "/start — greet and start a fresh session\n"
                           "/status — show active session info\n"
                           "/rename — rename the current session (no args → prompt)\n"

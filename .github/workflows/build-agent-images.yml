@@ -1,0 +1,114 @@
+name: Build agent CLI images
+
+# Builds the per-CLI docker agent images (ubuntu + Node + the one CLI) and pushes
+# them to ghcr.io/<owner>/aw-sandbox-agent-cli-<cli>. Packages default to PRIVATE
+# on personal accounts; the workflow-scoped GITHUB_TOKEN provides packages:write,
+# so no Docker Hub / external credential is needed.
+#
+#   gh workflow run build-agent-images.yml                       # amd64, all CLIs
+#   gh workflow run build-agent-images.yml -f include_arm64=true # + linux/arm64
+#   gh workflow run build-agent-images.yml -f cli=claude         # one CLI only
+on:
+  workflow_dispatch:
+    inputs:
+      include_arm64:
+        description: 'Also build linux/arm64 (QEMU emulation; slower)'
+        type: boolean
+        default: false
+      cli:
+        description: 'Single CLI to build (blank = all)'
+        type: string
+        default: ''
+  push:
+    branches: [master]
+    paths:
+      - 'agent-images/**'
+      - '.github/workflows/build-agent-images.yml'
+
+concurrency:
+  group: build-agent-images-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # Resolve the CLI matrix from the optional single-CLI input.
+  matrix:
+    name: Resolve matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      clis: ${{ steps.set.outputs.clis }}
+    steps:
+      - id: set
+        run: |
+          if [ -n "${{ inputs.cli }}" ]; then
+            echo "clis=[\"${{ inputs.cli }}\"]" >> "$GITHUB_OUTPUT"
+          else
+            echo 'clis=["claude","codex","gemini","copilot","cursor"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: ${{ matrix.cli }}
+    needs: matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        cli: ${{ fromJSON(needs.matrix.outputs.clis) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ghcr.io rejects mixed-case namespaces — lowercase the owner login.
+      - name: Lowercase repo owner
+        id: owner
+        run: echo "lc=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve platforms
+        id: plat
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.include_arm64 }}" = "true" ]; then
+            echo "platforms=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
+          else
+            echo "platforms=linux/amd64" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push ${{ matrix.cli }}
+        uses: docker/build-push-action@v6
+        with:
+          context: agent-images
+          file: agent-images/${{ matrix.cli }}/Dockerfile
+          platforms: ${{ steps.plat.outputs.platforms }}
+          push: true
+          tags: |
+            ghcr.io/${{ steps.owner.outputs.lc }}/aw-sandbox-agent-cli-${{ matrix.cli }}:latest
+            ghcr.io/${{ steps.owner.outputs.lc }}/aw-sandbox-agent-cli-${{ matrix.cli }}:${{ github.sha }}
+          cache-from: type=registry,ref=ghcr.io/${{ steps.owner.outputs.lc }}/aw-sandbox-agent-cli-${{ matrix.cli }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ steps.owner.outputs.lc }}/aw-sandbox-agent-cli-${{ matrix.cli }}:buildcache,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "## 🐳 aw-sandbox-agent-cli-${{ matrix.cli }} pushed"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Image** | \`ghcr.io/${{ steps.owner.outputs.lc }}/aw-sandbox-agent-cli-${{ matrix.cli }}:latest\` |"
+            echo "| **Platforms** | ${{ steps.plat.outputs.platforms }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
