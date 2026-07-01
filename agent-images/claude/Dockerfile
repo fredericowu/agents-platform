@@ -56,5 +56,13 @@ RUN chmod +x /usr/local/bin/aw-connector
 USER ubuntu
 RUN npm install -g @anthropic-ai/claude-code@latest && claude --version
 
+# ── Canonical session working directory ──────────────────────────────────────
+# Baked so it exists even when the real repo is NOT bind-mounted here (the
+# "Agentic Workspace Folder Access = off" case). Owned by ubuntu so the CLI can
+# use it as a writable cwd; sessions live in ~/.claude regardless. When access
+# is on, the repo is bind-mounted over this dir.
+USER root
+RUN mkdir -p /opt/agentic-workspace && chown ubuntu:ubuntu /opt/agentic-workspace
+USER ubuntu
 WORKDIR /workspace
 CMD ["claude", "--version"]

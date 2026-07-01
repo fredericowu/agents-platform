@@ -115,6 +115,23 @@ def _agent_to_runtime(s: Session, agent: Agent) -> dict[str, Any]:
     # Defaults ON (unlike other opt-in perms) per current rollout — flip to False
     # per-agent via the "Share network" permission checkbox to opt a given agent out.
     params["share_network"] = bool(permissions.get("share_network", True))
+    # "Agentic Workspace Folder Access" — controls only whether the REAL repo is
+    # bind-mounted into the container; it must NOT change the CLI's working dir.
+    # The claude CLI keys conversation memory (session files under
+    # ~/.claude/projects/<encoded-cwd>/) by cwd, and ~/.claude is a shared mount,
+    # so pinning cwd to /opt/agentic-workspace for every agent means:
+    #   • all docker agents share one session store (same cwd → same project dir),
+    #   • those sessions are the SAME ones host/external CLIs see (they also run
+    #     from /opt/agentic-workspace), so a session_id resumes identically
+    #     inside and outside the container, and
+    #   • toggling the mount never moves the session dir → memory is preserved.
+    # When access is ON the repo is bind-mounted at that path; when OFF docker_agent
+    # mounts an empty writable tmpfs there instead (the dir still exists as cwd,
+    # just without the repo). See CliLLM.mount_cwd / build_docker_argv.workdir.
+    params["cwd"] = _aw_base
+    params["mount_cwd"] = bool(permissions.get("workspace_access", True))
+    # /opt is now the cwd, so drop any redundant --add-dir for it (keep e.g. /tmp).
+    params["add_dirs"] = [d for d in (params.get("add_dirs") or []) if d != _aw_base]
     return {"provider": provider, "model_id": model_id, "model_slug": model_slug,
             "params": params,
             "system_prompt": system_prompt,

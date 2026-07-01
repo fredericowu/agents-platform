@@ -90,12 +90,14 @@ class CliLLM(BaseLLM):
         notion_task_id: str | None = None,
         extra_volumes: list[str] | None = None,
         share_network: bool = False,
+        mount_cwd: bool = True,
         **_: Any,
     ) -> None:
         self.model_id = model_id
         self.cli = cli
         self.model = model
         self.cwd = cwd
+        self.mount_cwd = mount_cwd
         self.add_dirs = list(add_dirs or [])
         self.allowed_tools = list(allowed_tools or [])
         self.disallowed_tools = list(disallowed_tools or [])
@@ -125,8 +127,13 @@ class CliLLM(BaseLLM):
 
         cli = self.cli if self.cli in CLI_SPECS else "claude"
 
+        # self.cwd is the CLI working directory (always passed as -w so the
+        # session project dir stays constant). It is bind-mounted only when
+        # mount_cwd is set ("workspace access on"); when off, docker_agent mounts
+        # an empty writable tmpfs there instead, so the dir exists without exposing
+        # the repo.
         mounts: list[str] = []
-        if self.cwd:
+        if self.cwd and self.mount_cwd:
             mounts.append(self.cwd)
 
         extra: list[str] = []
@@ -183,6 +190,10 @@ class CliLLM(BaseLLM):
             redis_mode=redis_url is not None,
             extra_volumes=self.extra_volumes or None,
             share_network=self.share_network,
+            # cwd is always passed as -w. When mount_cwd is off we do NOT bind the
+            # repo there; the dir still exists because it's baked into the agent
+            # image (mkdir/chown ubuntu in the Dockerfile), so no tmpfs is needed.
+            workdir=self.cwd,
         )
 
     async def astream(self, messages: list[dict], **params: Any) -> AsyncIterator[ChatChunk]:

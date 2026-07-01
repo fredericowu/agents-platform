@@ -146,6 +146,8 @@ def build_docker_argv(
     ws_mode: bool = False,
     redis_mode: bool = False,
     share_network: bool = False,
+    workdir: str | None = None,
+    workdir_tmpfs: bool = False,
 ) -> list[str]:
     spec = CLI_SPECS[cli]
     image = image_override or f"{REGISTRY}/{IMAGE_PREFIX}-{cli}:{tag}"
@@ -177,6 +179,19 @@ def build_docker_argv(
     # prevent claude from auto-discovering the workspace .mcp.json in the cwd.
     # In normal mode, use the first mounted directory.
     _cwd_set = False
+
+    # Explicit working directory, decoupled from the mounts. When set it wins over
+    # all auto-cwd logic below (first-mount / isolated). This keeps the CLI's cwd
+    # — and therefore its ~/.claude/projects/<encoded-cwd>/ session store —
+    # constant regardless of what is mounted, so sessions are SHARED across agents
+    # (all use the same cwd) and survive toggling the workspace mount.
+    # workdir_tmpfs mounts an empty, writable tmpfs at that path so the dir exists
+    # even when the real repo is NOT bind-mounted there ("workspace access off").
+    if workdir:
+        if workdir_tmpfs:
+            argv.extend(["--tmpfs", f"{workdir}:rw,mode=1777"])
+        argv.extend(["-w", workdir])
+        _cwd_set = True
 
     # User-specified mounts
     for raw in mounts:
