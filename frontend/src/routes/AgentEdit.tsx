@@ -1,24 +1,20 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import Page from "../components/Page";
-import { api, type Agent, type Model, type ToolItem, type Skill } from "../lib/api";
+import { api, type Agent, type AgentConfig, type Model, type ToolItem, type Skill } from "../lib/api";
 
 const BLANK: Agent = {
   slug: "", name: "", description: "", system_prompt: "",
-  inherit_from: null, model_slug: "claude-cli-sonnet", tool_specs: [], skill_slugs: [],
+  inherit_from: null, agent_config_slug: null, model_slug: "claude-cli-sonnet", tool_specs: [], skill_slugs: [],
   params: {}, mcp_config: {}, extra_volumes: [], permissions: {}, icon: "bot", color: "#58a6ff",
 };
-
-const PERMISSION_DEFS: { key: string; label: string; description: string }[] = [
-  { key: "docker", label: "Docker", description: "Mount the Docker socket — enables docker ps, docker run, etc." },
-  { key: "github", label: "GitHub / Git", description: "Mount SSH keys for git push/pull and GitHub access." },
-];
 
 export default function AgentEdit() {
   const { slug } = useParams<{ slug: string }>();
   const isNew = slug === "new";
   const nav = useNavigate();
   const [a, setA] = useState<Agent | null>(null);
+  const [agentConfigs, setAgentConfigs] = useState<AgentConfig[]>([]);
   const [models, setModels] = useState<Model[]>([]);
   const [tools, setTools] = useState<ToolItem[]>([]);
   const [skills, setSkills] = useState<Skill[]>([]);
@@ -38,6 +34,7 @@ export default function AgentEdit() {
     api.listModels().then(setModels);
     api.listTools().then(setTools);
     api.listSkills().then(setSkills);
+    api.listAgentConfigs().then(setAgentConfigs).catch(() => {});
     api.listAgents().then(setAllAgents).catch(() => {});
     api.listResettableAgents().then(r => setResettableSet(new Set(r))).catch(() => {});
     if (!slug) return;
@@ -105,6 +102,7 @@ export default function AgentEdit() {
         const created = await api.createAgent({
           slug: a.slug, name: a.name || a.slug, description: a.description,
           system_prompt: a.system_prompt, inherit_from: a.inherit_from || null,
+          agent_config_slug: a.agent_config_slug || null,
           model_slug: a.model_slug, tool_specs: a.tool_specs, skill_slugs: a.skill_slugs,
           params: a.params, mcp_config: a.mcp_config, extra_volumes: a.extra_volumes,
           permissions: a.permissions || {},
@@ -119,7 +117,8 @@ export default function AgentEdit() {
         }
         await api.saveAgent(targetSlug, {
           name: a.name, description: a.description, system_prompt: a.system_prompt,
-          inherit_from: a.inherit_from || null, model_slug: a.model_slug,
+          inherit_from: a.inherit_from || null, agent_config_slug: a.agent_config_slug || null,
+          model_slug: a.model_slug,
           tool_specs: a.tool_specs, skill_slugs: a.skill_slugs,
           params: a.params, mcp_config: a.mcp_config, extra_volumes: a.extra_volumes,
           permissions: a.permissions || {},
@@ -227,8 +226,8 @@ export default function AgentEdit() {
             </>
           }>
       {error && <div className="codebox text-err mb-3" data-testid="agent-error">{error}</div>}
-      <div className="grid grid-cols-3 gap-4">
-        <div className="col-span-2 space-y-4">
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <div className="lg:col-span-2 space-y-4">
           <div className="card">
             <h2 className="text-base font-semibold mb-3">Configuration</h2>
 
@@ -403,109 +402,30 @@ export default function AgentEdit() {
             </div>
           </div>
 
-          {/* ───── Permissions ───── */}
+          {/* ───── Agent Config ───── */}
           <div className="card">
-            <h2 className="text-base font-semibold mb-1">Permissions</h2>
+            <h2 className="text-base font-semibold mb-1">Agent config</h2>
             <p className="text-xs text-muted mb-3">
-              Each permission is applied when this agent runs in a container — translated to volume mounts, environment variables, or other config as needed.
+              Permissions, extra volumes, and MCP servers now live in a reusable{" "}
+              <Link to="/agent-configs" className="text-accent hover:underline">Agents Config</Link>{" "}
+              record. Pick one below, or create a new one.
             </p>
-            <div className="space-y-2">
-              {PERMISSION_DEFS.map(({ key, label, description }) => (
-                <label key={key} className="flex items-start gap-2 cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    className="mt-0.5"
-                    checked={!!(a.permissions || {})[key]}
-                    onChange={e => {
-                      const next = { ...(a.permissions || {}), [key]: e.target.checked };
-                      if (!e.target.checked) delete next[key];
-                      setA({ ...a, permissions: next });
-                    }}
-                  />
-                  <span>
-                    <span className="text-sm font-medium">{label}</span>
-                    <span className="block text-xs text-muted">{description}</span>
-                  </span>
-                </label>
+            <select value={a.agent_config_slug ?? ""}
+                    onChange={e => setA({ ...a, agent_config_slug: e.target.value || null })}
+                    data-testid="agent-config-select">
+              <option value="">(none)</option>
+              {agentConfigs.map(ac => (
+                <option key={ac.slug} value={ac.slug}>{ac.name} ({ac.slug})</option>
               ))}
-            </div>
-          </div>
-
-          {/* ───── Extra Volumes ───── */}
-          <div className="card">
-            <h2 className="text-base font-semibold mb-1">Extra volumes</h2>
-            <p className="text-xs text-muted mb-3">
-              Docker volume mounts injected when this agent runs in a container.
-              One entry per line in <code>host:container</code> format
-              (e.g. <code>/var/run/docker.sock:/var/run/docker.sock</code>).
-              {a.inherit_from && (
-                <span className="ml-1">
-                  Volumes from <strong>{a.inherit_from}</strong> are prepended automatically.
-                </span>
+            </select>
+            <div className="mt-2 flex gap-2">
+              {a.agent_config_slug && (
+                <Link to={`/agent-configs/${a.agent_config_slug}`} className="btn text-xs py-1 px-2">
+                  edit "{a.agent_config_slug}"
+                </Link>
               )}
-            </p>
-            <textarea rows={4}
-                      className="font-mono text-xs"
-                      placeholder={a.inherit_from
-                        ? `(leave blank to use only inherited volumes from "${a.inherit_from}")`
-                        : "/var/run/docker.sock:/var/run/docker.sock"}
-                      data-testid="agent-volumes"
-                      value={(a.extra_volumes || []).join("\n")}
-                      onChange={e => {
-                        const lines = e.target.value.split("\n")
-                          .map(l => l.trim()).filter(Boolean);
-                        setA({ ...a, extra_volumes: lines });
-                      }} />
-          </div>
-
-          {/* ───── MCP Config ───── */}
-          <div className="card">
-            <h2 className="text-base font-semibold mb-1">MCP servers</h2>
-            <p className="text-xs text-muted mb-3">
-              When this agent runs in a Docker container, these servers are injected via{" "}
-              <code>--mcp-config</code>. Use <code>http://host.docker.internal:9123/mcp</code>{" "}
-              to point at the AW Gateway.
-            </p>
-            {/* Server list */}
-            {Object.entries(a.mcp_config?.servers ?? {}).map(([name, srv]) => (
-              <div key={name} className="border border-line rounded p-3 mb-2 space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-mono font-semibold">{name}</span>
-                  <button className="btn btn-danger text-xs py-0.5 px-2"
-                    onClick={() => {
-                      const next = { ...a.mcp_config, servers: { ...(a.mcp_config?.servers ?? {}) } };
-                      delete next.servers![name];
-                      setA({ ...a, mcp_config: next });
-                    }}>remove</button>
-                </div>
-                <div>
-                  <label className="block text-xs text-muted mb-0.5">URL</label>
-                  <input className="text-xs font-mono" value={srv.url}
-                    onChange={e => {
-                      const next = { ...a.mcp_config, servers: { ...(a.mcp_config?.servers ?? {}), [name]: { ...srv, url: e.target.value } } };
-                      setA({ ...a, mcp_config: next });
-                    }} />
-                </div>
-                <div>
-                  <label className="block text-xs text-muted mb-0.5">Authorization header (Bearer token)</label>
-                  <input className="text-xs font-mono"
-                    value={srv.headers?.["Authorization"]?.replace("Bearer ", "") ?? ""}
-                    placeholder="paste token here"
-                    onChange={e => {
-                      const tok = e.target.value.trim();
-                      const h: Record<string, string> = tok ? { Authorization: `Bearer ${tok}` } : {};
-                      const next = { ...a.mcp_config, servers: { ...(a.mcp_config?.servers ?? {}), [name]: { ...srv, headers: h } } };
-                      setA({ ...a, mcp_config: next });
-                    }} />
-                </div>
-              </div>
-            ))}
-            <button className="btn text-xs mt-1"
-              onClick={() => {
-                const newName = `server-${Date.now()}`;
-                const next = { servers: { ...(a.mcp_config?.servers ?? {}), [newName]: { type: "streamable-http", url: "http://host.docker.internal:9123/mcp", headers: {} } } };
-                setA({ ...a, mcp_config: next });
-              }}>+ add server</button>
+              <Link to="/agent-configs/new" className="btn text-xs py-1 px-2">+ new config</Link>
+            </div>
           </div>
 
           <div className={`card${isDockerCli ? " opacity-50 pointer-events-none select-none" : ""}`}>
@@ -513,22 +433,15 @@ export default function AgentEdit() {
               Tools ({a.tool_specs.length} selected)
               {isDockerCli && <span className="ml-2 text-xs font-normal text-muted normal-case">(managed by Docker image)</span>}
             </h2>
-            <div className="space-y-3">
-              {["builtin", "mcp", "skill"].map(kind => (
-                <div key={kind}>
-                  <div className="text-xs text-muted uppercase mb-1">{kind}</div>
-                  <div className="grid grid-cols-2 gap-1 max-h-48 overflow-y-auto">
-                    {tools.filter(t => t.kind === kind).map(t => (
-                      <label key={t.id} className="flex items-center gap-2 py-1 cursor-pointer text-xs">
-                        <input type="checkbox" className="w-auto"
-                               checked={enabledToolIds.has(t.id)}
-                               disabled={isDockerCli}
-                               onChange={() => !isDockerCli && toggleTool(t.id)} />
-                        <span className="font-mono">{t.id}</span>
-                      </label>
-                    ))}
-                  </div>
-                </div>
+            <div className="grid grid-cols-2 gap-1 max-h-48 overflow-y-auto">
+              {tools.filter(t => t.kind === "builtin").map(t => (
+                <label key={t.id} className="flex items-center gap-2 py-1 cursor-pointer text-xs">
+                  <input type="checkbox" className="w-auto"
+                         checked={enabledToolIds.has(t.id)}
+                         disabled={isDockerCli}
+                         onChange={() => !isDockerCli && toggleTool(t.id)} />
+                  <span className="font-mono">{t.id}</span>
+                </label>
               ))}
             </div>
           </div>

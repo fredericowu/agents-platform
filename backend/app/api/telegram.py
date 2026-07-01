@@ -274,6 +274,20 @@ def _strip_markdown(text: str) -> str:
     return text
 
 
+def _split_into_messages(text: str) -> list[str]:
+    """Split a reply into individual Telegram bubbles on blank-line (paragraph)
+    boundaries.
+
+    The CLI emits one assistant text block per narration between tool calls, and
+    cli.py joins them with a blank line. Delivering each paragraph as its own
+    message turns the trailing mashed blob ("...agora.Now remove...Now fix...")
+    into a readable step-by-step sequence of bubbles — what the user asked for.
+    """
+    parts = [p.strip() for p in re.split(r"\n\s*\n+", text)]
+    parts = [p for p in parts if p]
+    return parts or [text]
+
+
 def _chunk_text(text: str, limit: int = MESSAGE_LIMIT) -> list[str]:
     if len(text) <= limit:
         return [text]
@@ -358,54 +372,18 @@ def _parse_markers(raw: str):
 
 
 # ---------------------------------------------------------------------------
-# TTS — edge_tts → OGG/Opus
+# TTS / STT — provider-configurable, see ../core/voice.py
 # ---------------------------------------------------------------------------
 
-_EDGE_VOICES = {
-    "pt": "pt-BR-AntonioNeural",
-    "en": "en-US-AndrewMultilingualNeural",
-    "es": "es-MX-JorgeNeural",
-    "it": "it-IT-DiegoNeural",
-    "fr": "fr-FR-HenriNeural",
-    "de": "de-DE-ConradNeural",
-}
-_DEFAULT_VOICE = "pt-BR-AntonioNeural"
+from ..core import voice as _voice  # noqa: E402
 
 
-def _strip_for_tts(text: str) -> str:
-    text = re.sub(r"```[^\n]*\n?(.*?)```", r"\1", text, flags=re.DOTALL)
-    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
-    text = re.sub(r"\*{3}(.+?)\*{3}", r"\1", text, flags=re.DOTALL)
-    text = re.sub(r"\*{2}(.+?)\*{2}", r"\1", text, flags=re.DOTALL)
-    text = re.sub(r"(?<!\w)\*(.+?)\*(?!\w)", r"\1", text, flags=re.DOTALL)
-    text = re.sub(r"~~(.+?)~~", r"\1", text, flags=re.DOTALL)
-    text = re.sub(r"`(.+?)`", r"\1", text)
-    text = re.sub(r"\[(.+?)\]\(https?://[^\)]+\)", r"\1", text)
-    return text.strip()
-
-
-async def _tts_edge(text: str, lang: str = "") -> bytes:
-    import edge_tts
-    import subprocess
-    voice = _EDGE_VOICES.get(lang, _DEFAULT_VOICE)
-    tts_text = _strip_for_tts(text)[:3000]
-    communicate = edge_tts.Communicate(tts_text, voice)
-    mp3_bytes = b""
-    async for chunk in communicate.stream():
-        if chunk["type"] == "audio":
-            mp3_bytes += chunk["data"]
-    if not mp3_bytes:
-        raise RuntimeError("edge_tts returned no audio")
-    # Convert MP3 → OGG/Opus via ffmpeg
-    proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y", "-f", "mp3", "-i", "pipe:0",
-        "-c:a", "libopus", "-b:a", "32k", "-f", "ogg", "pipe:1",
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    ogg_bytes, _ = await proc.communicate(mp3_bytes)
-    return ogg_bytes
+async def _tts(text: str, lang: str = "") -> bytes:
+    """Synthesize speech via the configured provider (openai/edge). Raises on failure."""
+    audio = await _voice.synthesize_async(text, language=lang)
+    if not audio:
+        raise RuntimeError("TTS synthesis returned no audio")
+    return audio
 
 
 def _detect_lang(text: str) -> str:
@@ -422,25 +400,12 @@ def _detect_lang(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# STT — faster-whisper
+# STT — provider-configurable (OpenAI Whisper API / local faster-whisper),
+# see ../core/voice.py
 # ---------------------------------------------------------------------------
-
-_WHISPER_MODEL = None
-_WHISPER_LOCK = threading.Lock()
-
-
-def _get_whisper():
-    global _WHISPER_MODEL
-    with _WHISPER_LOCK:
-        if _WHISPER_MODEL is None:
-            from faster_whisper import WhisperModel
-            _WHISPER_MODEL = WhisperModel("tiny", device="cpu", compute_type="int8")
-    return _WHISPER_MODEL
-
 
 def _transcribe_voice(token: str, file_id: str) -> tuple[str, str]:
     """Download voice file from Telegram and transcribe. Returns (text, lang)."""
-    # Get file path
     r = httpx.get(
         TELEGRAM_API.format(token=token, method="getFile"),
         params={"file_id": file_id}, timeout=10,
@@ -450,26 +415,14 @@ def _transcribe_voice(token: str, file_id: str) -> tuple[str, str]:
     if not file_path:
         return "", ""
 
-    # Download
     audio_url = TELEGRAM_FILE_API.format(token=token, path=file_path)
     audio_bytes = httpx.get(audio_url, timeout=30).content
+    filename = file_path.rsplit("/", 1)[-1] or "voice.oga"
 
-    # Write to temp file and transcribe
-    suffix = "." + (file_path.rsplit(".", 1)[-1] if "." in file_path else "ogg")
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-        f.write(audio_bytes)
-        tmp_path = f.name
-    try:
-        model = _get_whisper()
-        segments, info = model.transcribe(tmp_path, beam_size=5)
-        text = " ".join(s.text.strip() for s in segments).strip()
-        lang = info.language or ""
-        return text, lang
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
+    result = _voice.transcribe(audio_bytes, filename)
+    if result is None:
+        return "", ""
+    return result
 
 
 _TELEGRAM_MAX_UPLOAD = 20 * 1024 * 1024  # 20 MB Bot API limit
@@ -837,23 +790,26 @@ def _deliver_reply(
     if wants_voice:
         reply_lang = parsed["force_lang"] or _detect_lang(text) or inbound_lang or "pt"
         try:
-            ogg = (asyncio.run_coroutine_threadsafe(_tts_edge(text, reply_lang), _MAIN_LOOP).result(timeout=30)
-                   if _MAIN_LOOP else asyncio.run(_tts_edge(text, reply_lang)))
+            ogg = (asyncio.run_coroutine_threadsafe(_tts(text, reply_lang), _MAIN_LOOP).result(timeout=30)
+                   if _MAIN_LOOP else asyncio.run(_tts(text, reply_lang)))
             _send_voice(token, chat_id, ogg, caption=_md_to_html(text[:1024]))
             return
         except Exception as e:
             log.warning("TTS failed, falling back to text: %s", e)
 
-    for chunk in _chunk_text(text):
-        try:
-            _send_message(token, chat_id, _md_to_html(chunk), parse_mode="HTML")
-        except Exception:
+    # One Telegram bubble per paragraph (each is a distinct narration step),
+    # further chunked only if a single paragraph exceeds Telegram's size limit.
+    for segment in _split_into_messages(text):
+        for chunk in _chunk_text(segment):
             try:
-                # Telegram rejected the HTML — retry as plain text (no asterisks)
-                _send_message(token, chat_id, _strip_markdown(chunk), parse_mode="")
-            except Exception as e:
-                log.warning("send_message failed: %s", e)
-                break
+                _send_message(token, chat_id, _md_to_html(chunk), parse_mode="HTML")
+            except Exception:
+                try:
+                    # Telegram rejected the HTML — retry as plain text (no asterisks)
+                    _send_message(token, chat_id, _strip_markdown(chunk), parse_mode="")
+                except Exception as e:
+                    log.warning("send_message failed: %s", e)
+                    return
 
 
 # ---------------------------------------------------------------------------
@@ -955,7 +911,10 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
                 log.warning("dispatch: _MAIN_LOOP not set, using asyncio.run() for run %s (cross-loop bug)", run_id)
                 result = asyncio.run(_coro)
             t_agent_done = _time.perf_counter()
-            output_text = result.get("text", "")
+            # Deliver only the concluding answer (post-last-tool text), not the
+            # full progress transcript — otherwise every "Let me…/Now…" narration
+            # floods the chat as its own bubble.
+            output_text = result.get("reply") or result.get("text", "")
             status = result.get("status", "unknown")
             timing = result.get("timing", {})
             if status in ("success", "completed"):
@@ -994,7 +953,7 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
                 else:
                     result = asyncio.run(_coro2)
                 run_id = retry_run_id
-                output_text = result.get("text", "")
+                output_text = result.get("reply") or result.get("text", "")
                 status = result.get("status", "unknown")
                 if status in ("success", "completed"):
                     final_state = "done"
@@ -1685,6 +1644,68 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
                           else "Nothing running to abort.")
             return {"ok": True, "reason": "slash /abort"}
 
+        if cmd == "compact":
+            with session_scope() as ss:
+                _tg_row = (ss.query(TelegramSession)
+                           .filter(TelegramSession.bot_id == bot_id,
+                                   TelegramSession.chat_id == chat_id)
+                           .first())
+                _compact_session_id = _tg_row.session_id if _tg_row else None
+                _compact_slug = (_tg_row.agent_slug_override if _tg_row else None) or bot.agent_slug
+            if not _compact_slug:
+                _send_message(bot.token, chat_id, "⚠️ No agent configured for this chat.")
+                return {"ok": True, "reason": "slash /compact no agent"}
+            if not _compact_session_id:
+                _send_message(bot.token, chat_id,
+                              "⚠️ No active session. Send a message first to start one.")
+                return {"ok": True, "reason": "slash /compact no session"}
+            _send_message(bot.token, chat_id,
+                          "🗜 Compacting context… (may take up to a minute)")
+            _compact_target_id = _ensure_target(bot.id, chat_id)
+            _compact_token = bot.token
+            _compact_bot_id = bot.id
+            _compact_chat_id = chat_id
+
+            def _do_compact(slug, sess_id, target_id, tg_token, b_id, c_id):
+                import asyncio as _aio
+                try:
+                    from ..core.executor import run_agent as _run_agent
+                    _coro = _run_agent(
+                        slug, "/compact",
+                        target_id=target_id,
+                        session_id=sess_id,
+                        initiator_kind="telegram",
+                        initiator_id=f"{b_id}:{c_id}",
+                    )
+                    if _MAIN_LOOP is not None:
+                        result = _aio.run_coroutine_threadsafe(_coro, _MAIN_LOOP).result(timeout=300)
+                    else:
+                        result = _aio.run(_coro)
+                    output_text = (result.get("text") or "").strip()
+                    status = result.get("status", "unknown")
+                    if status in ("success", "completed"):
+                        if output_text and output_text != "(empty response)":
+                            _send_message(tg_token, c_id,
+                                          f"✅ Context compacted.\n\n{_md_to_html(output_text)}",
+                                          parse_mode="HTML")
+                        else:
+                            _send_message(tg_token, c_id, "✅ Context compacted.")
+                    else:
+                        _send_message(tg_token, c_id,
+                                      f"⚠️ Compact finished with status: <code>{status}</code>",
+                                      parse_mode="HTML")
+                except Exception as _e:
+                    log.exception("compact failed for bot=%s chat=%s", b_id, c_id)
+                    _send_message(tg_token, c_id, f"⚠️ Compact failed: {_e}")
+
+            threading.Thread(
+                target=_do_compact,
+                args=(_compact_slug, _compact_session_id, _compact_target_id,
+                      _compact_token, _compact_bot_id, _compact_chat_id),
+                daemon=True, name=f"compact-{bot.id}-{chat_id}",
+            ).start()
+            return {"ok": True, "reason": "slash /compact queued"}
+
         if cmd in ("help", "?"):
             _send_message(bot.token, chat_id,
                           "🤖 <b>Agents Platform commands</b>\n"
@@ -1694,6 +1715,7 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
                           "/status — show active session info\n"
                           "/rename — rename the current session (no args → prompt)\n"
                           "/abort — stop the run in progress\n"
+                          "/compact — compress conversation context to save tokens\n"
                           "/help — show this message")
             return {"ok": True, "reason": "slash /help"}
         # Unknown slash command → fall through to the agent dispatch below.
@@ -1737,6 +1759,29 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
 
     if not text_raw:
         return {"ok": True, "reason": "no text"}
+
+    # Inject replied-to message content so the agent has full context.
+    # Skip when the reply is to a pending /rename prompt (handled above).
+    reply_msg = message.get("reply_to_message")
+    if reply_msg and _PENDING_RENAME.get((bot_id, chat_id)) != reply_msg.get("message_id"):
+        replied_text = (reply_msg.get("text") or reply_msg.get("caption") or "").strip()
+        if not replied_text:
+            if reply_msg.get("voice"):
+                replied_text = "[voice message]"
+            elif reply_msg.get("audio"):
+                fname = (reply_msg["audio"].get("file_name") or "audio")
+                replied_text = f"[audio: {fname}]"
+            elif reply_msg.get("photo"):
+                replied_text = "[photo]"
+            elif reply_msg.get("video"):
+                replied_text = "[video]"
+            elif reply_msg.get("document"):
+                fname = (reply_msg["document"].get("file_name") or "file")
+                replied_text = f"[document: {fname}]"
+            elif reply_msg.get("sticker"):
+                replied_text = "[sticker]"
+        if replied_text:
+            text_raw = f"[Replying to: \"{replied_text}\"]\n\n{text_raw}"
 
     # Capture bot state before thread (avoid detached ORM object)
     bot_snapshot = TelegramBot(

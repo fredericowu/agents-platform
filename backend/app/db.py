@@ -103,6 +103,9 @@ def _apply_inline_migrations() -> None:
         if "permissions" not in agent_cols:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE agents ADD COLUMN permissions JSON DEFAULT '{}'"))
+        if "agent_config_slug" not in agent_cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE agents ADD COLUMN agent_config_slug VARCHAR"))
 
     # soft-delete columns on agents and workflows
     for tbl in ("agents", "workflows"):

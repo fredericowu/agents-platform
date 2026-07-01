@@ -309,25 +309,27 @@ export default function TargetDetail() {
           <div className="text-xs text-muted uppercase tracking-wide mb-3 flex items-center gap-2">
             <GitPullRequest size={12} /> Pull requests ({target.pr_urls.length})
           </div>
-          <table className="w-full text-sm">
-            <thead className="text-xs text-muted">
-              <tr><th className="text-left py-1 px-1">URL</th><th className="text-left py-1 px-1">Title</th><th className="text-left py-1 px-1">PR status</th><th className="text-left py-1 px-1">CI</th></tr>
-            </thead>
-            <tbody>
-              {target.pr_urls.map((pr, i) => (
-                <tr key={i} className="border-t border-line">
-                  <td className="py-1 px-1">
-                    <a href={pr.url} target="_blank" rel="noopener" className="text-accent hover:underline inline-flex items-center gap-1 font-mono text-xs">
-                      {pr.url.replace(/^https?:\/\//, "")} <ExternalLink size={10} />
-                    </a>
-                  </td>
-                  <td className="py-1 px-1 text-muted">{pr.title || "—"}</td>
-                  <td className="py-1 px-1">{pr.status && <span className={`badge ${pr.status === "merged" ? "badge-success" : pr.status === "open" ? "badge-info" : ""}`}>{pr.status}</span>}</td>
-                  <td className="py-1 px-1">{pr.ci_status && <span className={`badge ${pr.ci_status === "passing" ? "badge-success" : pr.ci_status === "failing" ? "badge-crit" : ""}`}>{pr.ci_status}</span>}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="text-xs text-muted">
+                <tr><th className="text-left py-1 px-1">URL</th><th className="text-left py-1 px-1">Title</th><th className="text-left py-1 px-1">PR status</th><th className="text-left py-1 px-1">CI</th></tr>
+              </thead>
+              <tbody>
+                {target.pr_urls.map((pr, i) => (
+                  <tr key={i} className="border-t border-line">
+                    <td className="py-1 px-1">
+                      <a href={pr.url} target="_blank" rel="noopener" className="text-accent hover:underline inline-flex items-center gap-1 font-mono text-xs">
+                        {pr.url.replace(/^https?:\/\//, "")} <ExternalLink size={10} />
+                      </a>
+                    </td>
+                    <td className="py-1 px-1 text-muted">{pr.title || "—"}</td>
+                    <td className="py-1 px-1">{pr.status && <span className={`badge ${pr.status === "merged" ? "badge-success" : pr.status === "open" ? "badge-info" : ""}`}>{pr.status}</span>}</td>
+                    <td className="py-1 px-1">{pr.ci_status && <span className={`badge ${pr.ci_status === "passing" ? "badge-success" : pr.ci_status === "failing" ? "badge-crit" : ""}`}>{pr.ci_status}</span>}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
 

@@ -13,6 +13,7 @@ export type Agent = {
   description: string;
   system_prompt: string;
   inherit_from: string | null;
+  agent_config_slug: string | null;
   model_slug: string | null;
   tool_specs: string[];
   skill_slugs: string[];
@@ -22,6 +23,15 @@ export type Agent = {
   permissions: Record<string, boolean>;
   icon: string;
   color: string;
+};
+
+export type AgentConfig = {
+  slug: string;
+  name: string;
+  description: string;
+  mcp_config: { servers?: Record<string, AgentMcpServer> };
+  extra_volumes: string[];
+  permissions: Record<string, boolean>;
 };
 
 export type Workflow = {
@@ -197,12 +207,23 @@ export type PlatformSettings = {
   github_sync_enabled?: boolean;
   github_repo?: string;
   github_webhook_secret?: string;
+  tts_provider?: "openai" | "edge";
+  stt_provider?: "openai" | "local";
+  openai_api_key?: string;
+  tts_voice?: string;
+  edge_voice?: string;
+  edge_voices?: Record<string, string>;
+  openai_key_configured?: boolean;
   _defaults?: {
     command_timeout_seconds: number;
     security_mode: "insecure" | "secure";
     command_allowlist: string[];
     command_denylist: string[];
     rag_provider?: RagProviderConfig;
+    tts_provider?: string;
+    stt_provider?: string;
+    tts_voice?: string;
+    edge_voice?: string;
   };
 };
 
@@ -344,6 +365,15 @@ export const api = {
     call<Agent>(`/api/agents/${slug}/rename`, { method: "POST", body: JSON.stringify({ new_slug: newSlug }) }),
   renameWorkflow: (slug: string, newSlug: string) =>
     call<Workflow>(`/api/workflows/${slug}/rename`, { method: "POST", body: JSON.stringify({ new_slug: newSlug }) }),
+
+  listAgentConfigs: () => call<AgentConfig[]>("/api/agent-configs"),
+  getAgentConfig: (slug: string) => call<AgentConfig>(`/api/agent-configs/${slug}`),
+  createAgentConfig: (c: any) =>
+    call<AgentConfig>("/api/agent-configs", { method: "POST", body: JSON.stringify(c) }),
+  saveAgentConfig: (slug: string, patch: Partial<AgentConfig>) =>
+    call<AgentConfig>(`/api/agent-configs/${slug}`, { method: "PUT", body: JSON.stringify(patch) }),
+  deleteAgentConfig: (slug: string) =>
+    call<{ deleted: string }>(`/api/agent-configs/${slug}`, { method: "DELETE" }),
 
   listWorkflows: () => call<Workflow[]>("/api/workflows"),
   getWorkflow: (slug: string) => call<Workflow>(`/api/workflows/${slug}`),

@@ -21,7 +21,7 @@ a { color: theme('colors.accent'); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
 button, input, select, textarea { font: inherit; color: inherit; }
-input, select, textarea {
+input:not([type="checkbox"]):not([type="radio"]), select, textarea {
   background: theme('colors.bg.2');
   border: 1px solid theme('colors.line');
   border-radius: 6px;
@@ -30,6 +30,12 @@ input, select, textarea {
   width: 100%;
 }
 input:focus, select:focus, textarea:focus { border-color: theme('colors.accent'); }
+
+input[type="checkbox"], input[type="radio"] {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
 
 .btn {
   display: inline-flex; align-items: center; gap: 6px;

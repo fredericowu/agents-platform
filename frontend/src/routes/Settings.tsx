@@ -4,6 +4,57 @@ import Page from "../components/Page";
 import { FormRow } from "../components/Modal";
 import { api, type PlatformSettings, type RagHealth, type RagProviderConfig } from "../lib/api";
 
+const OPENAI_VOICE_OPTIONS = [
+  { id: "alloy",   label: "Alloy",   desc: "Neutral, balanced" },
+  { id: "echo",    label: "Echo",    desc: "Male, calm" },
+  { id: "fable",   label: "Fable",   desc: "British, warm" },
+  { id: "onyx",    label: "Onyx",    desc: "Deep, authoritative" },
+  { id: "nova",    label: "Nova",    desc: "Female, energetic" },
+  { id: "shimmer", label: "Shimmer", desc: "Female, soft" },
+];
+
+// Curated Edge Neural voice list per language — the configured map
+// (setting: edge_voices) is the source of truth at runtime.
+const EDGE_VOICES_BY_LANG: Record<string, { id: string; label: string }[]> = {
+  pt: [
+    { id: "pt-BR-AntonioNeural",   label: "Antônio (BR, male)" },
+    { id: "pt-BR-FranciscaNeural", label: "Francisca (BR, female)" },
+    { id: "pt-BR-ThalitaNeural",   label: "Thalita (BR, female)" },
+    { id: "pt-PT-DuarteNeural",    label: "Duarte (PT, male)" },
+    { id: "pt-PT-RaquelNeural",    label: "Raquel (PT, female)" },
+  ],
+  en: [
+    { id: "en-US-AndrewMultilingualNeural", label: "Andrew (US, multilingual)" },
+    { id: "en-US-AriaNeural",               label: "Aria (US, female)" },
+    { id: "en-US-GuyNeural",                label: "Guy (US, male)" },
+    { id: "en-GB-RyanNeural",               label: "Ryan (UK, male)" },
+    { id: "en-GB-SoniaNeural",              label: "Sonia (UK, female)" },
+  ],
+  es: [
+    { id: "es-MX-JorgeNeural",  label: "Jorge (MX, male)" },
+    { id: "es-MX-DaliaNeural",  label: "Dalia (MX, female)" },
+    { id: "es-ES-AlvaroNeural", label: "Álvaro (ES, male)" },
+    { id: "es-ES-ElviraNeural", label: "Elvira (ES, female)" },
+  ],
+  it: [
+    { id: "it-IT-DiegoNeural",    label: "Diego (male)" },
+    { id: "it-IT-ElsaNeural",     label: "Elsa (female)" },
+    { id: "it-IT-IsabellaNeural", label: "Isabella (female)" },
+  ],
+  fr: [
+    { id: "fr-FR-HenriNeural",  label: "Henri (male)" },
+    { id: "fr-FR-DeniseNeural", label: "Denise (female)" },
+  ],
+  de: [
+    { id: "de-DE-ConradNeural", label: "Conrad (male)" },
+    { id: "de-DE-KatjaNeural",  label: "Katja (female)" },
+  ],
+};
+
+const EDGE_LANG_LABELS: Record<string, string> = {
+  pt: "Portuguese", en: "English", es: "Spanish", it: "Italian", fr: "French", de: "German",
+};
+
 export default function Settings() {
   const [s, setS] = useState<PlatformSettings | null>(null);
   const [saving, setSaving] = useState<string>("");   // key currently saving
@@ -23,6 +74,9 @@ export default function Settings() {
   const [ghRepo, setGhRepo] = useState("");
   const [ghSecret, setGhSecret] = useState("");
   const [ghTestResult, setGhTestResult] = useState<{ ok: boolean; output: string } | null>(null);
+
+  // Voice & STT settings
+  const [voiceOpenaiKey, setVoiceOpenaiKey] = useState("");
 
   const RETRO_DIMS = ["cost", "wall", "mistakes", "lessons_applied", "plan_adherence",
                       "scope_discipline", "accuracy", "output_quality", "recovery"];
@@ -55,6 +109,7 @@ export default function Settings() {
       setGhEnabled(!!res.github_sync_enabled);
       setGhRepo(res.github_repo || "");
       setGhSecret(res.github_webhook_secret || "");
+      setVoiceOpenaiKey(res.openai_api_key || "");
     } catch (e: any) { setError(String(e.message || e)); }
     try {
       const rw = await api.getRetroScoreWeights();
@@ -253,6 +308,118 @@ export default function Settings() {
             </button>
           </div>
         </div>
+      </div>
+
+      {/* ─────── Voice & STT ─────── */}
+      <div className="card mb-4" data-testid="settings-voice">
+        <h2 className="text-base font-semibold mb-1">Voice & STT</h2>
+        <div className="text-xs text-muted mb-3">
+          Controls how the Telegram bots transcribe inbound voice notes and speak replies.
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-3">
+          <FormRow label="STT provider" hint="Speech-to-text used to transcribe inbound voice messages.">
+            <div className="flex gap-1">
+              {[
+                { id: "openai", label: "Whisper API", desc: "OpenAI Whisper (cloud)" },
+                { id: "local",  label: "faster-whisper", desc: "Local Whisper (offline, tiny model)" },
+              ].map(({ id, label, desc }) => (
+                <button key={id} type="button" title={desc}
+                        className={`btn ${s.stt_provider === id ? "btn-primary" : "btn-ghost"}`}
+                        disabled={saving === "stt_provider"}
+                        onClick={() => save("stt_provider", id)}
+                        data-testid={`settings-stt-${id}`}>
+                  {label}
+                </button>
+              ))}
+            </div>
+          </FormRow>
+
+          <FormRow label="TTS provider" hint="Text-to-speech used to speak bot replies.">
+            <div className="flex gap-1">
+              {[
+                { id: "openai", label: "OpenAI", desc: "tts-1 (cloud, multilingual)" },
+                { id: "edge",   label: "Edge",   desc: "Microsoft Edge Neural (per-language)" },
+              ].map(({ id, label, desc }) => (
+                <button key={id} type="button" title={desc}
+                        className={`btn ${s.tts_provider === id ? "btn-primary" : "btn-ghost"}`}
+                        disabled={saving === "tts_provider"}
+                        onClick={() => save("tts_provider", id)}
+                        data-testid={`settings-tts-${id}`}>
+                  {label}
+                </button>
+              ))}
+            </div>
+          </FormRow>
+        </div>
+
+        {(s.stt_provider === "openai" || s.tts_provider === "openai") && (
+          <FormRow label="OpenAI API key" hint="Shared by Whisper STT and OpenAI TTS. Falls back to the OPENAI_API_KEY env var if left blank.">
+            <div className="flex items-center gap-2">
+              <input type="password" className="w-80 font-mono text-sm"
+                     placeholder="sk-..."
+                     value={voiceOpenaiKey}
+                     onChange={e => setVoiceOpenaiKey(e.target.value)}
+                     data-testid="settings-voice-openai-key" />
+              <button className="btn btn-primary"
+                      disabled={saving === "openai_api_key" || voiceOpenaiKey === (s.openai_api_key || "")}
+                      onClick={() => save("openai_api_key", voiceOpenaiKey)}
+                      data-testid="settings-voice-openai-key-save">
+                {saving === "openai_api_key" ? "saving…" : "save"}
+              </button>
+              <span className={`text-xs ${s.openai_key_configured ? "text-ok" : "text-err"}`}>
+                {s.openai_key_configured ? "✓ key detected" : "⚠ no key — voice off when provider=OpenAI"}
+              </span>
+            </div>
+          </FormRow>
+        )}
+
+        {s.tts_provider === "edge" ? (
+          <div className="mt-3">
+            <div className="text-xs text-muted mb-2">
+              Edge voice per language — picked by the language Whisper/langdetect detected on the reply.
+            </div>
+            <div className="space-y-2">
+              {Object.keys(EDGE_VOICES_BY_LANG).map(lang => {
+                const options = EDGE_VOICES_BY_LANG[lang];
+                const current = s.edge_voices?.[lang] || (lang === "pt" ? (s.edge_voice || "pt-BR-AntonioNeural") : options[0]?.id);
+                return (
+                  <div key={lang} className="grid grid-cols-[130px_1fr] gap-2 items-center">
+                    <span className="text-xs">{EDGE_LANG_LABELS[lang]} <span className="text-muted">({lang})</span></span>
+                    <select value={current} className="w-64"
+                            onChange={e => save("edge_voices", { ...(s.edge_voices || {}), [lang]: e.target.value })}
+                            data-testid={`settings-edge-voice-${lang}`}>
+                      {options.map(({ id, label }) => <option key={id} value={id}>{label}</option>)}
+                    </select>
+                  </div>
+                );
+              })}
+            </div>
+            <FormRow label="Default voice" hint="Used when the detected language has no entry above.">
+              <select value={s.edge_voices?._default || s.edge_voice || "pt-BR-AntonioNeural"} className="w-64"
+                      onChange={e => save("edge_voices", { ...(s.edge_voices || {}), _default: e.target.value })}
+                      data-testid="settings-edge-voice-default">
+                {Object.values(EDGE_VOICES_BY_LANG).flat().map(({ id, label }) => (
+                  <option key={id} value={id}>{label} — {id}</option>
+                ))}
+              </select>
+            </FormRow>
+          </div>
+        ) : (
+          <FormRow label="TTS voice" hint="Default OpenAI voice for all bot replies.">
+            <div className="grid grid-cols-3 md:grid-cols-6 gap-2">
+              {OPENAI_VOICE_OPTIONS.map(({ id, label, desc }) => (
+                <button key={id} type="button" title={desc}
+                        className={`btn ${(s.tts_voice || "alloy") === id ? "btn-primary" : "btn-ghost"}`}
+                        disabled={saving === "tts_voice"}
+                        onClick={() => save("tts_voice", id)}
+                        data-testid={`settings-tts-voice-${id}`}>
+                  {label}
+                </button>
+              ))}
+            </div>
+          </FormRow>
+        )}
       </div>
 
       {/* ─────── RAG Provider ─────── */}

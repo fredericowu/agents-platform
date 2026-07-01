@@ -89,6 +89,7 @@ class CliLLM(BaseLLM):
         resume_run_id: str | None = None,
         notion_task_id: str | None = None,
         extra_volumes: list[str] | None = None,
+        share_network: bool = False,
         **_: Any,
     ) -> None:
         self.model_id = model_id
@@ -113,6 +114,7 @@ class CliLLM(BaseLLM):
         self.resume_run_id = resume_run_id
         self.notion_task_id = notion_task_id
         self.extra_volumes = list(extra_volumes or [])
+        self.share_network = share_network
         # When set, astream() does NOT launch a container — it re-attaches to the
         # run's durable Redis Stream and replays it (platform-restart recovery).
         self.attach_run_id = _.get("attach_run_id")
@@ -151,7 +153,8 @@ class CliLLM(BaseLLM):
             rid = self.run_id or current_run_id.get() or ""
             _extra_env["AW_RUN_ID"] = rid
             _extra_env["AW_AGENT_TOKEN"] = ws_token
-            _extra_env["AW_WS_URL"] = "ws://host.docker.internal:9123/ws/agent"
+            _ws_host = "127.0.0.1" if self.share_network else "host.docker.internal"
+            _extra_env["AW_WS_URL"] = f"ws://{_ws_host}:9123/ws/agent"
         if redis_url:
             rid = self.run_id or current_run_id.get() or ""
             _extra_env["AW_RUN_ID"] = rid
@@ -179,6 +182,7 @@ class CliLLM(BaseLLM):
             ws_mode=ws_token is not None,
             redis_mode=redis_url is not None,
             extra_volumes=self.extra_volumes or None,
+            share_network=self.share_network,
         )
 
     async def astream(self, messages: list[dict], **params: Any) -> AsyncIterator[ChatChunk]:
@@ -244,8 +248,13 @@ class CliLLM(BaseLLM):
             # We consume via XREADGROUP into an asyncio.Queue (same interface as WS mode).
             _redis_url = os.environ.get("AP_REDIS_URL", "redis://127.0.0.1:6379/0")
             q = asyncio.Queue()
-            argv = self._build_argv(prompt, redis_url=_redis_url.replace(
-                "127.0.0.1", "host.docker.internal"))  # container sees host via this alias
+            # share_network containers join aw-sandbox's netns, so 127.0.0.1 already
+            # reaches redis there — only the isolated-bridge containers need the alias.
+            if self.share_network:
+                argv = self._build_argv(prompt, redis_url=_redis_url)
+            else:
+                argv = self._build_argv(prompt, redis_url=_redis_url.replace(
+                    "127.0.0.1", "host.docker.internal"))  # container sees host via this alias
             stdout_target = asyncio.subprocess.DEVNULL
         else:
             argv = self._build_argv(prompt, ws_token=None)  # no aw-connector wrapper
@@ -344,8 +353,15 @@ class CliLLM(BaseLLM):
                         elif bt == "text":
                             txt = block.get("text", "")
                             if txt:
-                                final_text += txt
-                                yield ChatChunk(delta=txt)
+                                # Each assistant text block is a distinct narration
+                                # the CLI emitted between tool calls. Separate them
+                                # with a blank line so they stay individual
+                                # paragraphs instead of gluing into one blob
+                                # ("...agora.Now remove..."). The Telegram
+                                # dispatcher then delivers each as its own bubble.
+                                sep = "\n\n" if (final_text and not final_text.endswith("\n")) else ""
+                                final_text += sep + txt
+                                yield ChatChunk(delta=sep + txt)
                     usage = evt.get("message", {}).get("usage") or {}
                     if usage:
                         tin = usage.get("input_tokens", 0) + usage.get("cache_creation_input_tokens", 0) + usage.get("cache_read_input_tokens", 0)

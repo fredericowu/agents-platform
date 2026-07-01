@@ -121,6 +121,7 @@ export default function Targets() {
           No Targets yet. Create one to start tracking deliveries with full run lineage + retro view.
         </div>
       ) : (
+        <div className="overflow-x-auto">
         <table className="w-full text-sm">
           <thead className="text-muted text-xs uppercase tracking-wide">
             <tr>
@@ -172,6 +173,7 @@ export default function Targets() {
             ))}
           </tbody>
         </table>
+        </div>
       )}
 
       <Modal open={open} onClose={() => setOpen(false)} title="Create Target">

@@ -145,12 +145,21 @@ def build_docker_argv(
     extra_volumes: list[str] | None = None,
     ws_mode: bool = False,
     redis_mode: bool = False,
+    share_network: bool = False,
 ) -> list[str]:
     spec = CLI_SPECS[cli]
     image = image_override or f"{REGISTRY}/{IMAGE_PREFIX}-{cli}:{tag}"
 
-    argv: list[str] = ["docker", "run", "--rm", "-i",
-                       "--add-host=host.docker.internal:host-gateway"]
+    if share_network:
+        # Join aw-sandbox's network namespace directly — 127.0.0.1 then reaches
+        # every service that shares that netns (awserv, redis, postgres, the
+        # agents-platform backend itself). Docker forbids combining a container
+        # network mode with --add-host, so that flag is dropped in this branch.
+        argv: list[str] = ["docker", "run", "--rm", "-i",
+                           "--network", "container:aw-sandbox"]
+    else:
+        argv = ["docker", "run", "--rm", "-i",
+               "--add-host=host.docker.internal:host-gateway"]
 
     # ── Volume mounts ──────────────────────────────────────────────────────────
     seen_mounts: set[str] = set()

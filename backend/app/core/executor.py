@@ -31,6 +31,20 @@ from .orchestrators import dispatch as dispatch_workflow
 from .tools.langchain_tools import tools_for_agent
 
 
+def _resolve_agent_config(s: Session, agent: Agent) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
+    """Return (permissions, extra_volumes, mcp_config) for *agent*. When
+    ``agent.agent_config_slug`` points at an AgentConfig, that record wins —
+    otherwise fall back to the legacy inline columns on Agent itself (agents
+    created before Agents Config existed)."""
+    if agent.agent_config_slug:
+        from ..models import AgentConfig
+        cfg = s.query(AgentConfig).filter(AgentConfig.slug == agent.agent_config_slug,
+                                          AgentConfig.deleted_at.is_(None)).first()
+        if cfg:
+            return dict(cfg.permissions or {}), list(cfg.extra_volumes or []), dict(cfg.mcp_config or {})
+    return dict(agent.permissions or {}), list(agent.extra_volumes or []), dict(agent.mcp_config or {})
+
+
 def _agent_to_runtime(s: Session, agent: Agent) -> dict[str, Any]:
     from ..models import Model
     provider = "echo"
@@ -45,8 +59,9 @@ def _agent_to_runtime(s: Session, agent: Agent) -> dict[str, Any]:
             params = dict(m.params or {})
             model_slug = m.slug
     params.update(agent.params or {})
+    permissions, extra_volumes, mcp_config = _resolve_agent_config(s, agent)
     # If the agent has an MCP config, inject the config dir for Docker mode
-    if agent.mcp_config and agent.mcp_config.get("servers"):
+    if mcp_config.get("servers"):
         import os as _os
         base = _os.environ.get("AW_BASE_DIR", "/opt/agentic-workspace")
         mcp_dir = f"{base}/data/agents-platform/{agent.id}"
@@ -55,7 +70,6 @@ def _agent_to_runtime(s: Session, agent: Agent) -> dict[str, Any]:
     params["agent_id"] = agent.id
     # Resolve inherited system_prompt and extra_volumes (one level deep — no recursive loops)
     system_prompt = agent.system_prompt or ""
-    extra_volumes = list(agent.extra_volumes or [])
     if agent.inherit_from:
         parent = s.query(Agent).filter(Agent.slug == agent.inherit_from,
                                        Agent.deleted_at.is_(None)).first()
@@ -63,26 +77,44 @@ def _agent_to_runtime(s: Session, agent: Agent) -> dict[str, Any]:
             if not system_prompt:
                 system_prompt = parent.system_prompt or ""
             # Prepend parent volumes; child volumes take precedence (dedup by container path)
-            parent_vols = list(parent.extra_volumes or [])
+            _, parent_vols, _ = _resolve_agent_config(s, parent)
             seen_container = {v.split(":", 1)[-1] for v in extra_volumes}
             for pv in parent_vols:
                 container = pv.split(":", 1)[-1]
                 if container not in seen_container:
                     extra_volumes.insert(0, pv)
-    # Resolve agent permissions into additional volume mounts
-    _perm_volumes: dict[str, str] = {
+    # Resolve agent permissions into additional volume mounts.
+    # Values are either a single "host:container[:opts]" string or a list of them.
+    import os as _os
+    _aw_base = _os.environ.get("AW_BASE_DIR", "/opt/agentic-workspace")
+    _data_home = _os.path.join(_aw_base, "data", "home")
+    _perm_volumes: dict[str, str | list[str]] = {
         "docker": "/var/run/docker.sock:/var/run/docker.sock",
-        "github": "/home/ubuntu/.ssh:/home/ubuntu/.ssh:ro",
+        "github": [
+            v for v in [
+                f"{_data_home}/.gitconfig:/home/ubuntu/.gitconfig:ro"
+                if _os.path.exists(f"{_data_home}/.gitconfig") else None,
+                f"{_data_home}/.config/gh:/home/ubuntu/.config/gh:ro"
+                if _os.path.exists(f"{_data_home}/.config/gh") else None,
+            ] if v
+        ],
     }
     seen_container = {v.split(":", 1)[-1] for v in extra_volumes}
-    for perm, vol in _perm_volumes.items():
-        if (agent.permissions or {}).get(perm):
-            container = vol.split(":", 1)[-1]
-            if container not in seen_container:
-                extra_volumes.append(vol)
-                seen_container.add(container)
+    for perm, vol_or_list in _perm_volumes.items():
+        if permissions.get(perm):
+            vols = [vol_or_list] if isinstance(vol_or_list, str) else vol_or_list
+            for vol in vols:
+                container = vol.split(":", 1)[-1].split(":")[0]
+                if container not in seen_container:
+                    extra_volumes.append(vol)
+                    seen_container.add(container)
     if extra_volumes:
         params["extra_volumes"] = extra_volumes
+    # share_network: join aw-sandbox's docker netns instead of the default bridge,
+    # so 127.0.0.1 reaches awserv/redis/postgres/the agents-platform backend itself.
+    # Defaults ON (unlike other opt-in perms) per current rollout — flip to False
+    # per-agent via the "Share network" permission checkbox to opt a given agent out.
+    params["share_network"] = bool(permissions.get("share_network", True))
     return {"provider": provider, "model_id": model_id, "model_slug": model_slug,
             "params": params,
             "system_prompt": system_prompt,
@@ -213,6 +245,13 @@ async def run_agent(
                               "parent_run_id": parent_run_id}, node=node_id or agent_slug)
 
     text = ""
+    # The concluding answer — the assistant text emitted AFTER the last tool
+    # call. Progress narration between tool calls ("Let me search…", "Perfect!
+    # Now…") is process, not answer, and would flood a Telegram chat if each
+    # were delivered as its own bubble. We reset this on every tool_call so only
+    # the trailing message survives; `text` keeps the full transcript for the
+    # run history / View Progress.
+    reply_text = ""
     tin = tout = 0
     cost = 0.0
     err: str | None = None
@@ -286,6 +325,7 @@ async def run_agent(
                     cancel_check=lambda: is_cancelled(run_id) or is_cancelled(event_run_id) or is_cancelled(parent_run_id),
                 )
                 text = res.text
+                reply_text = res.text
                 tin = max(tin, res.tokens_in)
                 tout = max(tout, res.tokens_out)
                 cost = max(cost, res.cost_usd)
@@ -298,6 +338,11 @@ async def run_agent(
                     meta_payload = getattr(chunk, "meta_payload", None)
                     if meta_kind:
                         await emit(meta_kind, meta_payload or {}, node=node_id or agent_slug)
+                        # A new tool call means everything narrated so far was
+                        # progress, not the final answer — drop it so only the
+                        # post-last-tool message reaches Telegram.
+                        if meta_kind == "tool_call":
+                            reply_text = ""
                         # Persist session_id from system.init so callers can resume later.
                         if meta_kind == "system.init" and meta_payload and run_id:
                             if _t_system_init is None:
@@ -317,6 +362,7 @@ async def run_agent(
                         if _t_first_token is None:
                             _t_first_token = _time.perf_counter()
                         text += chunk.delta
+                        reply_text += chunk.delta
                         await emit("llm_token", {"delta": chunk.delta}, node=node_id or agent_slug)
                     if chunk.tokens_in:
                         tin = max(tin, chunk.tokens_in)
@@ -433,7 +479,11 @@ async def run_agent(
             _timing["run_total_s"],
         )
 
-    return {"run_id": run_id, "text": text, "status": status, "error": err,
+    # `reply` = concluding answer only (for chat delivery); `text` = full
+    # transcript (for storage / progress). Fall back to full text if the run
+    # ended on a tool call with no trailing message.
+    return {"run_id": run_id, "text": text, "reply": (reply_text.strip() or text),
+            "status": status, "error": err,
             "tokens_in": tin, "tokens_out": tout, "cost_usd": cost, "timing": _timing}
 
 

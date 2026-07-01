@@ -253,7 +253,7 @@ export default function RunDetail() {
         </div>
       )}
 
-      <div className="grid grid-cols-4 gap-4 mb-4">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
         <Stat label="status">{<StatusBadge status={run.status} />}</Stat>
         <Stat label="started">{new Date(run.started_at).toLocaleString()}</Stat>
         <Stat label="tokens">{run.tokens_in} in / {run.tokens_out} out</Stat>

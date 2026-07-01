@@ -4,13 +4,13 @@ export default function Page({
   title, subtitle, actions, children,
 }: { title: ReactNode; subtitle?: ReactNode; actions?: ReactNode; children: ReactNode }) {
   return (
-    <div className="p-6 max-w-[1400px] mx-auto">
-      <header className="flex items-end justify-between border-b border-line pb-4 mb-6">
+    <div className="p-4 md:p-6 max-w-[1400px] mx-auto">
+      <header className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between border-b border-line pb-4 mb-6">
         <div>
           <h1 className="text-2xl font-semibold text-accent m-0">{title}</h1>
           {subtitle && <div className="text-sm text-muted mt-1">{subtitle}</div>}
         </div>
-        <div className="flex items-center gap-2">{actions}</div>
+        <div className="flex items-center gap-2 flex-wrap">{actions}</div>
       </header>
       {children}
     </div>

@@ -36,6 +36,7 @@ class AgentIn(BaseModel):
     description: str = ""
     system_prompt: str = ""
     inherit_from: str | None = None  # slug of parent agent to inherit system_prompt from
+    agent_config_slug: str | None = None  # slug of an AgentConfig bundling permissions/volumes/mcp
     use_cases: list[str] = []
     model_slug: str | None = None
     tool_specs: list[Any] = []
@@ -53,6 +54,7 @@ class AgentUpdate(BaseModel):
     description: str | None = None
     system_prompt: str | None = None
     inherit_from: str | None = None
+    agent_config_slug: str | None = None
     use_cases: list[str] | None = None
     model_slug: str | None = None
     tool_specs: list[Any] | None = None
@@ -71,6 +73,7 @@ class AgentOut(_Base):
     description: str
     system_prompt: str
     inherit_from: str | None = None
+    agent_config_slug: str | None = None
     use_cases: list[str] = []
     model_slug: str | None
     tool_specs: list[Any]
@@ -81,6 +84,36 @@ class AgentOut(_Base):
     permissions: dict[str, Any] = {}
     icon: str
     color: str
+    deleted_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+# ----- agent configs -----
+class AgentConfigIn(BaseModel):
+    slug: str | None = None  # auto-generated from name if omitted
+    name: str
+    description: str = ""
+    mcp_config: dict[str, Any] = {}
+    extra_volumes: list[str] = []
+    permissions: dict[str, Any] = {}
+
+
+class AgentConfigUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    mcp_config: dict[str, Any] | None = None
+    extra_volumes: list[str] | None = None
+    permissions: dict[str, Any] | None = None
+
+
+class AgentConfigOut(_Base):
+    slug: str
+    name: str
+    description: str
+    mcp_config: dict[str, Any] = {}
+    extra_volumes: list[str] = []
+    permissions: dict[str, Any] = {}
     deleted_at: datetime | None = None
     created_at: datetime
     updated_at: datetime

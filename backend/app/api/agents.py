@@ -49,9 +49,15 @@ def _inject_gateway_token(cfg: dict) -> dict:
     return updated
 
 
-def _write_agent_mcp_config(agent: Agent, cli: str | None = None) -> None:
+def _write_agent_mcp_config(agent: Agent, cli: str | None = None, s: Session | None = None) -> None:
     """Generate CLI-specific MCP config files in data/agents-platform/{agent.id}/."""
     mcp = agent.mcp_config or {}
+    if agent.agent_config_slug and s is not None:
+        from ..models import AgentConfig
+        cfg = s.query(AgentConfig).filter(AgentConfig.slug == agent.agent_config_slug,
+                                          AgentConfig.deleted_at.is_(None)).first()
+        if cfg:
+            mcp = cfg.mcp_config or {}
     servers: dict = mcp.get("servers") or {}
     if not servers:
         return
@@ -157,7 +163,7 @@ def create_agent(body: AgentIn, s: Session = Depends(get_session)):
     s.add(a)
     s.commit()
     s.refresh(a)
-    _write_agent_mcp_config(a)
+    _write_agent_mcp_config(a, s=s)
     return a
 
 
@@ -172,7 +178,7 @@ def update_agent(slug: str, body: AgentUpdate, s: Session = Depends(get_session)
         setattr(a, k, v)
     s.commit()
     s.refresh(a)
-    _write_agent_mcp_config(a)
+    _write_agent_mcp_config(a, s=s)
     return a
 
 

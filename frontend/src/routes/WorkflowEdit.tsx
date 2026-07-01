@@ -377,8 +377,8 @@ export default function WorkflowEdit() {
       {mode === "run" && !isNew && (
         <>
           <div className="text-xs font-mono text-muted mb-3">{wf.slug}</div>
-          <div className="grid grid-cols-3 gap-4">
-            <div className="col-span-2 card p-0 overflow-hidden" style={{ height: 480 }} data-testid="workflow-graph">
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+            <div className="lg:col-span-2 card p-0 overflow-hidden" style={{ height: 480 }} data-testid="workflow-graph">
               <ReactFlow nodes={rfNodes} edges={rfEdges} fitView proOptions={{ hideAttribution: true }}>
                 <Background gap={20} size={1} color="#21262d" />
                 <Controls showInteractive={false} />
@@ -543,8 +543,8 @@ export default function WorkflowEdit() {
             </div>
 
             {editorMode === "visual" ? (
-              <div className="grid grid-cols-3 gap-3">
-                <div className="col-span-2 card p-0 overflow-hidden" style={{ height: 360 }}
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+                <div className="lg:col-span-2 card p-0 overflow-hidden" style={{ height: 360 }}
                      data-testid="workflow-canvas">
                   <ReactFlow
                     nodes={rfNodes}

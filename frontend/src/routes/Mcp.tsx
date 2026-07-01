@@ -101,7 +101,7 @@ export default function McpPage() {
               </div>
             </div>
             {srv.discovered_tools.length > 0 && (
-              <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
+              <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 text-xs">
                 {srv.discovered_tools.map((t: any) => (
                   <div key={t.name} className="border border-line rounded p-2">
                     <div className="font-mono">{t.name}</div>

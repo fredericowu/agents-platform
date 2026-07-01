@@ -45,11 +45,28 @@ class Agent(Base):
     params: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)     # {temperature, max_tokens, ...}
     mcp_config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict) # {servers: {name: {type, url, headers}}}
     extra_volumes: Mapped[list[str]] = mapped_column(JSON, default=list)   # ["host:container", ...] extra -v flags for docker run
-    permissions: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)  # {"docker": true, "github": true}
+    permissions: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)  # {"docker": true, "github": true, "share_network": false}  — share_network defaults True unless explicitly false
     inherit_from: Mapped[str | None] = mapped_column(String, nullable=True)  # slug of parent agent to inherit system_prompt from
+    agent_config_slug: Mapped[str | None] = mapped_column(String, nullable=True)  # slug of an AgentConfig — when set, its permissions/extra_volumes/mcp_config win over the columns above
     builtin: Mapped[bool] = mapped_column(Boolean, default=False)
     icon: Mapped[str] = mapped_column(String, default="bot")
     color: Mapped[str] = mapped_column(String, default="#58a6ff")
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class AgentConfig(Base):
+    """Reusable bundle of Permissions + Extra volumes + MCP servers. Agents pick
+    one via ``Agent.agent_config_slug`` instead of duplicating this config inline."""
+    __tablename__ = "agent_configs"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    slug: Mapped[str] = mapped_column(String, unique=True, index=True)
+    name: Mapped[str] = mapped_column(String)
+    description: Mapped[str] = mapped_column(Text, default="")
+    mcp_config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    extra_volumes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    permissions: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)

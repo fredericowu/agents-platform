@@ -111,6 +111,7 @@ export default function Sessions() {
           No sessions yet. Sessions appear here when a CLI run captures a <code>session_id</code>.
         </div>
       ) : (
+        <div className="overflow-x-auto">
         <table className="w-full text-sm">
           <thead className="text-muted text-xs uppercase tracking-wide">
             <tr>
@@ -164,6 +165,7 @@ export default function Sessions() {
             ))}
           </tbody>
         </table>
+        </div>
       )}
     </Page>
   );

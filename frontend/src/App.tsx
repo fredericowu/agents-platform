@@ -1,9 +1,12 @@
-import { useEffect } from "react";
-import { NavLink, Route, Routes, Navigate, useSearchParams } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { NavLink, Route, Routes, Navigate, useSearchParams, useLocation } from "react-router-dom";
 import { wsManager } from "./lib/ws";
+import { Menu, X } from "lucide-react";
 import Dashboard from "./routes/Dashboard";
 import Agents from "./routes/Agents";
 import AgentEdit from "./routes/AgentEdit";
+import AgentConfigs from "./routes/AgentConfigs";
+import AgentConfigEdit from "./routes/AgentConfigEdit";
 import Workflows from "./routes/Workflows";
 import WorkflowEdit from "./routes/WorkflowEdit";
 import Playground from "./routes/Playground";
@@ -23,7 +26,7 @@ import Sessions from "./routes/Sessions";
 import {
   LayoutDashboard, Bot, Workflow as WfIcon, MessageCircle,
   Activity, Cpu, Plug, Sparkles, GaugeCircle, Settings as SettingsIcon,
-  Crosshair, BookOpen, Send, Monitor, TerminalSquare,
+  Crosshair, BookOpen, Send, Monitor, TerminalSquare, Settings2,
 } from "lucide-react";
 
 const NAV = [
@@ -31,6 +34,7 @@ const NAV = [
   { path: "/targets", label: "Targets", icon: Crosshair },
   { path: "/lessons", label: "Lessons", icon: BookOpen },
   { path: "/agents", label: "Agents", icon: Bot },
+  { path: "/agent-configs", label: "Agents Config", icon: Settings2 },
   { path: "/workflows", label: "Workflows", icon: WfIcon },
   { path: "/playground", label: "Playground", icon: MessageCircle },
   { path: "/runs", label: "Runs", icon: Activity },
@@ -49,41 +53,86 @@ export default function App() {
   // ?view=telegram hides the sidebar so a single run fills the viewport.
   const [params] = useSearchParams();
   const embedded = params.get("view") === "telegram";
+  const [navOpen, setNavOpen] = useState(false);
+  const location = useLocation();
 
   useEffect(() => {
     wsManager.connect();
     return () => wsManager.disconnect();
   }, []);
 
+  // Close the mobile drawer whenever the route changes.
+  useEffect(() => {
+    setNavOpen(false);
+  }, [location.pathname]);
+
+  const navLinks = (
+    <nav className="flex-1 py-2 overflow-y-auto">
+      {NAV.map(({ path, label, icon: Icon, exact }) => (
+        <NavLink
+          key={path}
+          to={path}
+          end={!!exact}
+          className={({ isActive }) =>
+            `flex items-center gap-3 px-4 py-3 md:py-2 text-sm border-l-2 ${
+              isActive
+                ? "border-accent text-fg bg-bg-3/60"
+                : "border-transparent text-muted hover:text-fg hover:bg-bg-3/40"
+            }`
+          }
+        >
+          <Icon size={16} /> {label}
+        </NavLink>
+      ))}
+    </nav>
+  );
+
   return (
-    <div className="flex h-full">
+    <div className="flex flex-col md:flex-row h-full">
       {!embedded && (
-      <aside className="w-56 border-r border-line bg-bg-2 flex flex-col">
-        <nav className="flex-1 py-2">
-          {NAV.map(({ path, label, icon: Icon, exact }) => (
-            <NavLink
-              key={path}
-              to={path}
-              end={!!exact}
-              className={({ isActive }) =>
-                `flex items-center gap-3 px-4 py-2 text-sm border-l-2 ${
-                  isActive
-                    ? "border-accent text-fg bg-bg-3/60"
-                    : "border-transparent text-muted hover:text-fg hover:bg-bg-3/40"
-                }`
-              }
-            >
-              <Icon size={16} /> {label}
-            </NavLink>
-          ))}
-        </nav>
-      </aside>
+      <>
+        {/* Mobile top bar with hamburger toggle */}
+        <div className="md:hidden flex items-center justify-between px-4 py-3 border-b border-line bg-bg-2">
+          <button
+            type="button"
+            aria-label={navOpen ? "Close navigation" : "Open navigation"}
+            onClick={() => setNavOpen(v => !v)}
+            className="text-fg p-1 -ml-1"
+          >
+            {navOpen ? <X size={22} /> : <Menu size={22} />}
+          </button>
+          <span className="text-sm font-semibold text-accent">
+            {NAV.find(n => (n.exact ? location.pathname === n.path : location.pathname.startsWith(n.path)))?.label ?? "Agents Platform"}
+          </span>
+          <span className="w-[22px]" />
+        </div>
+
+        {/* Desktop sidebar */}
+        <aside className="hidden md:flex w-56 shrink-0 border-r border-line bg-bg-2 flex-col">
+          {navLinks}
+        </aside>
+
+        {/* Mobile drawer overlay */}
+        {navOpen && (
+          <div className="md:hidden fixed inset-0 z-50 flex">
+            <div className="w-64 max-w-[80vw] bg-bg-2 border-r border-line flex flex-col">
+              {navLinks}
+            </div>
+            <div
+              className="flex-1 bg-black/50"
+              onClick={() => setNavOpen(false)}
+            />
+          </div>
+        )}
+      </>
       )}
-      <main className="flex-1 overflow-auto">
+      <main className="flex-1 overflow-auto min-w-0">
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/agents" element={<Agents />} />
           <Route path="/agents/:slug" element={<AgentEdit />} />
+          <Route path="/agent-configs" element={<AgentConfigs />} />
+          <Route path="/agent-configs/:slug" element={<AgentConfigEdit />} />
           <Route path="/workflows" element={<Workflows />} />
           <Route path="/workflows/:slug" element={<WorkflowEdit />} />
           <Route path="/playground" element={<Playground />} />

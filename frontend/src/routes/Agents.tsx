@@ -56,7 +56,7 @@ export default function Agents() {
                onChange={e => setFilter(e.target.value)}
                data-testid="agents-filter" />
       </div>
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
         {filtered.map(a => (
           <div key={a.slug} className="card hover:border-accent transition-colors relative"
                data-testid={`agent-card-${a.slug}`}>

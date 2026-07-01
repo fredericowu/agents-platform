@@ -22,30 +22,32 @@ export default function Dashboard() {
 
   return (
     <Page title="Dashboard" subtitle="At-a-glance overview of the platform">
-      <div className="grid grid-cols-4 gap-4 mb-6">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
         <Metric label="Agents" value={agents.length} link="/agents" />
         <Metric label="Workflows" value={wfs.length} link="/workflows" />
         <Metric label="Models" value={models.length} link="/models" />
         <Metric label="MCP servers" value={mcp.length} link="/mcp" />
       </div>
 
-      <section className="grid grid-cols-2 gap-4">
+      <section className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div className="card" data-testid="recent-runs">
           <h2 className="text-base font-semibold mb-3">Recent runs</h2>
           {runs.length === 0 && <div className="text-muted text-sm">no runs yet — try the playground</div>}
-          <table className="w-full text-sm">
-            <tbody>
-              {runs.map(r => (
-                <tr key={r.id} className="border-b border-line last:border-0">
-                  <td className="py-2 pr-2"><Link to={`/runs/${r.id}`} className="font-mono">{r.id.slice(0, 8)}</Link></td>
-                  <td className="py-2 pr-2"><span className="badge badge-info">{r.kind}</span></td>
-                  <td className="py-2 pr-2">{r.target_slug}</td>
-                  <td className="py-2 pr-2"><StatusBadge status={r.status} /></td>
-                  <td className="py-2 pr-2 text-muted text-right">{r.tokens_in}/{r.tokens_out} tok</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <tbody>
+                {runs.map(r => (
+                  <tr key={r.id} className="border-b border-line last:border-0">
+                    <td className="py-2 pr-2"><Link to={`/runs/${r.id}`} className="font-mono">{r.id.slice(0, 8)}</Link></td>
+                    <td className="py-2 pr-2"><span className="badge badge-info">{r.kind}</span></td>
+                    <td className="py-2 pr-2">{r.target_slug}</td>
+                    <td className="py-2 pr-2"><StatusBadge status={r.status} /></td>
+                    <td className="py-2 pr-2 text-muted text-right">{r.tokens_in}/{r.tokens_out} tok</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
 
         <div className="card">
@@ -60,7 +62,7 @@ export default function Dashboard() {
         </div>
       </section>
 
-      <section className="mt-6 grid grid-cols-2 gap-4">
+      <section className="mt-6 grid grid-cols-1 md:grid-cols-2 gap-4">
         <div className="card">
           <h2 className="text-base font-semibold mb-3">Workflows ({wfs.length})</h2>
           <ul className="space-y-1 text-sm">
