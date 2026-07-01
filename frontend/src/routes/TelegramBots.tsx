@@ -1,5 +1,4 @@
 import { Fragment, useEffect, useState } from "react";
-import Page from "../components/Page";
 import Modal, { FormRow } from "../components/Modal";
 import { api, type TelegramBot, type TelegramBotSession, type Agent } from "../lib/api";
 
@@ -116,15 +115,13 @@ export default function TelegramBots() {
   }
 
   return (
-    <Page
-      title="Telegram Bots"
-      subtitle={`${list.length} bot(s) configured`}
-      actions={
+    <div>
+      <div className="flex items-center justify-between mb-4">
+        <div className="text-sm text-muted">{list.length} bot(s) configured</div>
         <button className="btn btn-primary" onClick={openCreate}>
           + new bot
         </button>
-      }
-    >
+      </div>
       <div className="card overflow-x-auto">
         <table className="w-full text-sm">
           <thead>
@@ -369,6 +366,6 @@ export default function TelegramBots() {
           </label>
         </FormRow>
       </Modal>
-    </Page>
+    </div>
   );
 }

@@ -20,13 +20,12 @@ import SkillsPage from "./routes/Skills";
 import Evals from "./routes/Evals";
 import Settings from "./routes/Settings";
 import Lessons from "./routes/Lessons";
-import TelegramBots from "./routes/TelegramBots";
 import RemoteAgents from "./routes/RemoteAgents";
 import Sessions from "./routes/Sessions";
 import {
   LayoutDashboard, Bot, Workflow as WfIcon, MessageCircle,
   Activity, Cpu, Plug, Sparkles, GaugeCircle, Settings as SettingsIcon,
-  Crosshair, BookOpen, Send, Monitor, TerminalSquare, Settings2,
+  Crosshair, BookOpen, Monitor, TerminalSquare, Settings2,
 } from "lucide-react";
 
 const NAV = [
@@ -42,7 +41,6 @@ const NAV = [
   { path: "/models", label: "Models", icon: Cpu },
   { path: "/mcp", label: "MCP", icon: Plug },
   { path: "/skills", label: "Skills", icon: Sparkles },
-  { path: "/telegram", label: "Telegram", icon: Send },
   { path: "/sessions", label: "Sessions", icon: TerminalSquare },
   { path: "/remote-agents", label: "Remote Agents", icon: Monitor },
   { path: "/settings", label: "Settings", icon: SettingsIcon },
@@ -145,7 +143,6 @@ export default function App() {
           <Route path="/models" element={<Models />} />
           <Route path="/mcp" element={<McpPage />} />
           <Route path="/skills" element={<SkillsPage />} />
-          <Route path="/telegram" element={<TelegramBots />} />
           <Route path="/sessions" element={<Sessions />} />
           <Route path="/remote-agents" element={<RemoteAgents />} />
           <Route path="/settings" element={<Settings />} />

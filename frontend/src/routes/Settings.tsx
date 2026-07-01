@@ -2,6 +2,8 @@ import React, { useEffect, useState } from "react";
 import { Laptop2, Trash2, Check, Copy, Eye, EyeOff, RefreshCcw, FolderOpen, FileText, Play } from "lucide-react";
 import Page from "../components/Page";
 import { FormRow } from "../components/Modal";
+import Tabs from "../components/Tabs";
+import TelegramBots from "./TelegramBots";
 import { api, type PlatformSettings, type RagHealth, type RagProviderConfig } from "../lib/api";
 
 const OPENAI_VOICE_OPTIONS = [
@@ -206,18 +208,8 @@ export default function Settings() {
   const isDefaultMode    = s.security_mode === s._defaults?.security_mode;
   const isDefaultTimeout = s.command_timeout_seconds === s._defaults?.command_timeout_seconds;
 
-  return (
-    <Page
-      title="Settings"
-      subtitle="Platform-wide defaults. Agents can override the security mode in their own params."
-      actions={
-        <button className="btn btn-danger" onClick={reset} disabled={!!saving}
-                data-testid="settings-reset">reset all to defaults</button>
-      }
-    >
-      {error && <div className="codebox text-err mb-3" data-testid="settings-error">{error}</div>}
-      {msg   && <div className="codebox text-ok mb-3"  data-testid="settings-msg">{msg}</div>}
-
+  const geralTab = (
+    <>
       {/* ─────── Command execution ─────── */}
       <div className="card mb-4">
         <h2 className="text-base font-semibold mb-1">Command execution</h2>
@@ -310,6 +302,11 @@ export default function Settings() {
         </div>
       </div>
 
+    </>
+  );
+
+  const vozTab = (
+    <>
       {/* ─────── Voice & STT ─────── */}
       <div className="card mb-4" data-testid="settings-voice">
         <h2 className="text-base font-semibold mb-1">Voice & STT</h2>
@@ -422,6 +419,11 @@ export default function Settings() {
         )}
       </div>
 
+    </>
+  );
+
+  const integracoesTab = (
+    <>
       {/* ─────── RAG Provider ─────── */}
       <div className="card mb-4">
         <h2 className="text-base font-semibold mb-1">RAG Provider (knowledge-base backend for lessons)</h2>
@@ -581,7 +583,11 @@ export default function Settings() {
           )}
         </div>
       </div>
+    </>
+  );
 
+  const remoteAgentsTab = (
+    <>
       {/* ─────── Remote Agents ─────── */}
       <div className="card mb-4">
         <h2 className="text-base font-semibold mb-1">Remote Agents</h2>
@@ -656,7 +662,11 @@ export default function Settings() {
           </div>
         </div>
       </div>
+    </>
+  );
 
+  const retroScoringTab = (
+    <>
       {/* ─────── Retro-Score Weights ─────── */}
       <div className="card mb-4" data-testid="settings-retro-weights">
         <h2 className="text-base font-semibold mb-1">Retro-Score Weights</h2>
@@ -700,6 +710,32 @@ export default function Settings() {
           )}
         </div>
       </div>
+    </>
+  );
+
+  return (
+    <Page
+      title="Settings"
+      subtitle="Platform-wide defaults. Agents can override the security mode in their own params."
+      actions={
+        <button className="btn btn-danger" onClick={reset} disabled={!!saving}
+                data-testid="settings-reset">reset all to defaults</button>
+      }
+    >
+      {error && <div className="codebox text-err mb-3" data-testid="settings-error">{error}</div>}
+      {msg   && <div className="codebox text-ok mb-3"  data-testid="settings-msg">{msg}</div>}
+
+      <Tabs
+        defaultTab="geral"
+        tabs={[
+          { id: "geral", label: "Geral", content: geralTab },
+          { id: "voz", label: "Voz", content: vozTab },
+          { id: "telegram", label: "Telegram", content: <TelegramBots /> },
+          { id: "integracoes", label: "Integrações", content: integracoesTab },
+          { id: "remote-agents", label: "Remote Agents", content: remoteAgentsTab },
+          { id: "retro-scoring", label: "Retro Scoring", content: retroScoringTab },
+        ]}
+      />
     </Page>
   );
 }
