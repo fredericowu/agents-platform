@@ -204,6 +204,19 @@ def build_docker_argv(
             argv.extend(["-w", c])
             _cwd_set = True
 
+    # Always mount the aw venv, readonly, at the same absolute path — independent
+    # of "workspace access" (which only controls whether the repo *source* is
+    # bind-mounted). Agents need `.venv/aw/bin/python` to run workspace tooling
+    # (e.g. the agents-platform CLI) even when the repo mount is off. Skipped when
+    # BASE_DIR itself is already bind-mounted (workspace access on), since .venv
+    # comes along with it — mounting it again would be a harmless but redundant flag.
+    base_already_mounted = any(
+        Path(parse_mount(raw)[0]).resolve() == BASE_DIR.resolve() for raw in mounts
+    )
+    venv_host = BASE_DIR / ".venv"
+    if not base_already_mounted and venv_host.is_dir():
+        add_mount(str(venv_host), str(BASE_DIR / ".venv"), readonly=True)
+
     # Optional: workspace skills
     if skills:
         skills_host = BASE_DIR / "skills"

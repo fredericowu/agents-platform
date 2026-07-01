@@ -313,6 +313,14 @@ export type TelegramBot = {
   admin_user_ids: string[];
 };
 
+export type TelegramBotSession = {
+  chat_id: string;
+  agent_slug: string | null;
+  is_override: boolean;
+  session_id: string | null;
+  updated_at: string | null;
+};
+
 export type ConsolidationCluster = {
   confidence: number;
   lessons: Lesson[];
@@ -589,6 +597,8 @@ export const api = {
     call<void>(`/api/telegram/bots/${id}`, { method: "DELETE" }),
   registerTelegramWebhook: (id: string) =>
     call<{ ok: boolean; message: string }>(`/api/telegram/bots/${id}/register-webhook`, { method: "POST" }),
+  listTelegramBotSessions: (id: string) =>
+    call<TelegramBotSession[]>(`/api/telegram/bots/${id}/sessions`),
 };
 
 // SSE helper

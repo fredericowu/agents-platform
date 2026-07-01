@@ -1290,6 +1290,137 @@ def _handle_approval_callback(cq_id: str, cq_data: str, chat_id: str, bot_token:
 
 
 # ---------------------------------------------------------------------------
+# Kanban approval flow (aw-system-analyst daily findings)
+# ---------------------------------------------------------------------------
+# Ported from awserv src/api/kanban_manager.py so Telegram is owned entirely by
+# AP. awserv POSTs findings to /api/telegram/kanban/notify; AP sends the inline
+# keyboard via the sysadmin bot and handles the aw_kanban: callback here
+# (execute → update Notion status + fire the agent run; skip → edit message).
+# ---------------------------------------------------------------------------
+
+_NOTION_API = "https://api.notion.com/v1"
+
+
+def _notion_cfg() -> dict:
+    """Read the notion config block from the shared aw.json (same file awserv uses)."""
+    try:
+        import json as _j
+        from ..config import settings
+        cfg_path = str(settings.workspace_root / "src" / "config" / "aw.json")
+        with open(cfg_path) as f:
+            return _j.load(f).get("notion") or {}
+    except Exception:
+        log.exception("kanban: failed to read notion cfg from aw.json")
+        return {}
+
+
+def _notion_headers() -> dict:
+    token = _notion_cfg().get("api_token", "")
+    return {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+    }
+
+
+def _kanban_cfg() -> dict:
+    return _notion_cfg().get("agents_kanban", {})
+
+
+def _kanban_get_page(page_id: str) -> dict:
+    r = httpx.get(f"{_NOTION_API}/pages/{page_id}", headers=_notion_headers(), timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+def _kanban_update_status(page_id: str, status_name: str) -> None:
+    httpx.patch(
+        f"{_NOTION_API}/pages/{page_id}",
+        headers=_notion_headers(),
+        json={"properties": {"Status": {"select": {"name": status_name}}}},
+        timeout=10,
+    )
+
+
+def _kanban_text_prop(page: dict, prop: str) -> str:
+    p = page.get("properties", {}).get(prop, {})
+    ptype = p.get("type", "")
+    if ptype == "title":
+        return "".join(t.get("plain_text", "") for t in p.get("title", []))
+    if ptype == "rich_text":
+        return "".join(t.get("plain_text", "") for t in p.get("rich_text", []))
+    return ""
+
+
+def _handle_kanban_callback(cq_id: str, cq_data: str, chat_id: str,
+                            msg_id: int | None, bot_token: str) -> None:
+    """Process an aw_kanban:execute/skip callback_query button tap.
+
+    callback_data:
+      aw_kanban:execute:{page_id}:{agent_slug}
+      aw_kanban:skip:{page_id}
+    """
+    # Always clear the Telegram spinner first
+    _answer_callback_query(bot_token, cq_id)
+
+    parts = cq_data.split(":", 3)
+    if len(parts) < 3:
+        return
+    action, page_id = parts[1], parts[2]
+    agent_slug = parts[3] if len(parts) > 3 else None
+
+    def _edit(text: str) -> None:
+        if msg_id is not None:
+            _edit_message_text(bot_token, chat_id, msg_id, text)
+
+    if action == "skip":
+        _edit("⏭ Pulado.")
+        return
+    if action != "execute":
+        return
+
+    try:
+        page = _kanban_get_page(page_id)
+        card_title = _kanban_text_prop(page, "Name")
+        target_slug = _kanban_text_prop(page, "TargetSlug") or "kanban-tasks"
+        input_text = _kanban_text_prop(page, "Input") or f"Execute task: {card_title}"
+        if not agent_slug:
+            agent_slug = _kanban_text_prop(page, "AgentSlug")
+        if not agent_slug:
+            _edit(f"❌ Card <b>{_md_to_html(card_title)}</b> não tem AgentSlug definido.")
+            return
+
+        # Move card to In Progress before firing the run
+        in_progress = _kanban_cfg().get("statuses", {}).get("running", "In Progress")
+        _kanban_update_status(page_id, in_progress)
+        log.info("kanban callback: approved %s → In Progress, firing %s", page_id, agent_slug)
+
+        # Resolve the target and fire the run through AP's own executor.
+        from ..core.executor import start_agent_run_bg
+        with session_scope() as s:
+            agent = s.query(Agent).filter(Agent.slug == agent_slug).first()
+            if not agent:
+                _edit(f"❌ Agente <code>{agent_slug}</code> não existe no Agents Platform.")
+                return
+            t = s.query(Target).filter(Target.slug == target_slug).first()
+            if t is None:
+                _edit(f"❌ Target <code>{target_slug}</code> não existe no Agents Platform.")
+                return
+            target_id = t.id
+        run_id = start_agent_run_bg(
+            agent_slug, input_text, target_id=target_id,
+            session_id=None, notion_task_id=page_id,
+        )
+        _edit(f"▶ Executando <b>{_md_to_html(card_title)}</b>\n<code>run_id: {run_id}</code>")
+    except Exception as exc:
+        log.exception("kanban callback: error for page_id=%s", page_id)
+        try:
+            _edit(f"❌ Erro: {exc}")
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Webhook receiver
 # ---------------------------------------------------------------------------
 
@@ -1462,6 +1593,16 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
                 daemon=True,
             ).start()
             return {"ok": True, "reason": "approval callback queued"}
+
+        if cq_data.startswith("aw_kanban:") and cq_chat_id:
+            # Kanban approval flow (aw-system-analyst daily findings)
+            _kb_msg_id = cq_msg.get("message_id")
+            threading.Thread(
+                target=_handle_kanban_callback,
+                args=(cq_id, cq_data, cq_chat_id, _kb_msg_id, bot.token),
+                daemon=True,
+            ).start()
+            return {"ok": True, "reason": "kanban callback queued"}
 
         if cq_data.startswith("ap_opt:") and cq_chat_id:
             # Format: ap_opt:{index}:{option_text[:32]}
@@ -1774,11 +1915,21 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
     if reply_msg and _PENDING_RENAME.get((bot_id, chat_id)) != reply_msg.get("message_id"):
         replied_text = (reply_msg.get("text") or reply_msg.get("caption") or "").strip()
         if not replied_text:
-            if reply_msg.get("voice"):
-                replied_text = "[voice message]"
-            elif reply_msg.get("audio"):
-                fname = (reply_msg["audio"].get("file_name") or "audio")
-                replied_text = f"[audio: {fname}]"
+            if reply_msg.get("voice") or reply_msg.get("audio"):
+                _quoted_file_id = ((reply_msg.get("voice") or reply_msg.get("audio")) or {}).get("file_id", "")
+                replied_text = ""
+                if _quoted_file_id:
+                    try:
+                        replied_text, _ = _transcribe_voice(bot.token, _quoted_file_id)
+                    except Exception as _e:
+                        log.warning("STT failed for quoted voice message: %s", _e)
+                if not replied_text:
+                    replied_text = "[voice transcription failed]"
+                    try:
+                        _send_message(bot.token, chat_id,
+                                      "⚠️ Could not transcribe the voice message you replied to.")
+                    except Exception:
+                        pass
             elif reply_msg.get("photo"):
                 replied_text = "[photo]"
             elif reply_msg.get("video"):
@@ -1886,6 +2037,29 @@ def delete_bot(bot_id: str, s: Session = Depends(get_session)):
     s.commit()
 
 
+@router.get("/bots/{bot_id}/sessions")
+def list_bot_sessions(bot_id: str, s: Session = Depends(get_session)):
+    """Per-chat state for this bot — which agent (default or /agent override)
+    is currently active in each chat, and whether a session is live."""
+    bot = s.query(TelegramBot).filter(TelegramBot.id == bot_id).first()
+    if not bot:
+        raise HTTPException(404, f"bot '{bot_id}' not found")
+    rows = (s.query(TelegramSession)
+            .filter(TelegramSession.bot_id == bot_id)
+            .order_by(TelegramSession.updated_at.desc())
+            .all())
+    return [
+        {
+            "chat_id": r.chat_id,
+            "agent_slug": r.agent_slug_override or bot.agent_slug,
+            "is_override": bool(r.agent_slug_override),
+            "session_id": r.session_id,
+            "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+        }
+        for r in rows
+    ]
+
+
 @router.post("/bots/{bot_id}/register-webhook")
 def register_webhook(bot_id: str, base_url: str = "", s: Session = Depends(get_session)):
     """Register this bot's webhook URL with Telegram.
@@ -1908,6 +2082,79 @@ def register_webhook(bot_id: str, base_url: str = "", s: Session = Depends(get_s
         payload["secret_token"] = bot.webhook_secret
     result = _tg(bot.token, "setWebhook", **payload)
     return {"ok": True, "webhook_url": webhook_url, "telegram": result}
+
+
+# ---------------------------------------------------------------------------
+# Kanban approval — send inline keyboard via the sysadmin bot
+# ---------------------------------------------------------------------------
+
+class KanbanFinding(BaseModel):
+    page_id: str
+    title: str = "?"
+    agent_slug: str = ""
+    priority: str = "Média"
+    finding_key: str = ""
+    occurrence_count: int = 1
+    summary: str = ""
+
+
+class KanbanNotify(BaseModel):
+    findings: list[KanbanFinding] = []
+
+
+@router.post("/kanban/notify")
+def kanban_notify(body: KanbanNotify, s: Session = Depends(get_session)):
+    """Send one Telegram approval message per finding via the sysadmin bot.
+
+    Called by awserv (src/api/kanban_manager.send_approval_batch) so Telegram
+    delivery stays entirely inside AP. Returns {ok, sent}.
+    """
+    if not body.findings:
+        return {"ok": True, "sent": 0}
+
+    bot = _sysadmin_bot(s)
+    if not bot:
+        raise HTTPException(503, "No sysadmin bot configured — set is_sysadmin on a bot")
+    admin_ids = bot.admin_user_ids or []
+    if not admin_ids:
+        raise HTTPException(503, "Sysadmin bot has no admin_user_ids configured")
+    chat_id = admin_ids[0]
+
+    prio_emoji = {"Alta": "🔴", "Média": "🟡", "Baixa": "🟢",
+                  "High": "🔴", "Medium": "🟡", "Low": "🟢"}
+
+    sent = 0
+    for f in body.findings:
+        emoji = prio_emoji.get(f.priority, "⚪")
+        occ_tag = f" · ocorrência #{f.occurrence_count}" if f.occurrence_count > 1 else ""
+        notion_url = f"https://www.notion.so/{f.page_id.replace('-', '')}"
+        raw_summary = f.summary or f.finding_key or ""
+        summary = raw_summary[:200] + ("…" if len(raw_summary) > 200 else "")
+
+        lines = [f"{emoji} <b>{_md_to_html(f.title)}</b>{occ_tag}", ""]
+        if summary:
+            lines += [f"<i>{_md_to_html(summary)}</i>", ""]
+        lines += [
+            (f"🤖 Agente: <code>{f.agent_slug}</code>" if f.agent_slug
+             else "🤖 Agente: <i>não definido</i>"),
+            f'<a href="{notion_url}">Ver card completo no Notion</a>',
+        ]
+        text = "\n".join(lines)
+        keyboard = {"inline_keyboard": [[
+            {"text": "▶ Executar",
+             "callback_data": f"aw_kanban:execute:{f.page_id}:{f.agent_slug}"},
+            {"text": "⏭ Pular",
+             "callback_data": f"aw_kanban:skip:{f.page_id}"},
+        ]]}
+        try:
+            _tg(bot.token, "sendMessage", chat_id=chat_id, text=text,
+                parse_mode="HTML", reply_markup=keyboard,
+                disable_web_page_preview=True)
+            sent += 1
+        except Exception:
+            log.exception("kanban notify: send failed for page %s", f.page_id)
+
+    return {"ok": True, "sent": sent}
 
 
 # Self-contained Mini App page. __RUN_ID__ is substituted at request time.

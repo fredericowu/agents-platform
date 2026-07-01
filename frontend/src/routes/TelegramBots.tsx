@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import Page from "../components/Page";
 import Modal, { FormRow } from "../components/Modal";
-import { api, type TelegramBot, type Agent } from "../lib/api";
+import { api, type TelegramBot, type TelegramBotSession, type Agent } from "../lib/api";
 
 const BLANK = {
   id: "", name: "", token: "", webhook_secret: "",
@@ -18,6 +18,9 @@ export default function TelegramBots() {
   const [saving, setSaving] = useState(false);
   const [webhookMsg, setWebhookMsg] = useState<Record<string, string>>({});
   const [showToken, setShowToken] = useState<Record<string, boolean>>({});
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [chatSessions, setChatSessions] = useState<Record<string, TelegramBotSession[]>>({});
+  const [loadingSessions, setLoadingSessions] = useState<Record<string, boolean>>({});
 
   async function load() {
     setList(await api.listTelegramBots());
@@ -89,6 +92,22 @@ export default function TelegramBots() {
     setShowToken(s => ({ ...s, [id]: !s[id] }));
   }
 
+  async function toggleExpanded(id: string) {
+    const next = !expanded[id];
+    setExpanded(e => ({ ...e, [id]: next }));
+    if (next) {
+      setLoadingSessions(l => ({ ...l, [id]: true }));
+      try {
+        const sessions = await api.listTelegramBotSessions(id);
+        setChatSessions(cs => ({ ...cs, [id]: sessions }));
+      } catch {
+        setChatSessions(cs => ({ ...cs, [id]: [] }));
+      } finally {
+        setLoadingSessions(l => ({ ...l, [id]: false }));
+      }
+    }
+  }
+
   function maskToken(token: string) {
     if (!token) return "—";
     const parts = token.split(":");
@@ -122,8 +141,18 @@ export default function TelegramBots() {
           </thead>
           <tbody>
             {list.map(b => (
-              <tr key={b.id} className="border-t border-line align-top">
-                <td className="py-2 pr-3 font-mono">{b.id}</td>
+              <Fragment key={b.id}>
+              <tr className="border-t border-line align-top">
+                <td className="py-2 pr-3 font-mono">
+                  <button
+                    className="text-muted hover:text-fg mr-1"
+                    title="show active chats / per-chat agent"
+                    onClick={() => toggleExpanded(b.id)}
+                  >
+                    {expanded[b.id] ? "▾" : "▸"}
+                  </button>
+                  {b.id}
+                </td>
                 <td className="py-2 pr-3">{b.name || <span className="text-muted">—</span>}</td>
                 <td className="py-2 pr-3 font-mono text-xs">
                   <span
@@ -187,6 +216,52 @@ export default function TelegramBots() {
                   </div>
                 </td>
               </tr>
+              {expanded[b.id] && (
+                <tr key={`${b.id}-chats`} className="border-t border-line bg-line/20">
+                  <td colSpan={8} className="py-2 pr-3">
+                    {loadingSessions[b.id] ? (
+                      <span className="text-xs text-muted">loading chats…</span>
+                    ) : !chatSessions[b.id]?.length ? (
+                      <span className="text-xs text-muted">No chats have messaged this bot yet.</span>
+                    ) : (
+                      <table className="w-full text-xs">
+                        <thead>
+                          <tr className="text-left text-muted uppercase">
+                            <th className="py-1 pr-3">chat id</th>
+                            <th className="py-1 pr-3">active agent</th>
+                            <th className="py-1 pr-3">session</th>
+                            <th className="py-1 pr-3">updated</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {chatSessions[b.id].map(cs => (
+                            <tr key={cs.chat_id} className="border-t border-line/50">
+                              <td className="py-1 pr-3 font-mono">{cs.chat_id}</td>
+                              <td className="py-1 pr-3">
+                                {cs.agent_slug
+                                  ? <span className="badge badge-info">{cs.agent_slug}</span>
+                                  : <span className="text-muted">—</span>}
+                                {cs.is_override && (
+                                  <span className="text-muted ml-1" title="set via /agent for this chat, overrides the bot default">
+                                    (override)
+                                  </span>
+                                )}
+                              </td>
+                              <td className="py-1 pr-3 font-mono">
+                                {cs.session_id ? `${cs.session_id.slice(0, 8)}…` : <span className="text-muted">none</span>}
+                              </td>
+                              <td className="py-1 pr-3 text-muted">
+                                {cs.updated_at ? new Date(cs.updated_at).toLocaleString() : "—"}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    )}
+                  </td>
+                </tr>
+              )}
+              </Fragment>
             ))}
             {list.length === 0 && (
               <tr>
