@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from .api import api_router
 from .config import settings
 from .core.mcp_client import sync_mcp_servers_from_file
+from .core.executor import recover_orphaned_runs
 from .db import init_db
 from .seed import seed_all
 
@@ -19,6 +20,12 @@ from .seed import seed_all
 async def lifespan(app: FastAPI):
     init_db()
     seed_all()
+    # Re-attach interrupted runs that still have a durable Redis Stream; cancel
+    # the rest. Replaces the old blind cancel-all so runs survive a restart.
+    try:
+        await recover_orphaned_runs()
+    except Exception as e:
+        print(f"[main] run recovery skipped: {e}")
     try:
         sync_mcp_servers_from_file()
     except Exception as e:

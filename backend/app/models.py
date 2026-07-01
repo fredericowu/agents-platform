@@ -45,6 +45,7 @@ class Agent(Base):
     params: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)     # {temperature, max_tokens, ...}
     mcp_config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict) # {servers: {name: {type, url, headers}}}
     extra_volumes: Mapped[list[str]] = mapped_column(JSON, default=list)   # ["host:container", ...] extra -v flags for docker run
+    permissions: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)  # {"docker": true, "github": true}
     inherit_from: Mapped[str | None] = mapped_column(String, nullable=True)  # slug of parent agent to inherit system_prompt from
     builtin: Mapped[bool] = mapped_column(Boolean, default=False)
     icon: Mapped[str] = mapped_column(String, default="bot")
@@ -385,6 +386,7 @@ class TelegramBot(Base):
     token: Mapped[str] = mapped_column(String)                          # Telegram Bot API token
     webhook_secret: Mapped[str] = mapped_column(String, default="")     # HMAC secret set on Telegram webhook
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_sysadmin: Mapped[bool] = mapped_column(Boolean, default=False)      # receives system approval prompts
     agent_slug: Mapped[str | None] = mapped_column(String, nullable=True)  # AP agent to dispatch to
     admin_user_ids: Mapped[list[str]] = mapped_column(JSON, default=list)  # allowed Telegram user IDs
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)

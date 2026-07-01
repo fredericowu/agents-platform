@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     # Database (PostgreSQL — shared aw-postgres instance)
     database_url: str = "postgresql://postgres:postgres@localhost:5432/agents_platform"
 
+    # Redis — durable event stream for CLI agent runs (aw-redis exposed on host)
+    redis_url: str = "redis://localhost:6379/0"
+
     # MCP discovery
     mcp_json_path: Path = WORKSPACE_ROOT / ".mcp.json"
     skills_path: Path = WORKSPACE_ROOT / ".claude" / "skills"

@@ -6,8 +6,13 @@ import { api, type Agent, type Model, type ToolItem, type Skill } from "../lib/a
 const BLANK: Agent = {
   slug: "", name: "", description: "", system_prompt: "",
   inherit_from: null, model_slug: "claude-cli-sonnet", tool_specs: [], skill_slugs: [],
-  params: {}, mcp_config: {}, extra_volumes: [], icon: "bot", color: "#58a6ff",
+  params: {}, mcp_config: {}, extra_volumes: [], permissions: {}, icon: "bot", color: "#58a6ff",
 };
+
+const PERMISSION_DEFS: { key: string; label: string; description: string }[] = [
+  { key: "docker", label: "Docker", description: "Mount the Docker socket — enables docker ps, docker run, etc." },
+  { key: "github", label: "GitHub / Git", description: "Mount SSH keys for git push/pull and GitHub access." },
+];
 
 export default function AgentEdit() {
   const { slug } = useParams<{ slug: string }>();
@@ -102,6 +107,7 @@ export default function AgentEdit() {
           system_prompt: a.system_prompt, inherit_from: a.inherit_from || null,
           model_slug: a.model_slug, tool_specs: a.tool_specs, skill_slugs: a.skill_slugs,
           params: a.params, mcp_config: a.mcp_config, extra_volumes: a.extra_volumes,
+          permissions: a.permissions || {},
           color: a.color, icon: a.icon,
         });
         nav(`/agents/${created.slug}`);
@@ -116,6 +122,7 @@ export default function AgentEdit() {
           inherit_from: a.inherit_from || null, model_slug: a.model_slug,
           tool_specs: a.tool_specs, skill_slugs: a.skill_slugs,
           params: a.params, mcp_config: a.mcp_config, extra_volumes: a.extra_volumes,
+          permissions: a.permissions || {},
           color: a.color, icon: a.icon,
         });
         if (targetSlug !== slug) nav(`/agents/${targetSlug}`);
@@ -393,6 +400,34 @@ export default function AgentEdit() {
                           else p.command_allowlist = lines;
                           setA({ ...a, params: p });
                         }} />
+            </div>
+          </div>
+
+          {/* ───── Permissions ───── */}
+          <div className="card">
+            <h2 className="text-base font-semibold mb-1">Permissions</h2>
+            <p className="text-xs text-muted mb-3">
+              Each permission is applied when this agent runs in a container — translated to volume mounts, environment variables, or other config as needed.
+            </p>
+            <div className="space-y-2">
+              {PERMISSION_DEFS.map(({ key, label, description }) => (
+                <label key={key} className="flex items-start gap-2 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    checked={!!(a.permissions || {})[key]}
+                    onChange={e => {
+                      const next = { ...(a.permissions || {}), [key]: e.target.checked };
+                      if (!e.target.checked) delete next[key];
+                      setA({ ...a, permissions: next });
+                    }}
+                  />
+                  <span>
+                    <span className="text-sm font-medium">{label}</span>
+                    <span className="block text-xs text-muted">{description}</span>
+                  </span>
+                </label>
+              ))}
             </div>
           </div>
 

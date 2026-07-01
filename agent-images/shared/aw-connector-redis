@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""aw-connector-redis — wraps a CLI and publishes stdout directly to a Redis Stream.
+
+Replaces the WebSocket hop: the container writes events straight into Redis so
+agents-platform consumes them via XREADGROUP without a WebSocket connection.
+
+Usage (injected by docker_agent.py when redis_mode=True):
+    aw-connector-redis <cli-binary> [cli-args...]
+
+Required env vars:
+    AW_RUN_ID      — run ID used as stream key: run:{run_id}:events
+    AW_REDIS_URL   — Redis URL (default redis://host.docker.internal:6379/0)
+
+No third-party libraries needed — uses raw RESP protocol over a TCP socket.
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import socket
+import sys
+from urllib.parse import urlparse
+
+
+class _RespClient:
+    """Minimal synchronous RESP client — just enough for XADD and EXPIRE."""
+
+    def __init__(self, host: str, port: int) -> None:
+        self._sock = socket.create_connection((host, port), timeout=10)
+        self._buf = b""
+
+    def _send(self, *args: str) -> None:
+        parts: list[bytes] = [f"*{len(args)}\r\n".encode()]
+        for a in args:
+            b = a.encode("utf-8") if isinstance(a, str) else a
+            parts.append(f"${len(b)}\r\n".encode())
+            parts.append(b)
+            parts.append(b"\r\n")
+        self._sock.sendall(b"".join(parts))
+        self._drain_reply()
+
+    def _drain_reply(self) -> None:
+        """Read and discard the server reply."""
+        data = b""
+        while True:
+            chunk = self._sock.recv(4096)
+            data += chunk
+            if b"\r\n" in data:
+                break
+        first = data.split(b"\r\n", 1)[0]
+        if first.startswith(b"$"):
+            n = int(first[1:])
+            if n >= 0:
+                needed = n + 2  # data + \r\n
+                while len(data) < len(first) + 2 + needed:
+                    data += self._sock.recv(4096)
+        elif first.startswith(b"*"):
+            # bulk array — just ignore, not used in our simple calls
+            pass
+
+    def xadd(self, key: str, fields: dict[str, str], maxlen: int = 50_000) -> None:
+        args = ["XADD", key, "MAXLEN", "~", str(maxlen), "*"]
+        for k, v in fields.items():
+            args += [k, v]
+        self._send(*args)
+
+    def expire(self, key: str, seconds: int) -> None:
+        self._send("EXPIRE", key, str(seconds))
+
+    def close(self) -> None:
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
+
+async def run() -> None:
+    run_id = os.environ.get("AW_RUN_ID", "unknown")
+    redis_url = os.environ.get("AW_REDIS_URL", "redis://host.docker.internal:6379/0")
+    cli_args = sys.argv[1:]
+
+    if not cli_args:
+        print("aw-connector-redis: no CLI args provided", file=sys.stderr)
+        sys.exit(1)
+
+    parsed = urlparse(redis_url)
+    r_host = parsed.hostname or "host.docker.internal"
+    r_port = parsed.port or 6379
+    stream_key = f"run:{run_id}:events"
+
+    try:
+        r = _RespClient(r_host, r_port)
+    except Exception as e:
+        print(f"aw-connector-redis: cannot connect to Redis at {r_host}:{r_port} ({e})",
+              file=sys.stderr)
+        sys.exit(1)
+
+    proc = await asyncio.create_subprocess_exec(
+        *cli_args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        limit=10 * 1024 * 1024,
+    )
+
+    assert proc.stdout
+    while True:
+        raw = await proc.stdout.readline()
+        if not raw:
+            break
+        line = raw.decode("utf-8", errors="replace").rstrip("\n")
+        if line:
+            try:
+                r.xadd(stream_key, {"type": "stdout", "line": line})
+            except Exception as e:
+                print(f"aw-connector-redis: XADD failed ({e})", file=sys.stderr)
+
+    rc = await proc.wait()
+    try:
+        r.xadd(stream_key, {"done": "1", "returncode": str(rc)})
+        r.expire(stream_key, 86400)
+    except Exception as e:
+        print(f"aw-connector-redis: final XADD failed ({e})", file=sys.stderr)
+    finally:
+        r.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(run())

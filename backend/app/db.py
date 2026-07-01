@@ -53,6 +53,13 @@ def init_db() -> None:
     _seed_retro_score_weights()
 
 
+# NOTE: the old cancel_orphaned_runs() was removed. Cancelling every 'running'
+# run on startup is wrong under the Redis Stream architecture — the docker agent
+# keeps publishing while the platform is down, and its events arrive once the
+# platform is back up. Startup recovery is now executor.recover_orphaned_runs(),
+# which re-attaches in-flight runs via their durable stream instead of killing them.
+
+
 def _ensure_column(conn, table: str, column: str, ddl: str) -> None:
     """Add `column` to `table` if it does not already exist. Cross-database safe."""
     from sqlalchemy import inspect as sa_inspect, text
@@ -84,7 +91,7 @@ def _apply_inline_migrations() -> None:
             if col not in existing:
                 conn.execute(text(f"ALTER TABLE runs ADD COLUMN {col} {ddl}"))
 
-    # mcp_config + inherit_from on agents
+    # mcp_config + inherit_from + permissions on agents
     if "agents" in insp.get_table_names():
         agent_cols = {c["name"] for c in insp.get_columns("agents")}
         if "mcp_config" not in agent_cols:
@@ -93,6 +100,9 @@ def _apply_inline_migrations() -> None:
         if "inherit_from" not in agent_cols:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE agents ADD COLUMN inherit_from VARCHAR"))
+        if "permissions" not in agent_cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE agents ADD COLUMN permissions JSON DEFAULT '{}'"))
 
     # soft-delete columns on agents and workflows
     for tbl in ("agents", "workflows"):
@@ -180,6 +190,10 @@ def _apply_inline_migrations() -> None:
         if "telegram_sessions" in insp.get_table_names():
             _ensure_column(conn, "telegram_sessions", "agent_slug_override",
                            "agent_slug_override VARCHAR")
+    if "telegram_bots" in insp.get_table_names():
+        with engine.begin() as conn:
+            _ensure_column(conn, "telegram_bots", "is_sysadmin",
+                           "is_sysadmin BOOLEAN NOT NULL DEFAULT FALSE")
 
     # Backfill cli_sessions from existing runs.session_id values
     if "cli_sessions" in insp.get_table_names() and "runs" in insp.get_table_names():

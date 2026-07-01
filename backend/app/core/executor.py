@@ -69,6 +69,18 @@ def _agent_to_runtime(s: Session, agent: Agent) -> dict[str, Any]:
                 container = pv.split(":", 1)[-1]
                 if container not in seen_container:
                     extra_volumes.insert(0, pv)
+    # Resolve agent permissions into additional volume mounts
+    _perm_volumes: dict[str, str] = {
+        "docker": "/var/run/docker.sock:/var/run/docker.sock",
+        "github": "/home/ubuntu/.ssh:/home/ubuntu/.ssh:ro",
+    }
+    seen_container = {v.split(":", 1)[-1] for v in extra_volumes}
+    for perm, vol in _perm_volumes.items():
+        if (agent.permissions or {}).get(perm):
+            container = vol.split(":", 1)[-1]
+            if container not in seen_container:
+                extra_volumes.append(vol)
+                seen_container.add(container)
     if extra_volumes:
         params["extra_volumes"] = extra_volumes
     return {"provider": provider, "model_id": model_id, "model_slug": model_slug,
@@ -122,11 +134,14 @@ async def run_agent(
     extra_messages: list[dict] | None = None,
     session_id: str | None = None,
     notion_task_id: str | None = None,
+    attach: bool = False,
 ) -> dict[str, Any]:
     """Run an agent and return ``{run_id, text, status, error, tokens_in, tokens_out}``.
 
     ``run_id``      attach to existing row (no parent set)
     ``event_run_id`` publish events on this id too (so workflows roll up nicely)
+    ``attach``      re-attach to an already-running container via its Redis Stream
+                    instead of launching a new one (platform-restart recovery).
     """
     # If the workflow that spawned us was already cancelled (or our own row was
     # marked while pending), bail out before spinning up an LLM subprocess.
@@ -223,6 +238,10 @@ async def run_agent(
         # Inject runtime context for session isolation and resumption.
         runtime["params"]["target_id"] = target_id
         runtime["params"]["run_id"] = run_id
+        if attach:
+            # Re-attach to the run's durable Redis Stream (CliLLM replays it
+            # instead of launching a new container).
+            runtime["params"]["attach_run_id"] = run_id
         if notion_task_id:
             runtime["params"]["notion_task_id"] = notion_task_id
         if session_id:
@@ -416,6 +435,114 @@ async def run_agent(
 
     return {"run_id": run_id, "text": text, "status": status, "error": err,
             "tokens_in": tin, "tokens_out": tout, "cost_usd": cost, "timing": _timing}
+
+
+# ---------------- restart recovery ----------------
+
+async def _reattach_run(run_id: str, agent_slug: str, user_input: str,
+                        target_id: str | None, session_id: str | None) -> None:
+    """Re-run finalisation for an interrupted agent run by replaying its Redis Stream."""
+    try:
+        await run_agent(agent_slug, user_input, run_id=run_id, target_id=target_id,
+                        session_id=session_id, attach=True)
+        _exec_log.info("re-attached run %s finalised", run_id)
+    except Exception as e:
+        _exec_log.warning("re-attach failed run=%s: %s", run_id, e)
+        # Last resort: don't leave it stuck in 'running'.
+        try:
+            with session_scope() as s:
+                r = s.query(Run).filter(Run.id == run_id).first()
+                if r and r.status == "running":
+                    r.status = "cancelled"
+                    r.error = f"re-attach failed: {e}"
+                    r.ended_at = datetime.utcnow()
+        except Exception:
+            pass
+
+
+# How long to wait for a still-booting container to create its Redis Stream
+# before concluding the run is genuinely dead. The CLI emits its first stream
+# entry (system/init) within a few seconds of `docker run`; 30s is generous
+# even under API rate-limiting, while bounding hung rows for truly-dead runs.
+_RECOVER_STREAM_GRACE_S = 30
+
+
+async def _reattach_or_wait(run_id: str, agent_slug: str, user_input: str,
+                            target_id: str | None, session_id: str | None) -> None:
+    """Re-attach a running agent run, NEVER cancelling one that may still stream.
+
+    A container launched just before the restart keeps running and keeps
+    publishing to its durable Redis Stream; its events simply arrive once the
+    platform is back up. So we re-attach as soon as the stream has any data,
+    waiting up to a grace window for a still-booting container. Only if no
+    stream ever appears (the container is genuinely gone) do we finalise the
+    row — otherwise it would be stuck 'running' forever.
+    """
+    from .redis_streams import stream_has_data
+
+    waited = 0.0
+    while waited < _RECOVER_STREAM_GRACE_S:
+        try:
+            if await stream_has_data(run_id):
+                await _reattach_run(run_id, agent_slug, user_input, target_id, session_id)
+                return
+        except Exception:
+            pass
+        await asyncio.sleep(1.0)
+        waited += 1.0
+
+    # No stream after the grace window — the container is gone, nothing will
+    # stream. Finalise so the row isn't stuck 'running' indefinitely.
+    with session_scope() as s:
+        r = s.query(Run).filter(Run.id == run_id).first()
+        if r and r.status == "running":
+            r.status = "cancelled"
+            r.error = "server restarted — no live run stream to resume"
+            r.ended_at = datetime.utcnow()
+    _exec_log.info("recovery: run %s had no stream after %ss — marked cancelled",
+                   run_id, int(_RECOVER_STREAM_GRACE_S))
+
+
+async def recover_orphaned_runs() -> None:
+    """On startup, re-attach interrupted agent runs via their durable Redis Stream.
+
+    A docker CLI agent keeps running (and keeps publishing to its Redis Stream)
+    even while the platform process is down — so on boot we re-attach instead of
+    cancelling. Each agent run is handled in its own background task that waits
+    for the stream (the container may still be booting) and replays it; a run is
+    only cancelled if no stream ever appears (container genuinely gone). Workflow
+    rows (no replayable CLI stream) are finalised immediately; their child agent
+    rows recover independently.
+    """
+    with session_scope() as s:
+        orphans = [
+            (r.id, r.source_slug, (r.input or {}).get("input", ""),
+             r.target_id, r.session_id, r.kind)
+            for r in s.query(Run).filter(Run.status == "running").all()
+        ]
+    if not orphans:
+        return
+
+    reattaching = cancelled = 0
+    for run_id, slug, user_input, target_id, session_id, kind in orphans:
+        if slug and kind == "agent":
+            # Never cancel here — hand off to a task that waits for the stream.
+            reattaching += 1
+            asyncio.create_task(
+                _reattach_or_wait(run_id, slug, user_input, target_id, session_id),
+                name=f"recover-{run_id}",
+            )
+        else:
+            with session_scope() as s:
+                r = s.query(Run).filter(Run.id == run_id).first()
+                if r and r.status == "running":
+                    r.status = "cancelled"
+                    r.error = "server restarted — run interrupted"
+                    r.ended_at = datetime.utcnow()
+            cancelled += 1
+
+    print(f"[startup] run recovery: {reattaching} agent run(s) re-attaching, "
+          f"{cancelled} non-agent cancelled")
 
 
 # ---------------- workflow execution ----------------

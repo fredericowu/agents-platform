@@ -19,6 +19,7 @@ export type Agent = {
   params: Record<string, any>;
   mcp_config: { servers?: Record<string, AgentMcpServer> };
   extra_volumes: string[];
+  permissions: Record<string, boolean>;
   icon: string;
   color: string;
 };
@@ -286,6 +287,7 @@ export type TelegramBot = {
   token: string;
   webhook_secret: string;
   enabled: boolean;
+  is_sysadmin: boolean;
   agent_slug: string | null;
   admin_user_ids: string[];
 };

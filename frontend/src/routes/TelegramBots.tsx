@@ -5,7 +5,7 @@ import { api, type TelegramBot, type Agent } from "../lib/api";
 
 const BLANK = {
   id: "", name: "", token: "", webhook_secret: "",
-  enabled: true, agent_slug: "", admin_user_ids: "",
+  enabled: true, is_sysadmin: false, agent_slug: "", admin_user_ids: "",
 };
 
 export default function TelegramBots() {
@@ -39,6 +39,7 @@ export default function TelegramBots() {
       token: b.token,
       webhook_secret: b.webhook_secret,
       enabled: b.enabled,
+      is_sysadmin: b.is_sysadmin ?? false,
       agent_slug: b.agent_slug ?? "",
       admin_user_ids: b.admin_user_ids.join(", "),
     });
@@ -53,6 +54,7 @@ export default function TelegramBots() {
         token: form.token,
         webhook_secret: form.webhook_secret,
         enabled: form.enabled,
+        is_sysadmin: form.is_sysadmin,
         agent_slug: form.agent_slug || null,
         admin_user_ids: form.admin_user_ids
           .split(",").map((s: string) => s.trim()).filter(Boolean),
@@ -113,6 +115,7 @@ export default function TelegramBots() {
               <th className="py-2 pr-3">token</th>
               <th className="py-2 pr-3">agent</th>
               <th className="py-2 pr-3">admins</th>
+              <th className="py-2 pr-3">sysadmin</th>
               <th className="py-2 pr-3">enabled</th>
               <th className="py-2 pr-3"></th>
             </tr>
@@ -138,6 +141,20 @@ export default function TelegramBots() {
                 </td>
                 <td className="py-2 pr-3 text-xs text-muted">
                   {b.admin_user_ids.length ? b.admin_user_ids.join(", ") : "—"}
+                </td>
+                <td className="py-2 pr-3">
+                  <label className="inline-flex items-center gap-1" title="System administration bot — receives secrets approval prompts">
+                    <input
+                      type="checkbox"
+                      className="w-auto"
+                      checked={b.is_sysadmin ?? false}
+                      onChange={async e => {
+                        await api.updateTelegramBot(b.id, { is_sysadmin: e.target.checked });
+                        await load();
+                      }}
+                    />
+                    <span className="text-muted text-xs">{b.is_sysadmin ? "on" : "off"}</span>
+                  </label>
                 </td>
                 <td className="py-2 pr-3">
                   <label className="inline-flex items-center gap-1">
@@ -251,6 +268,18 @@ export default function TelegramBots() {
             onChange={e => setForm({ ...form, admin_user_ids: e.target.value })}
             placeholder="1223642032, 987654321"
           />
+        </FormRow>
+
+        <FormRow label="system admin" hint="receives secrets approval prompts from SecretsFS">
+          <label className="inline-flex items-center gap-2">
+            <input
+              type="checkbox"
+              className="w-auto"
+              checked={form.is_sysadmin}
+              onChange={e => setForm({ ...form, is_sysadmin: e.target.checked })}
+            />
+            <span className="text-muted text-xs">{form.is_sysadmin ? "on" : "off"}</span>
+          </label>
         </FormRow>
 
         <FormRow label="enabled">

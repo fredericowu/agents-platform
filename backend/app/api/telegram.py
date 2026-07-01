@@ -1062,6 +1062,275 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
 
 
 # ---------------------------------------------------------------------------
+# Approval flow (human-in-the-loop secrets)
+# ---------------------------------------------------------------------------
+# Mirrors the SecretsManager in awserv but lives here so the AP can handle
+# the full cycle: send inline keyboard via the sysadmin bot, receive the
+# callback_query, call the Lambda, return the secret to the polling MCP.
+# ---------------------------------------------------------------------------
+
+import base64 as _b64
+import hashlib as _hashlib
+import json as _json_mod
+import secrets as _secrets_mod
+import time as _time_mod
+
+_APPROVAL_TIMEOUT_S = 300  # 5 min
+_SCOPE_TTL: dict[str, int] = {"one_shot": 0, "10min": 600, "60min": 3600}
+# Minimum token validity window. The scope TTL controls how long a *grant* is
+# reused; the token itself still has to survive the round-trip to the Lambda.
+# one_shot has TTL 0, so without a floor the token's `e` == now and the Lambda's
+# `time.time() > e` check rejects it as expired the instant it arrives (403).
+# Single-use is enforced by clearing secret_value after the first poll, not by `e`.
+_TOKEN_GRACE_S = 120
+
+# In-memory store: request_id → {secret_name, reason, scope, status,
+#                                 secret_value, created_at, chat_id, message_id, bot_token}
+_pending_approvals: dict[str, dict] = {}
+
+
+def _approval_cfg() -> dict:
+    """Read approval config from the shared aw.json (same file awserv uses)."""
+    try:
+        import json as _j
+        from ..config import settings  # `settings` was never imported at module scope,
+        # so the old reference raised NameError → swallowed here → empty cfg → empty
+        # hmac_key → every approval token failed the Lambda signature check (403).
+        cfg_path = str(settings.workspace_root / "src" / "config" / "aw.json")
+        with open(cfg_path) as f:
+            return _j.load(f).get("approval") or {}
+    except Exception:
+        log.exception("approval: failed to read approval cfg from aw.json")
+        return {}
+
+
+def _sysadmin_bot(s: Session) -> TelegramBot | None:
+    """Return the first enabled sysadmin bot, or None."""
+    return (
+        s.query(TelegramBot)
+        .filter(TelegramBot.is_sysadmin == True, TelegramBot.enabled == True)  # noqa: E712
+        .first()
+    )
+
+
+def _approval_make_token(secret_name: str, request_id: str, scope: str, hmac_key: str) -> str:
+    payload: dict = {
+        "n": secret_name,
+        "r": request_id,
+        "s": scope,
+        "e": int(_time_mod.time()) + max(_SCOPE_TTL.get(scope, 60), _TOKEN_GRACE_S),
+        "z": _secrets_mod.token_hex(8),
+    }
+    canonical = _json_mod.dumps(payload, sort_keys=True, separators=(",", ":"))
+    sig = hmac.new(
+        hmac_key.encode(),
+        canonical.encode(),
+        _hashlib.sha256,
+    ).hexdigest()
+    payload["sig"] = sig
+    return _b64.urlsafe_b64encode(
+        _json_mod.dumps(payload, separators=(",", ":")).encode()
+    ).decode().rstrip("=")
+
+
+def _approval_call_lambda(secret_name: str, token: str) -> str:
+    import boto3, json as _j
+    cfg = _approval_cfg()
+    kwargs: dict = {"region_name": cfg.get("aws_region") or "us-east-1"}
+    if cfg.get("aws_access_key_id") and cfg.get("aws_secret_access_key"):
+        kwargs["aws_access_key_id"] = cfg["aws_access_key_id"]
+        kwargs["aws_secret_access_key"] = cfg["aws_secret_access_key"]
+    client = boto3.client("lambda", **kwargs)
+    payload = _j.dumps({
+        "body": _j.dumps({"secret_name": secret_name, "token": token}),
+        "requestContext": {"http": {"method": "POST"}},
+    })
+    resp = client.invoke(FunctionName="aw-approval", Payload=payload.encode())
+    result = _j.loads(resp["Payload"].read())
+    body = _j.loads(result.get("body") or "{}")
+    if result.get("statusCode") != 200:
+        raise RuntimeError(f"Lambda error {result.get('statusCode')}: {body.get('error', body)}")
+    value = body.get("value")
+    if value is None:
+        raise RuntimeError(f"Lambda returned no value: {body}")
+    return value
+
+
+class ApprovalRequest(BaseModel):
+    secret_name: str
+    reason: str
+    scope: str = "one_shot"
+
+
+class ApprovalStatus(BaseModel):
+    request_id: str
+    status: str          # pending | approved | denied | expired
+    value: str | None = None
+
+
+@router.post("/approval/request", response_model=ApprovalStatus)
+def create_approval_request(body: ApprovalRequest, s: Session = Depends(get_session)):
+    """Create a human-in-the-loop approval request.
+
+    Finds the sysadmin bot, sends an inline keyboard to all its admin_user_ids,
+    returns a request_id the caller can poll via GET /approval/status/{id}.
+    """
+    bot = _sysadmin_bot(s)
+    if not bot:
+        raise HTTPException(503, "No sysadmin bot configured — set is_sysadmin on a bot")
+
+    admin_ids = bot.admin_user_ids or []
+    if not admin_ids:
+        raise HTTPException(503, "Sysadmin bot has no admin_user_ids configured")
+
+    request_id = str(uuid4())
+    now = _time_mod.time()
+    _pending_approvals[request_id] = {
+        "secret_name": body.secret_name,
+        "reason":      body.reason,
+        "scope":       body.scope,
+        "status":      "pending",
+        "secret_value": None,
+        "created_at":  now,
+        "chat_ids":    admin_ids,
+        "message_ids": {},   # chat_id → message_id
+        "bot_token":   bot.token,
+    }
+
+    text = (
+        f"🔐 *Aprovação de segredo*\n\n"
+        f"Segredo: `{body.secret_name}`\n"
+        f"Motivo: {body.reason}\n"
+        f"Escolha o escopo da liberação:"
+    )
+    # The approver picks the scope at approval time (1 use / 10 min / 60 min),
+    # like the legacy awserv flow. callback_data is limited to 64 bytes, and a
+    # uuid4 request_id is 36 chars, so the scope is encoded as a short code
+    # (1 / 10 / 60) rather than the full word — "aw_approval:approve:one_shot:<uuid>"
+    # would be 65 bytes and Telegram would silently drop the button.
+    keyboard = [[
+        {"text": "✅ 1 uso",  "callback_data": f"aw_approval:approve:1:{request_id}"},
+        {"text": "⏱ 10 min", "callback_data": f"aw_approval:approve:10:{request_id}"},
+        {"text": "⏱ 60 min", "callback_data": f"aw_approval:approve:60:{request_id}"},
+    ], [
+        {"text": "❌ Negar",   "callback_data": f"aw_approval:deny:{request_id}"},
+    ]]
+
+    for chat_id in admin_ids:
+        try:
+            result = _tg(bot.token, "sendMessage",
+                         chat_id=chat_id,
+                         text=text,
+                         parse_mode="Markdown",
+                         reply_markup={"inline_keyboard": keyboard})
+            msg_id = (result.get("result") or {}).get("message_id")
+            if msg_id:
+                _pending_approvals[request_id]["message_ids"][chat_id] = msg_id
+        except Exception:
+            log.exception("approval: failed to send keyboard to chat %s", chat_id)
+
+    return ApprovalStatus(request_id=request_id, status="pending")
+
+
+@router.get("/approval/status/{request_id}", response_model=ApprovalStatus)
+def get_approval_status(request_id: str):
+    """Poll for approval status. Approved value is returned once then cleared."""
+    entry = _pending_approvals.get(request_id)
+    if not entry:
+        raise HTTPException(404, "request_id not found or expired")
+
+    now = _time_mod.time()
+    if entry["status"] == "pending" and now - entry["created_at"] > _APPROVAL_TIMEOUT_S:
+        entry["status"] = "expired"
+
+    value = None
+    if entry["status"] == "approved":
+        value = entry.get("secret_value")
+        if entry.get("scope") == "one_shot":
+            entry["secret_value"] = None  # one-shot: clear after first read
+
+    return ApprovalStatus(request_id=request_id, status=entry["status"], value=value)
+
+
+def _handle_approval_callback(cq_id: str, cq_data: str, chat_id: str, bot_token: str) -> None:
+    """Process an aw_approval: callback_query button tap.
+
+    callback_data format (≤64 bytes):
+      aw_approval:approve:<scope_code>:<request_id>   scope_code ∈ {1,10,60}
+      aw_approval:deny:<request_id>
+    The scope is chosen by the approver via the button they tap.
+    """
+    _SCOPE_BY_CODE = {"1": "one_shot", "10": "10min", "60": "60min"}
+    parts = cq_data.split(":")
+    # parts[0]="aw_approval", parts[1]=action
+    action = parts[1] if len(parts) > 1 else ""
+    scope_override = None
+    if action == "approve" and len(parts) >= 4:
+        scope_override = _SCOPE_BY_CODE.get(parts[2])
+        request_id = ":".join(parts[3:])          # UUID may contain hyphens (not colons)
+    else:
+        request_id = ":".join(parts[2:]) if len(parts) > 2 else ""
+
+    if action not in ("approve", "deny") or not request_id:
+        _answer_callback_query(bot_token, cq_id, "❓ Formato inválido")
+        return
+
+    entry = _pending_approvals.get(request_id)
+    if not entry:
+        _answer_callback_query(bot_token, cq_id, "Pedido não encontrado ou expirado")
+        return
+    if entry["status"] != "pending":
+        _answer_callback_query(bot_token, cq_id, f"Já processado: {entry['status']}")
+        return
+
+    if action == "deny":
+        entry["status"] = "denied"
+        _answer_callback_query(bot_token, cq_id, "❌ Negado")
+        msg_id = entry["message_ids"].get(str(chat_id))
+        if msg_id:
+            _edit_message_text(bot_token, str(chat_id), msg_id,
+                               f"❌ Segredo <code>{entry['secret_name']}</code> negado.")
+        return
+
+    # approve — retrieve the actual secret value (vault-first, Lambda fallback).
+    # This mirrors the legacy awserv flow: the local vault is the source of truth
+    # when populated; the Lambda is only the fallback when the key isn't in vault.
+    try:
+        scope = scope_override or entry.get("scope") or "one_shot"
+        secret_value = None
+        try:
+            from src.api.vault_client import is_configured as _vault_on, get_secret as _vault_get
+            if _vault_on():
+                try:
+                    secret_value = _vault_get(entry["secret_name"])
+                except KeyError:
+                    pass  # not in vault — fall through to Lambda
+                except Exception:
+                    log.exception("approval: vault read failed for %s, falling back to Lambda",
+                                  entry["secret_name"])
+        except Exception:
+            pass  # vault_client unavailable in this process — Lambda only
+        if secret_value is None:
+            cfg = _approval_cfg()
+            hmac_key = cfg.get("hmac_key") or ""
+            token = _approval_make_token(entry["secret_name"], request_id, scope, hmac_key)
+            secret_value = _approval_call_lambda(entry["secret_name"], token)
+        entry["status"] = "approved"
+        entry["secret_value"] = secret_value
+        entry["scope"] = scope
+        _scope_label = {"one_shot": "1 uso", "10min": "10 min", "60min": "60 min"}.get(scope, scope)
+        _answer_callback_query(bot_token, cq_id, f"✅ Aprovado ({_scope_label})")
+        msg_id = entry["message_ids"].get(str(chat_id))
+        _edit_message_text(bot_token, str(chat_id), msg_id,
+                           f"✅ Segredo <code>{entry['secret_name']}</code> aprovado "
+                           f"(<b>{_scope_label}</b>).")
+    except Exception as exc:
+        log.exception("approval: Lambda call failed for %s", request_id)
+        entry["status"] = "denied"
+        _answer_callback_query(bot_token, cq_id, f"Erro ao buscar segredo: {exc}")
+
+
+# ---------------------------------------------------------------------------
 # Webhook receiver
 # ---------------------------------------------------------------------------
 
@@ -1225,6 +1494,15 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
         if bot.admin_user_ids and cq_user_id not in bot.admin_user_ids:
             _answer_callback_query(bot.token, cq_id)
             return {"ok": True, "reason": "not authorized"}
+
+        if cq_data.startswith("aw_approval:") and cq_chat_id:
+            # Human-in-the-loop secrets approval flow
+            threading.Thread(
+                target=_handle_approval_callback,
+                args=(cq_id, cq_data, cq_chat_id, bot.token),
+                daemon=True,
+            ).start()
+            return {"ok": True, "reason": "approval callback queued"}
 
         if cq_data.startswith("ap_opt:") and cq_chat_id:
             # Format: ap_opt:{index}:{option_text[:32]}
@@ -1482,6 +1760,7 @@ class BotIn(BaseModel):
     token: str
     webhook_secret: str = ""
     enabled: bool = True
+    is_sysadmin: bool = False
     agent_slug: str | None = None
     admin_user_ids: list[str] = []
 
@@ -1491,6 +1770,7 @@ class BotUpdate(BaseModel):
     token: str | None = None
     webhook_secret: str | None = None
     enabled: bool | None = None
+    is_sysadmin: bool | None = None
     agent_slug: str | None = None
     admin_user_ids: list[str] | None = None
 
@@ -1501,6 +1781,7 @@ class BotOut(BaseModel):
     token: str
     webhook_secret: str
     enabled: bool
+    is_sysadmin: bool
     agent_slug: str | None
     admin_user_ids: list[str]
 

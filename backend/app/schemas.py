@@ -43,6 +43,7 @@ class AgentIn(BaseModel):
     params: dict[str, Any] = {}
     mcp_config: dict[str, Any] = {}
     extra_volumes: list[str] = []
+    permissions: dict[str, Any] = {}
     icon: str = "bot"
     color: str = "#58a6ff"
 
@@ -59,6 +60,7 @@ class AgentUpdate(BaseModel):
     params: dict[str, Any] | None = None
     mcp_config: dict[str, Any] | None = None
     extra_volumes: list[str] | None = None
+    permissions: dict[str, Any] | None = None
     icon: str | None = None
     color: str | None = None
 
@@ -76,6 +78,7 @@ class AgentOut(_Base):
     params: dict[str, Any]
     mcp_config: dict[str, Any] = {}
     extra_volumes: list[str] = []
+    permissions: dict[str, Any] = {}
     icon: str
     color: str
     deleted_at: datetime | None = None

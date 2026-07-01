@@ -113,8 +113,12 @@ class CliLLM(BaseLLM):
         self.resume_run_id = resume_run_id
         self.notion_task_id = notion_task_id
         self.extra_volumes = list(extra_volumes or [])
+        # When set, astream() does NOT launch a container — it re-attaches to the
+        # run's durable Redis Stream and replays it (platform-restart recovery).
+        self.attach_run_id = _.get("attach_run_id")
 
-    def _build_argv(self, prompt: str, ws_token: str | None = None) -> list[str]:
+    def _build_argv(self, prompt: str, ws_token: str | None = None,
+                    redis_url: str | None = None) -> list[str]:
         from ..tools.docker_agent import build_docker_argv, CLI_SPECS
 
         cli = self.cli if self.cli in CLI_SPECS else "claude"
@@ -137,11 +141,21 @@ class CliLLM(BaseLLM):
         _extra_env: dict[str, str] = {}
         if self.notion_task_id:
             _extra_env["NOTION_TASK_ID"] = self.notion_task_id
+        # AW_RUN_ID is the event-transport key (Redis Stream key / WS path). It
+        # MUST be the CURRENT run's id — the consumer in astream() reads by
+        # current_run_id. NOT resume_run_id: that only drives the isolated cwd
+        # (passed as run_id= below) so the CLI can find the prior session file.
+        # Conflating them sent a resume run's events to the OLD run's stream,
+        # which the consumer never read → empty run → lost conversation memory.
         if ws_token:
-            rid = self.resume_run_id or self.run_id or current_run_id.get() or ""
+            rid = self.run_id or current_run_id.get() or ""
             _extra_env["AW_RUN_ID"] = rid
             _extra_env["AW_AGENT_TOKEN"] = ws_token
             _extra_env["AW_WS_URL"] = "ws://host.docker.internal:9123/ws/agent"
+        if redis_url:
+            rid = self.run_id or current_run_id.get() or ""
+            _extra_env["AW_RUN_ID"] = rid
+            _extra_env["AW_REDIS_URL"] = redis_url
         return build_docker_argv(
             cli=cli,
             prompt=prompt,
@@ -163,6 +177,7 @@ class CliLLM(BaseLLM):
             session_id=self.session_id,
             extra_docker_env=_extra_env or None,
             ws_mode=ws_token is not None,
+            redis_mode=redis_url is not None,
             extra_volumes=self.extra_volumes or None,
         )
 
@@ -192,47 +207,83 @@ class CliLLM(BaseLLM):
         # Opt-in legacy WS mode (AP_CLI_WS_STREAM=1): the container is wrapped
         # with aw-connector, which streams stdout back over a WebSocket into a
         # registered queue. Kept for future remote-docker / reconnect scenarios.
+        # Re-attach path: when attach_run_id is set the container is already
+        # running (or finished) and has been publishing to its durable Redis
+        # Stream. We replay that stream instead of launching a new container —
+        # this is how a run survives a platform restart.
+        attach_run_id = self.attach_run_id
+
         use_ws = os.environ.get("AP_CLI_WS_STREAM") == "1"
+        # Redis is the default durable transport (the WS hop is being retired):
+        # the container publishes straight to a Redis Stream that survives a
+        # platform restart. Set AP_CLI_REDIS_STREAM=0 to fall back to reading the
+        # container's stdout directly (no restart durability).
+        use_redis = (not use_ws) and os.environ.get("AP_CLI_REDIS_STREAM", "1") != "0"
 
         q = None
+        proc = None
+        monitor_task = None
         register_run = unregister_run = None
-        if use_ws:
+        done_event = asyncio.Event()
+
+        if attach_run_id:
+            from ..redis_streams import replay_stream_into_queue
+            q = asyncio.Queue()
+            asyncio.create_task(
+                replay_stream_into_queue(attach_run_id, q),
+                name=f"redis-replay-{attach_run_id}",
+            )
+        elif use_ws:
             ws_token = secrets.token_hex(32)
             from ..ws_agent_registry import register_run, unregister_run
             q = register_run(rid or "unknown", ws_token)
             argv = self._build_argv(prompt, ws_token=ws_token)
             stdout_target = asyncio.subprocess.DEVNULL  # events arrive via WS
+        elif use_redis:
+            # Container publishes directly to Redis Stream via aw-connector-redis.
+            # We consume via XREADGROUP into an asyncio.Queue (same interface as WS mode).
+            _redis_url = os.environ.get("AP_REDIS_URL", "redis://127.0.0.1:6379/0")
+            q = asyncio.Queue()
+            argv = self._build_argv(prompt, redis_url=_redis_url.replace(
+                "127.0.0.1", "host.docker.internal"))  # container sees host via this alias
+            stdout_target = asyncio.subprocess.DEVNULL
         else:
             argv = self._build_argv(prompt, ws_token=None)  # no aw-connector wrapper
             stdout_target = asyncio.subprocess.PIPE  # read CLI stdout directly
 
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=stdout_target,
-            stderr=asyncio.subprocess.DEVNULL,
-            cwd=os.getcwd(), env={**os.environ},
-            limit=10 * 1024 * 1024,  # raise StreamReader cap for large init lines
-        )
-        if rid:
-            await _register(rid, proc)
+        if not attach_run_id:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=stdout_target,
+                stderr=asyncio.subprocess.DEVNULL,
+                cwd=os.getcwd(), env={**os.environ},
+                limit=10 * 1024 * 1024,  # raise StreamReader cap for large init lines
+            )
+            if rid:
+                await _register(rid, proc)
 
-        # Monitor process exit. In WS mode, inject the done sentinel if docker
-        # dies before aw-connector sends "done" so astream() doesn't hang.
-        done_event = asyncio.Event()
+            # Redis mode: start background task consuming from the Stream into q
+            if use_redis and q is not None:
+                from ..redis_streams import consume_stream_into_queue
+                asyncio.create_task(
+                    consume_stream_into_queue(rid or "unknown", q),
+                    name=f"redis-consumer-{rid}",
+                )
 
-        async def _proc_monitor():
-            rc = await proc.wait()
-            if rc != 0:
-                log.warning("cli docker exited rc=%d run=%s", rc, rid)
-            if not done_event.is_set() and q is not None:
-                await q.put(None)  # fallback sentinel on unexpected exit (WS mode)
-
-        monitor_task = asyncio.create_task(_proc_monitor())
+            # Monitor process exit. In WS/Redis mode, inject the done sentinel if
+            # docker dies before the connector sends "done" so astream() doesn't hang.
+            async def _proc_monitor():
+                rc = await proc.wait()
+                if rc != 0:
+                    log.warning("cli docker exited rc=%d run=%s", rc, rid)
+                if not done_event.is_set() and q is not None:
+                    await q.put(None)  # fallback sentinel on unexpected exit
+            monitor_task = asyncio.create_task(_proc_monitor())
 
         # Unified line source: yields each raw CLI JSON line, or None when done.
         async def _next_line() -> str | None:
-            if use_ws:
+            if attach_run_id or use_ws or use_redis:
                 return await asyncio.wait_for(q.get(), timeout=self.timeout_s)
             assert proc.stdout is not None
             raw = await asyncio.wait_for(proc.stdout.readline(), timeout=self.timeout_s)
@@ -249,7 +300,8 @@ class CliLLM(BaseLLM):
                 try:
                     line = await _next_line()
                 except asyncio.TimeoutError:
-                    proc.kill()
+                    if proc is not None:
+                        proc.kill()
                     yield _meta_chunk("cli.timeout", {"timeout_s": self.timeout_s})
                     break
 
@@ -324,14 +376,16 @@ class CliLLM(BaseLLM):
                                                         "is_error": evt.get("is_error")})
         finally:
             done_event.set()
-            monitor_task.cancel()
-            # Give the docker process a moment to exit cleanly
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                proc.kill()
-            if rid:
-                await _unregister(rid, proc)
+            if monitor_task is not None:
+                monitor_task.cancel()
+            # Give the docker process a moment to exit cleanly (attach mode has none)
+            if proc is not None:
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                if rid:
+                    await _unregister(rid, proc)
             if unregister_run is not None:
                 unregister_run(rid or "unknown")
 

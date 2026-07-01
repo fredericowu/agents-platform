@@ -39,6 +39,8 @@ dependencies = [
   "anyio>=4.6",
   # Eval support
   "jsonschema>=4.23",
+  # Redis Streams — durable event transport for CLI agent runs
+  "redis[asyncio]>=5.0",
 ]
 
 [project.optional-dependencies]
