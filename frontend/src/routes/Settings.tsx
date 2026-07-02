@@ -208,7 +208,7 @@ export default function Settings() {
   const isDefaultMode    = s.security_mode === s._defaults?.security_mode;
   const isDefaultTimeout = s.command_timeout_seconds === s._defaults?.command_timeout_seconds;
 
-  const geralTab = (
+  const generalTab = (
     <>
       {/* ─────── Command execution ─────── */}
       <div className="card mb-4">
@@ -305,7 +305,7 @@ export default function Settings() {
     </>
   );
 
-  const vozTab = (
+  const voiceTab = (
     <>
       {/* ─────── Voice & STT ─────── */}
       <div className="card mb-4" data-testid="settings-voice">
@@ -422,7 +422,7 @@ export default function Settings() {
     </>
   );
 
-  const integracoesTab = (
+  const integrationsTab = (
     <>
       {/* ─────── RAG Provider ─────── */}
       <div className="card mb-4">
@@ -726,12 +726,12 @@ export default function Settings() {
       {msg   && <div className="codebox text-ok mb-3"  data-testid="settings-msg">{msg}</div>}
 
       <Tabs
-        defaultTab="geral"
+        defaultTab="general"
         tabs={[
-          { id: "geral", label: "Geral", content: geralTab },
-          { id: "voz", label: "Voz", content: vozTab },
+          { id: "general", label: "General", content: generalTab },
+          { id: "voice", label: "Voice", content: voiceTab },
           { id: "telegram", label: "Telegram", content: <TelegramBots /> },
-          { id: "integracoes", label: "Integrações", content: integracoesTab },
+          { id: "integrations", label: "Integrations", content: integrationsTab },
           { id: "remote-agents", label: "Remote Agents", content: remoteAgentsTab },
           { id: "retro-scoring", label: "Retro Scoring", content: retroScoringTab },
         ]}

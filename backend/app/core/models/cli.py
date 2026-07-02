@@ -401,6 +401,59 @@ class CliLLM(BaseLLM):
                     if evt.get("subtype") != "success":
                         yield _meta_chunk("cli.error", {"subtype": evt.get("subtype"),
                                                         "is_error": evt.get("is_error")})
+                # ── codex --json event schema (thread.started/turn.started/
+                # item.started/item.completed/turn.completed) — distinct "type"
+                # values from claude's, so no collision with the branches above.
+                elif et == "item.started":
+                    item = evt.get("item") or {}
+                    it = item.get("type")
+                    if it == "mcp_tool_call":
+                        yield _meta_chunk("tool_call", {
+                            "id": item.get("id"),
+                            "name": f"{item.get('server', '')}.{item.get('tool', '')}",
+                            "input": _redact(item.get("arguments")),
+                        })
+                    elif it == "command_execution":
+                        yield _meta_chunk("tool_call", {
+                            "id": item.get("id"),
+                            "name": "exec",
+                            "input": _redact({"command": item.get("command")}),
+                        })
+                elif et == "item.completed":
+                    item = evt.get("item") or {}
+                    it = item.get("type")
+                    if it == "agent_message":
+                        txt = item.get("text", "")
+                        if txt:
+                            sep = "\n\n" if (final_text and not final_text.endswith("\n")) else ""
+                            final_text += sep + txt
+                            yield ChatChunk(delta=sep + txt)
+                    elif it == "mcp_tool_call":
+                        result = item.get("result") or {}
+                        content = result.get("content")
+                        if isinstance(content, list):
+                            text_blocks = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+                            content_text = "\n".join(text_blocks)[:20000]
+                        else:
+                            content_text = str(item.get("error") or result)[:20000]
+                        yield _meta_chunk("tool_result", {
+                            "tool_use_id": item.get("id"),
+                            "content": content_text,
+                        })
+                    elif it == "command_execution":
+                        yield _meta_chunk("tool_result", {
+                            "tool_use_id": item.get("id"),
+                            "content": str(item.get("aggregated_output", ""))[:20000],
+                        })
+                    elif it == "reasoning":
+                        rtext = item.get("text", "")
+                        if rtext:
+                            yield _meta_chunk("thinking", {"text": rtext[:20000]})
+                elif et == "turn.completed":
+                    usage = evt.get("usage") or {}
+                    if usage:
+                        tin = usage.get("input_tokens", 0) + usage.get("cached_input_tokens", 0)
+                        tout = usage.get("output_tokens", 0) or tout
         finally:
             done_event.set()
             if monitor_task is not None:

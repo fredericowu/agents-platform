@@ -510,9 +510,19 @@ async def _reattach_run(run_id: str, agent_slug: str, user_input: str,
                         target_id: str | None, session_id: str | None) -> None:
     """Re-run finalisation for an interrupted agent run by replaying its Redis Stream."""
     try:
-        await run_agent(agent_slug, user_input, run_id=run_id, target_id=target_id,
-                        session_id=session_id, attach=True)
+        result = await run_agent(agent_slug, user_input, run_id=run_id, target_id=target_id,
+                                 session_id=session_id, attach=True)
         _exec_log.info("re-attached run %s finalised", run_id)
+        # Close the loop with the user: deliver the recovered reply to its
+        # originating chat (the webhook coroutine that would have done this died
+        # with the restart). Idempotent — guarded by a Redis dedup claim.
+        try:
+            output_text = (result or {}).get("reply") or (result or {}).get("text", "")
+            if output_text:
+                from ..api.telegram import deliver_recovered_run
+                await deliver_recovered_run(run_id, output_text)
+        except Exception as de:
+            _exec_log.warning("recovery delivery failed run=%s: %s", run_id, de)
     except Exception as e:
         _exec_log.warning("re-attach failed run=%s: %s", run_id, e)
         # Last resort: don't leave it stuck in 'running'.

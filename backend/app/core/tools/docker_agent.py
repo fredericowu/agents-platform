@@ -68,6 +68,7 @@ CLI_SPECS: dict[str, dict] = {
         "default_extra": [
             "--skip-git-repo-check",
             "--dangerously-bypass-approvals-and-sandbox",
+            "--json",           # structured JSONL events (thread/turn/item.*) — see cli.py astream()
         ],
         "model_flag": "-c",    # -c model="o3"  (TOML config override)
         "add_dir_flag": None,
@@ -265,6 +266,14 @@ def build_docker_argv(
         add_mount(str(Path(mcp_config_dir).resolve()), "/agent-config", readonly=True)
         if not _cwd_set:
             argv.extend(["-w", "/home/ubuntu"])
+        # codex has no --mcp-config flag — it only reads MCP servers from
+        # $CODEX_HOME/config.toml or a layered $CODEX_HOME/<profile>.config.toml
+        # (--profile/-p). Bind the generated mcp_codex.toml straight into the
+        # mounted .codex creds dir under that profile filename so `-p agentmcp`
+        # (added below) picks it up.
+        codex_mcp_host = Path(mcp_config_dir) / "mcp_codex.toml"
+        if cli == "codex" and codex_mcp_host.is_file():
+            add_mount(str(codex_mcp_host.resolve()), "/home/ubuntu/.codex/agentmcp.config.toml", readonly=True)
 
     # Per-agent extra volumes (e.g. ["/var/run/docker.sock:/var/run/docker.sock"])
     for vol in (extra_volumes or []):
@@ -338,6 +347,8 @@ def build_docker_argv(
     if mcp_config_dir and Path(mcp_config_dir).is_dir():
         if cli == "claude" and (Path(mcp_config_dir) / "mcp.json").exists():
             argv.extend(["--mcp-config", "/agent-config/mcp.json"])
+        elif cli == "codex" and (Path(mcp_config_dir) / "mcp_codex.toml").exists():
+            argv.extend(["-p", "agentmcp"])
 
     argv.extend(spec["default_extra"])
     argv.extend(extra_args)

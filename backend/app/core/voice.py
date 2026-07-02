@@ -61,12 +61,38 @@ _LANGUAGE_NAME_TO_ISO = {
 # Config helpers
 # ---------------------------------------------------------------------------
 
+def _read_aw_json_openai_key() -> str:
+    """Fallback: read ``workspace_agent.openai_api_key`` from the AW ``aw.json``.
+
+    The Telegram/voice stack was migrated out of awserv into agents-platform,
+    but the OpenAI key still lives in awserv's ``aw.json``. Rather than force a
+    manual re-entry, read it directly as a last-resort source. Path can be
+    overridden with ``AW_CONFIG_PATH``.
+    """
+    path = os.environ.get("AW_CONFIG_PATH") or "/opt/agentic-workspace/src/config/aw.json"
+    try:
+        import json
+        with open(path, "r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        return str((cfg.get("workspace_agent") or {}).get("openai_api_key", "") or "").strip()
+    except Exception as exc:  # noqa: BLE001 — best-effort fallback
+        log.debug("could not read openai_api_key from aw.json (%s): %s", path, exc)
+        return ""
+
+
 def get_openai_api_key() -> str:
-    """Look up the OpenAI API key (Setting override first, then env)."""
+    """Look up the OpenAI API key.
+
+    Resolution order: ``Setting`` override → ``OPENAI_API_KEY`` env →
+    awserv ``aw.json`` (``workspace_agent.openai_api_key``).
+    """
     key = str(security.get_setting("openai_api_key", "") or "").strip()
     if key:
         return key
-    return os.environ.get("OPENAI_API_KEY", "").strip()
+    env_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    return _read_aw_json_openai_key()
 
 
 def get_stt_provider() -> str:
@@ -187,21 +213,11 @@ def _faster_whisper_transcribe(audio: bytes, filename: str) -> Optional[tuple[st
 # STT router
 # ---------------------------------------------------------------------------
 
-def transcribe(audio: bytes, filename: str = "voice.oga", language: str = "") -> Optional[tuple[str, str]]:
-    """Transcribe an audio blob. Returns ``(text, detected_language)`` or ``None``."""
-    if not audio:
-        log.warning("STT: empty audio buffer passed to transcribe")
-        return None
-
-    provider = get_stt_provider()
-    log.info("STT: using provider=%s filename=%s", provider, filename)
-
-    if provider == "local":
-        return _faster_whisper_transcribe(audio, filename)
-
+def _openai_transcribe(audio: bytes, filename: str, language: str = "") -> Optional[tuple[str, str]]:
+    """Transcribe via the OpenAI Whisper API. Returns ``None`` on any failure."""
     api_key = get_openai_api_key()
     if not api_key:
-        log.warning("STT: no OpenAI API key configured (setting: openai_api_key)")
+        log.warning("STT: no OpenAI API key configured (setting: openai_api_key / aw.json)")
         return None
 
     files = {"file": (filename, io.BytesIO(audio), "application/octet-stream")}
@@ -228,6 +244,32 @@ def transcribe(audio: bytes, filename: str = "voice.oga", language: str = "") ->
     except (httpx.HTTPError, ValueError) as exc:
         log.exception("Whisper request failed: %s", exc)
         return None
+
+
+def transcribe(audio: bytes, filename: str = "voice.oga", language: str = "") -> Optional[tuple[str, str]]:
+    """Transcribe an audio blob. Returns ``(text, detected_language)`` or ``None``.
+
+    When the configured provider is ``openai`` and the request fails for **any**
+    reason (missing key, quota/HTTP error, network error), we automatically fall
+    back to the local faster-whisper model so a voice message is never silently
+    dropped just because the cloud provider is unavailable.
+    """
+    if not audio:
+        log.warning("STT: empty audio buffer passed to transcribe")
+        return None
+
+    provider = get_stt_provider()
+    log.info("STT: using provider=%s filename=%s", provider, filename)
+
+    if provider == "local":
+        return _faster_whisper_transcribe(audio, filename)
+
+    result = _openai_transcribe(audio, filename, language)
+    if result is not None:
+        return result
+
+    log.warning("STT: OpenAI transcription failed — falling back to local faster-whisper")
+    return _faster_whisper_transcribe(audio, filename)
 
 
 # ---------------------------------------------------------------------------

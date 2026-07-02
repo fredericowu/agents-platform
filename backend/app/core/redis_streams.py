@@ -202,6 +202,33 @@ async def consume_stream_into_queue(run_id: str, queue: asyncio.Queue,
         await queue.put(None)
 
 
+def _delivered_key(run_id: str) -> str:
+    return f"run:{run_id}:delivered"
+
+
+async def mark_delivered(run_id: str) -> bool:
+    """Atomically claim delivery of a run's reply.
+
+    Returns True if THIS caller won the claim (the reply had not been delivered
+    yet), False if another path already delivered it. Redis-backed so the claim
+    survives a platform restart: the live Telegram dispatch and the post-restart
+    recovery path share one gate and can never both send the same reply.
+
+    Fails **open** (returns True) when Redis is unavailable — a missing Redis
+    should never silently swallow a user's reply.
+    """
+    r = await get_client()
+    if r is None:
+        return True
+    try:
+        won = await r.set(_delivered_key(run_id), "1", nx=True, ex=STREAM_TTL_S)
+        return bool(won)
+    except Exception as e:
+        log.warning("mark_delivered failed run=%s: %s", run_id, e)
+        await reset_client()
+        return True
+
+
 async def stream_has_data(run_id: str) -> bool:
     """Return True if a Redis Stream exists for this run and holds at least one entry.
 

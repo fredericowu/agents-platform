@@ -540,21 +540,19 @@ def _get_agent_slug_for_chat(bot: TelegramBot, bot_id: str, chat_id: str) -> str
     return bot.agent_slug or ""
 
 
-def _set_agent_slug_override(bot_id: str, chat_id: str, agent_slug: str) -> None:
-    """Persist a per-chat agent override; creates the TelegramSession row if needed."""
+def _set_bot_agent_slug(bot_id: str, agent_slug: str) -> None:
+    """Persist the agent for this bot; applies to every chat on the bot.
+
+    Clears any leftover per-chat overrides and resets every chat's active
+    session so all conversations start fresh under the new agent.
+    """
     with session_scope() as s:
-        row = (s.query(TelegramSession)
-               .filter(TelegramSession.bot_id == bot_id,
-                       TelegramSession.chat_id == chat_id)
-               .first())
-        if row:
-            row.agent_slug_override = agent_slug
-            row.session_id = None  # reset session so the new agent starts fresh
-        else:
-            s.add(TelegramSession(
-                bot_id=bot_id, chat_id=chat_id,
-                agent_slug_override=agent_slug, session_id=None,
-            ))
+        bot_row = s.query(TelegramBot).filter(TelegramBot.id == bot_id).first()
+        if bot_row:
+            bot_row.agent_slug = agent_slug
+        for row in s.query(TelegramSession).filter(TelegramSession.bot_id == bot_id).all():
+            row.agent_slug_override = None
+            row.session_id = None
 
 
 def _set_session_override(bot_id: str, chat_id: str, session_id: str | None) -> None:
@@ -713,17 +711,52 @@ def _get_or_create_session(bot_id: str, chat_id: str, target_id: str) -> tuple[s
         return None, row.id
 
 
-def _save_session_id(bot_id: str, chat_id: str, session_id: str) -> None:
+def _save_session_id(bot_id: str, chat_id: str, session_id: str, token: str | None = None) -> None:
+    """Bind ``session_id`` to this chat. When it's a genuinely new session
+    (no prior session_id — e.g. right after ``/new``) and the chat has no
+    custom /rename, auto-stamp the bot's Telegram display name with the new
+    session id so it's visible at a glance which session is active. Pass
+    ``token`` to enable this (callers without a token just skip it)."""
+    auto_name: str | None = None
     with session_scope() as s:
         row = (s.query(TelegramSession)
                .filter(TelegramSession.bot_id == bot_id,
                        TelegramSession.chat_id == chat_id)
                .first())
+        is_new_session = not (row and row.session_id)
         if row:
             row.session_id = session_id
         else:
             s.add(TelegramSession(bot_id=bot_id, chat_id=chat_id,
                                   session_id=session_id))
+
+        # Propagate a user-set /rename onto the CliSession that now backs this
+        # chat. /rename is commonly used before the first CLI run creates a
+        # session_id, so at that moment TelegramSession.session_id is still
+        # None and _apply_rename can only write the name onto Target — never
+        # onto CliSession, which is what the /agent session picker reads.
+        # Syncing here, whenever a session_id gets (re)bound to this chat,
+        # closes that gap.
+        tgt = (s.query(Target)
+               .filter(Target.slug == f"tg-{bot_id}-{chat_id}")
+               .first())
+        default_name = f"Telegram {bot_id} / chat {chat_id}"
+        if tgt and tgt.name and tgt.name != default_name:
+            from ..models import CliSession as _CS
+            cli_sess = s.query(_CS).filter(_CS.session_id == session_id).first()
+            if cli_sess:
+                cli_sess.name = tgt.name
+            else:
+                s.add(_CS(session_id=session_id, name=tgt.name))
+        elif is_new_session and token:
+            auto_name = session_id
+            if tgt:
+                tgt.name = auto_name
+            else:
+                s.add(Target(slug=f"tg-{bot_id}-{chat_id}", name=auto_name,
+                              source_kind="telegram", source_ref=f"{bot_id}:{chat_id}"))
+    if auto_name and token:
+        _set_bot_display_name(token, auto_name)
 
 
 def _reset_session(bot_id: str, chat_id: str) -> None:
@@ -734,6 +767,19 @@ def _reset_session(bot_id: str, chat_id: str) -> None:
                .first())
         if row:
             row.session_id = None
+
+
+def _reset_target_name(bot_id: str, chat_id: str) -> None:
+    """Clear any custom /rename on this chat's Target, back to the
+    auto-generated default. Call this alongside _reset_session for a true
+    "/new" — otherwise the old custom name lingers on Target and
+    _save_session_id re-applies it onto the next (unrelated) CliSession."""
+    with session_scope() as s:
+        tgt = (s.query(Target)
+               .filter(Target.slug == f"tg-{bot_id}-{chat_id}")
+               .first())
+        if tgt:
+            tgt.name = f"Telegram {bot_id} / chat {chat_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -817,6 +863,59 @@ def _deliver_reply(
                 except Exception as e:
                     log.warning("send_message failed: %s", e)
                     return
+
+
+async def deliver_recovered_run(run_id: str, output_text: str) -> None:
+    """Deliver a recovered run's reply to its originating Telegram chat.
+
+    Called by restart recovery (``executor._reattach_run``). The run finished —
+    possibly while the platform was down — and was finalised by replaying its
+    Redis Stream, but the original webhook coroutine that would have delivered
+    the reply died with the restart. We rebuild the chat context from the Run's
+    ``initiator_kind`` / ``initiator_id`` (persisted at dispatch time as
+    ``"{bot_id}:{chat_id}"``) and deliver through the SAME path as the live flow,
+    guarded by a Redis-backed dedup claim so a reply is never sent twice.
+
+    This is the "delivery follows the stream" piece: recovery is just a consumer
+    that resumes reading the durable stream and ships the result — identical to
+    what the live dispatcher does after ``run_agent`` returns.
+    """
+    if not output_text:
+        return
+
+    with session_scope() as s:
+        run = s.query(Run).filter(Run.id == run_id).first()
+        if not run or run.initiator_kind != "telegram" or not run.initiator_id:
+            return
+        initiator_id = run.initiator_id
+        session_id = run.session_id
+
+    bot_id, _, chat_id = initiator_id.rpartition(":")
+    if not bot_id or not chat_id:
+        log.warning("recovery: unparseable initiator_id=%r run=%s", initiator_id, run_id)
+        return
+
+    from ..core.redis_streams import mark_delivered
+    if not await mark_delivered(run_id):
+        log.info("recovery: run %s already delivered — skipping", run_id)
+        return
+
+    with session_scope() as s:
+        bot = s.query(TelegramBot).filter(TelegramBot.id == bot_id).first()
+        token = bot.token if bot else ""
+    if not token:
+        log.warning("recovery: no bot token for bot_id=%s run=%s", bot_id, run_id)
+        return
+
+    # Recovered replies go out as text (we no longer know the inbound modality);
+    # language is auto-detected from the reply text inside _deliver_reply.
+    await asyncio.to_thread(_deliver_reply, token, chat_id, output_text, False, "")
+    if session_id:
+        try:
+            _save_session_id(bot_id, chat_id, session_id, token=token)
+        except Exception:
+            pass
+    log.info("recovery: delivered reply for run=%s bot=%s chat=%s", run_id, bot_id, chat_id)
 
 
 # ---------------------------------------------------------------------------
@@ -934,7 +1033,7 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
                 from ..models import Run as _Run
                 run_row = ss.query(_Run).filter(_Run.id == run_id).first()
                 if run_row and run_row.session_id:
-                    _save_session_id(bot.id, chat_id, run_row.session_id)
+                    _save_session_id(bot.id, chat_id, run_row.session_id, token=token)
 
             # If the run succeeded (docker exited 0) but produced no tokens/text
             # while trying to resume a session, the session is stale. Reset and
@@ -969,12 +1068,20 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
                     from ..models import Run as _Run
                     retry_row = ss.query(_Run).filter(_Run.id == retry_run_id).first()
                     if retry_row and retry_row.session_id:
-                        _save_session_id(bot.id, chat_id, retry_row.session_id)
+                        _save_session_id(bot.id, chat_id, retry_row.session_id, token=token)
 
             if output_text:
                 t_deliver_start = _time.perf_counter()
                 _deliver_reply(token, chat_id, output_text, is_voice, inbound_lang)
                 t_deliver_done = _time.perf_counter()
+                # Claim delivery so post-restart recovery never re-sends this
+                # reply (shared Redis gate with deliver_recovered_run).
+                try:
+                    if _MAIN_LOOP is not None:
+                        from ..core.redis_streams import mark_delivered
+                        asyncio.run_coroutine_threadsafe(mark_delivered(run_id), _MAIN_LOOP)
+                except Exception:
+                    pass
             elif status not in ("success", "completed"):
                 t_deliver_start = t_deliver_done = _time.perf_counter()
                 _send_message(token, chat_id,
@@ -1541,8 +1648,9 @@ def _send_rename_prompt(token: str, chat_id: str, bot_id: str, current_name: str
 
 
 def _apply_rename(token: str, bot_id: str, chat_id: str, new_name: str) -> bool:
-    """Rename this chat's Target and update the bot display name. Returns False
-    when there's no Target yet (no message sent in this chat)."""
+    """Rename this chat's Target, the active CliSession, and the bot display
+    name. Returns False when there's no Target yet (no message sent in this
+    chat)."""
     new_name = new_name.strip()[:80]
     if not new_name:
         return False
@@ -1554,6 +1662,20 @@ def _apply_rename(token: str, bot_id: str, chat_id: str, new_name: str) -> bool:
         if tgt:
             tgt.name = new_name
             renamed = True
+
+        tg_row = (ss.query(TelegramSession)
+                  .filter(TelegramSession.bot_id == bot_id,
+                          TelegramSession.chat_id == chat_id)
+                  .first())
+        if tg_row and tg_row.session_id:
+            from ..models import CliSession as _CS
+            cli_sess = (ss.query(_CS)
+                        .filter(_CS.session_id == tg_row.session_id)
+                        .first())
+            if cli_sess:
+                cli_sess.name = new_name
+            else:
+                ss.add(_CS(session_id=tg_row.session_id, name=new_name))
     if renamed:
         _set_bot_display_name(token, new_name)
     return renamed
@@ -1643,8 +1765,8 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
             agents_all = _list_agents_for_picker()
             chosen_name = next((a["name"] for a in agents_all if a["slug"] == chosen_slug),
                                chosen_slug)
-            # Persist the override + reset session
-            _set_agent_slug_override(bot_id, cq_chat_id, chosen_slug)
+            # Persist as the bot-wide agent; applies to every chat on this bot
+            _set_bot_agent_slug(bot_id, chosen_slug)
             # Collapse the picker message
             msg_id = cq_msg.get("message_id")
             if msg_id:
@@ -1744,12 +1866,15 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
                               f"{base_msg}\nSession named <b>{_md_to_html(args.strip()[:80])}</b>." if ok
                               else base_msg)
             else:
+                _reset_target_name(bot_id, chat_id)
                 _set_bot_display_name(bot.token, "")  # back to the bot's base name
                 _send_message(bot.token, chat_id, base_msg)
             return {"ok": True, "reason": "slash /new"}
 
         if cmd == "start":
             _reset_session(bot_id, chat_id)
+            _reset_target_name(bot_id, chat_id)
+            _set_bot_display_name(bot.token, "")  # back to the bot's base name
             _send_message(bot.token, chat_id,
                           "👋 Hi! I'm your Agents Platform agent. "
                           "Send me a message to get started.")
@@ -1763,6 +1888,13 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
                        .first())
                 sid = row.session_id if row else None
                 slug_override = row.agent_slug_override if row else None
+                last_run_id = None
+                if sid:
+                    last_run = (ss.query(Run)
+                                .filter(Run.session_id == sid)
+                                .order_by(Run.started_at.desc())
+                                .first())
+                    last_run_id = last_run.id if last_run else None
             effective_slug = slug_override or bot.agent_slug or "(none)"
             override_note = " (override)" if slug_override else ""
             name = _current_target_name(bot_id, chat_id)
@@ -1773,11 +1905,13 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
                               "Send any message to start one.")
             else:
                 name_line = f"Name: <code>{_md_to_html(name)}</code>\n" if name else ""
+                run_line = f"Run id: <code>{last_run_id}</code>\n" if last_run_id else ""
                 _send_message(bot.token, chat_id,
                               "📊 <b>Session status</b>\n"
                               f"{name_line}"
                               f"Agent: <code>{effective_slug}</code>{override_note}\n"
-                              f"Session id: <code>{sid[:8]}…</code>")
+                              f"Session id: <code>{sid}</code>\n"
+                              f"{run_line}")
             return {"ok": True, "reason": "slash /status"}
 
         if cmd == "rename":
@@ -1862,6 +1996,70 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
             ).start()
             return {"ok": True, "reason": "slash /compact queued"}
 
+        if cmd == "clear":
+            # Unlike /new (which drops session_id and starts a brand-new CLI
+            # session), /clear passes the literal "/clear" straight through to
+            # the running CLI on the SAME session_id — the CLI's own /clear
+            # handles wiping its context in place. Mirrors the /compact block.
+            with session_scope() as ss:
+                _clear_row = (ss.query(TelegramSession)
+                              .filter(TelegramSession.bot_id == bot_id,
+                                      TelegramSession.chat_id == chat_id)
+                              .first())
+                _clear_session_id = _clear_row.session_id if _clear_row else None
+                _clear_slug = (_clear_row.agent_slug_override if _clear_row else None) or bot.agent_slug
+            if not _clear_slug:
+                _send_message(bot.token, chat_id, "⚠️ No agent configured for this chat.")
+                return {"ok": True, "reason": "slash /clear no agent"}
+            if not _clear_session_id:
+                _send_message(bot.token, chat_id,
+                              "⚠️ No active session. Send a message first to start one.")
+                return {"ok": True, "reason": "slash /clear no session"}
+            _clear_target_id = _ensure_target(bot.id, chat_id)
+            _clear_token = bot.token
+            _clear_bot_id = bot.id
+            _clear_chat_id = chat_id
+
+            def _do_clear(slug, sess_id, target_id, tg_token, b_id, c_id):
+                import asyncio as _aio
+                try:
+                    from ..core.executor import run_agent as _run_agent
+                    _coro = _run_agent(
+                        slug, "/clear",
+                        target_id=target_id,
+                        session_id=sess_id,
+                        initiator_kind="telegram",
+                        initiator_id=f"{b_id}:{c_id}",
+                    )
+                    if _MAIN_LOOP is not None:
+                        result = _aio.run_coroutine_threadsafe(_coro, _MAIN_LOOP).result(timeout=120)
+                    else:
+                        result = _aio.run(_coro)
+                    output_text = (result.get("text") or "").strip()
+                    status = result.get("status", "unknown")
+                    if status in ("success", "completed"):
+                        if output_text and output_text != "(empty response)":
+                            _send_message(tg_token, c_id,
+                                          f"🧹 Context cleared.\n\n{_md_to_html(output_text)}",
+                                          parse_mode="HTML")
+                        else:
+                            _send_message(tg_token, c_id, "🧹 Context cleared.")
+                    else:
+                        _send_message(tg_token, c_id,
+                                      f"⚠️ Clear finished with status: <code>{status}</code>",
+                                      parse_mode="HTML")
+                except Exception as _e:
+                    log.exception("clear failed for bot=%s chat=%s", b_id, c_id)
+                    _send_message(tg_token, c_id, f"⚠️ Clear failed: {_e}")
+
+            threading.Thread(
+                target=_do_clear,
+                args=(_clear_slug, _clear_session_id, _clear_target_id,
+                      _clear_token, _clear_bot_id, _clear_chat_id),
+                daemon=True, name=f"clear-{bot.id}-{chat_id}",
+            ).start()
+            return {"ok": True, "reason": "slash /clear queued"}
+
         if cmd in ("help", "?"):
             _send_message(bot.token, chat_id,
                           "🤖 <b>Agents Platform commands</b>\n"
@@ -1872,6 +2070,7 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
                           "/rename — rename the current session (no args → prompt)\n"
                           "/abort — stop the run in progress\n"
                           "/compact — compress conversation context to save tokens\n"
+                          "/clear — clear the CLI's context in place (keeps the same session)\n"
                           "/help — show this message")
             return {"ok": True, "reason": "slash /help"}
         # Unknown slash command → fall through to the agent dispatch below.
@@ -1883,26 +2082,41 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
 
     if message.get("voice") or message.get("audio"):
         file_id = (message.get("voice") or message.get("audio") or {}).get("file_id", "")
-        if file_id:
-            is_voice = True
-            try:
-                text_raw, inbound_lang = _transcribe_voice(bot.token, file_id)
-                # Echo transcription as reply to the original voice message
-                if text_raw and msg_id:
-                    try:
-                        _tg(bot.token, "sendMessage",
-                            chat_id=chat_id,
-                            text=f"🎙 Transcription: {text_raw}",
-                            reply_to_message_id=int(msg_id))
-                    except Exception:
-                        pass
-            except Exception as e:
-                log.warning("STT failed: %s", e)
-                _send_message(bot.token, chat_id,
-                              "⚠️ Could not transcribe the audio.")
-                return {"ok": True, "reason": "stt failed"}
+        if not file_id:
+            _send_message(bot.token, chat_id,
+                          "⚠️ Não consegui acessar o áudio (o Telegram não mandou o file_id).")
+            return {"ok": True, "reason": "voice without file_id"}
+        is_voice = True
+        stt_error = ""
+        try:
+            text_raw, inbound_lang = _transcribe_voice(bot.token, file_id)
+        except Exception as e:
+            log.exception("STT failed: %s", e)
+            text_raw, inbound_lang, stt_error = "", "", str(e)
         if not text_raw:
-            return {"ok": True, "reason": "empty voice"}
+            # Never fail silently: transcribe() already tries OpenAI Whisper and
+            # then falls back to local faster-whisper. If we still have nothing,
+            # tell the user why instead of dropping the message.
+            log.warning("STT produced no text for chat=%s file_id=%s err=%s",
+                        chat_id, file_id, stt_error or "(provider returned empty)")
+            detail = f"\nDetalhe: <code>{stt_error}</code>" if stt_error else ""
+            _send_message(
+                bot.token, chat_id,
+                "⚠️ Não consegui transcrever o seu áudio. Tentei o Whisper (OpenAI) e o "
+                "faster-whisper local, e nenhum dos dois retornou texto — verifique se a "
+                "chave da OpenAI está configurada ou se o modelo local está disponível. "
+                "Enquanto isso, pode me mandar por texto." + detail,
+                parse_mode="HTML")
+            return {"ok": True, "reason": "stt produced no text"}
+        # Echo transcription as reply to the original voice message
+        if msg_id:
+            try:
+                _tg(bot.token, "sendMessage",
+                    chat_id=chat_id,
+                    text=f"🎙 Transcription: {text_raw}",
+                    reply_to_message_id=int(msg_id))
+            except Exception:
+                pass
 
     # Handle user-uploaded file (document/photo/video/audio) — not voice notes
     if not is_voice:

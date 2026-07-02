@@ -268,8 +268,12 @@ type Message struct {
 	Info     *ClientInfo `json:"info,omitempty"`
 	Stdout   string      `json:"stdout,omitempty"`
 	Stderr   string      `json:"stderr,omitempty"`
-	ExitCode int         `json:"exit_code,omitempty"`
-	Error    string      `json:"error,omitempty"`
+	// ExitCode maps to the wire key "returncode" — the server's exec_response
+	// and exec_done handlers both read msg["returncode"]; a mismatched key
+	// here silently makes every reported exit code 0.
+	ExitCode int    `json:"returncode,omitempty"`
+	Stream   string `json:"stream,omitempty"`
+	Error    string `json:"error,omitempty"`
 	// FS fields
 	FsOp     string `json:"op,omitempty"`
 	FsPath   string `json:"path,omitempty"`
@@ -503,7 +507,33 @@ func getInfo() *ClientInfo {
 
 // ── Command execution ─────────────────────────────────────────────────────────
 
-func runCommand(command string, timeout int) (stdout, stderr string, exitCode int) {
+// wsStreamWriter forwards each Write() as an exec_chunk message, so the
+// server sees output as the process produces it instead of only after it
+// exits — matches the Linux client's streaming behavior.
+type wsStreamWriter struct {
+	conn   *safeConn
+	reqID  string
+	stream string
+}
+
+func (w *wsStreamWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if err := w.conn.writeJSON(Message{
+		Type:   "exec_chunk",
+		ReqID:  w.reqID,
+		Stream: w.stream,
+		Stdout: "", // unused for chunks; payload goes in FsData below
+	}); false {
+		_ = err // placeholder, replaced below
+	}
+	return len(p), nil
+}
+
+// runCommand streams stdout/stderr to the caller live via sc and returns
+// only the final exit code — the output itself was already sent as chunks.
+func runCommand(sc *safeConn, reqID, command string, timeout int) (exitCode int) {
 	if timeout <= 0 {
 		timeout = 30
 	}
@@ -514,34 +544,60 @@ func runCommand(command string, timeout int) (stdout, stderr string, exitCode in
 		cmd = exec.Command("sh", "-c", command)
 	}
 
-	var outBuf, errBuf strings.Builder
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &errBuf
+	cmd.Stdout = &wsChunkWriter{conn: sc, reqID: reqID, stream: "stdout"}
+	cmd.Stderr = &wsChunkWriter{conn: sc, reqID: reqID, stream: "stderr"}
 
 	done := make(chan error, 1)
 	if err := cmd.Start(); err != nil {
-		return "", err.Error(), 1
+		sc.writeJSON(Message{Type: "exec_chunk", ReqID: reqID, Stream: "stderr", FsData: err.Error()})
+		return 1
 	}
 	go func() { done <- cmd.Wait() }()
 
 	select {
 	case err := <-done:
-		stdout = outBuf.String()
-		stderr = errBuf.String()
-		exitCode = 0
 		if err != nil {
 			if exitErr, ok := err.(*exec.ExitError); ok {
 				exitCode = exitErr.ExitCode()
 			} else {
 				exitCode = 1
-				stderr += err.Error()
+				sc.writeJSON(Message{Type: "exec_chunk", ReqID: reqID, Stream: "stderr", FsData: err.Error()})
 			}
 		}
 	case <-time.After(time.Duration(timeout) * time.Second):
 		cmd.Process.Kill()
-		return "", fmt.Sprintf("command timed out after %ds", timeout), 124
+		sc.writeJSON(Message{
+			Type: "exec_chunk", ReqID: reqID, Stream: "stderr",
+			FsData: fmt.Sprintf("command timed out after %ds", timeout),
+		})
+		exitCode = 124
 	}
 	return
+}
+
+// wsChunkWriter is the io.Writer used as cmd.Stdout/cmd.Stderr — each Write
+// call (as the OS pipe delivers data) becomes one exec_chunk message. Reuses
+// the Message.FsData field for the payload (wire key "data") since it's
+// already part of the shared Message struct.
+type wsChunkWriter struct {
+	conn   *safeConn
+	reqID  string
+	stream string
+}
+
+func (w *wsChunkWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if err := w.conn.writeJSON(Message{
+		Type:   "exec_chunk",
+		ReqID:  w.reqID,
+		Stream: w.stream,
+		FsData: string(p),
+	}); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
 
 // ── Connection ────────────────────────────────────────────────────────────────

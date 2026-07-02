@@ -9,7 +9,7 @@ On first boot (empty table) it tries to migrate data from the old custom-app DB.
 """
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 import asyncio, json, secrets as _sec, time, uuid as _uuid, os
 
@@ -24,8 +24,10 @@ UPDATE_JSON_PATH = "/opt/agentic-workspace/.tmp/remote-agents/update/version.jso
 
 # client_id -> { ws, info, connected_at }
 connected_clients: dict = {}
-# req_id -> asyncio.Future
+# req_id -> asyncio.Future  (fs_request/response — single-shot, unchanged)
 pending_requests: dict = {}
+# req_id -> asyncio.Queue  (exec — streamed chunks + final {"done": True, "returncode": ...})
+exec_queues: dict = {}
 # UI WebSocket subscribers
 ui_clients: set = set()
 
@@ -83,12 +85,35 @@ async def client_ws(ws: WebSocket, client_id: str):
                 await ws.send_text(json.dumps({"type": "ping"}))
                 continue
 
-            if msg.get("type") in ("exec_response", "fs_response"):
+            kind = msg.get("type")
+            if kind == "fs_response":
                 req_id = msg.get("req_id")
                 fut = pending_requests.get(req_id)
                 if fut and not fut.done():
                     fut.set_result(msg)
-            elif msg.get("type") == "pong":
+            elif kind == "exec_response":
+                # Legacy single-shot client (e.g. the precompiled Windows exe,
+                # which we don't rebuild here): treat the one full response as
+                # a chunk pair followed by done, so it fits the streaming API.
+                req_id = msg.get("req_id")
+                q = exec_queues.get(req_id)
+                if q is not None:
+                    if msg.get("stdout"):
+                        await q.put({"stream": "stdout", "data": msg["stdout"]})
+                    if msg.get("stderr"):
+                        await q.put({"stream": "stderr", "data": msg["stderr"]})
+                    await q.put({"done": True, "returncode": msg.get("returncode", 0)})
+            elif kind == "exec_chunk":
+                req_id = msg.get("req_id")
+                q = exec_queues.get(req_id)
+                if q is not None:
+                    await q.put({"stream": msg.get("stream", "stdout"), "data": msg.get("data", "")})
+            elif kind == "exec_done":
+                req_id = msg.get("req_id")
+                q = exec_queues.get(req_id)
+                if q is not None:
+                    await q.put({"done": True, "returncode": msg.get("returncode", 0)})
+            elif kind == "pong":
                 pass
 
     except (WebSocketDisconnect, Exception):
@@ -157,27 +182,50 @@ class ExecRequest(BaseModel):
 
 @router.post("/api/clients/{client_id}/exec")
 async def exec_on_client(client_id: str, req: ExecRequest):
+    """Run `req.command` on the client and stream the result back as NDJSON.
+
+    Each line is either a chunk — {"stream": "stdout"|"stderr", "data": "..."}
+    — emitted as the client produces output, or the final line
+    {"done": true, "returncode": N}. Callers (the `aw` CLI's remote forward)
+    read line-by-line and print as they arrive instead of waiting for the
+    whole command to finish.
+    """
     client = connected_clients.get(client_id)
     if not client:
         raise HTTPException(404, "Client not connected")
 
     req_id = str(_uuid.uuid4())
-    loop = asyncio.get_event_loop()
-    fut = loop.create_future()
-    pending_requests[req_id] = fut
+    queue: asyncio.Queue = asyncio.Queue()
+    exec_queues[req_id] = queue
 
-    try:
-        await client["ws"].send_text(json.dumps({
-            "type": "exec",
-            "req_id": req_id,
-            "command": req.command,
-        }))
-        result = await asyncio.wait_for(fut, timeout=req.timeout)
-        return result
-    except asyncio.TimeoutError:
-        raise HTTPException(408, "Command timed out")
-    finally:
-        pending_requests.pop(req_id, None)
+    await client["ws"].send_text(json.dumps({
+        "type": "exec",
+        "req_id": req_id,
+        "command": req.command,
+        "timeout": req.timeout,
+    }))
+
+    async def _stream():
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + req.timeout + 15
+        try:
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    yield json.dumps({"stream": "stderr", "data": "Command timed out\n"}) + "\n"
+                    yield json.dumps({"done": True, "returncode": -1}) + "\n"
+                    return
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    continue
+                yield json.dumps(item) + "\n"
+                if item.get("done"):
+                    return
+        finally:
+            exec_queues.pop(req_id, None)
+
+    return StreamingResponse(_stream(), media_type="application/x-ndjson")
 
 
 class FsRequest(BaseModel):

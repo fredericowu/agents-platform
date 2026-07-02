@@ -83,16 +83,20 @@ def _write_agent_mcp_config(agent: Agent, cli: str | None = None, s: Session | N
     # Same structure as claude but different wrapping — we reuse the same file.
 
     # ── Codex format (TOML) ─────────────────────────────────────────────────
+    # Server names may contain characters (e.g. "aw-gateway/crispal") that are
+    # invalid as bare TOML keys — quote them so codex's config.toml parser
+    # doesn't choke on "invalid unquoted key".
     lines = ["[mcp_servers]"]
     for name, cfg in servers.items():
         if not cfg.get("url"):
             continue
-        lines.append(f"[mcp_servers.{name}]")
+        key = json.dumps(name)  # TOML basic-string quoting == JSON string quoting
+        lines.append(f"[mcp_servers.{key}]")
         lines.append(f'type = "{cfg.get("type", "streamable-http")}"')
         lines.append(f'url = "{cfg["url"]}"')
         if cfg.get("headers"):
             for k, v in cfg["headers"].items():
-                lines.append(f'[mcp_servers.{name}.headers]')
+                lines.append(f'[mcp_servers.{key}.headers]')
                 lines.append(f'{k} = "{v}"')
                 break  # only first header section needed
     (agent_dir / "mcp_codex.toml").write_text("\n".join(lines) + "\n")
@@ -345,14 +349,26 @@ async def run_agent_ep(slug: str, body: RunInput, s: Session = Depends(get_sessi
     target_slug = body.target_slug or (extra.get("target_slug") if isinstance(extra, dict) else None)
     session_id = body.session_id or (extra.get("session_id") if isinstance(extra, dict) else None)
     notion_task_id = body.notion_task_id or (extra.get("notion_task_id") if isinstance(extra, dict) else None)
+    from ..models import Target
     if target_id is None and target_slug:
-        from ..models import Target
         t = s.query(Target).filter(Target.slug == target_slug).first()
         if t is None:
             raise HTTPException(404, f"target slug '{target_slug}' not found")
         target_id = t.id
     if target_id is None:
-        raise HTTPException(400, "target_slug is required — pass a target_slug to link this run to a delivery Target")
+        # Ad-hoc run with no delivery Target (e.g. the Agent editor "Quick test"
+        # button). runs.target_id is NOT NULL, so link these to a well-known
+        # auto-provisioned "ad-hoc" Target instead of rejecting the request.
+        adhoc = s.query(Target).filter(Target.slug == "ad-hoc").first()
+        if adhoc is None:
+            adhoc = Target(slug="ad-hoc", name="Ad-hoc runs",
+                           description="Auto-created bucket for ad-hoc agent runs "
+                                       "(Quick test, one-off invocations) that aren't "
+                                       "tied to a delivery Target.",
+                           source_kind="manual", created_by="system")
+            s.add(adhoc)
+            s.commit()
+        target_id = adhoc.id
     try:
         rid = start_agent_run_bg(slug, payload, target_id=target_id, session_id=session_id,
                                  notion_task_id=notion_task_id)

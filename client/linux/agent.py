@@ -48,35 +48,57 @@ def _system_info() -> dict:
     }
 
 
-async def _handle_exec(ws, req_id: str, command: str) -> None:
+async def _handle_exec(ws, req_id: str, command: str, timeout: float = 900) -> None:
+    """Run `command` and stream stdout/stderr back chunk by chunk as it's produced.
+
+    Sends 0+ `exec_chunk` messages followed by exactly one `exec_done`, instead
+    of buffering the whole output and replying once — long-running commands
+    (e.g. `docker compose logs -f`, builds) are visible to the caller live
+    instead of only after they finish or hit the request timeout.
+    """
+    send_lock = asyncio.Lock()
+
+    async def _send(payload: dict) -> None:
+        async with send_lock:
+            await ws.send(json.dumps(payload))
+
+    async def _pump(stream, stream_name: str) -> None:
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                break
+            await _send({
+                "type": "exec_chunk",
+                "req_id": req_id,
+                "stream": stream_name,
+                "data": chunk.decode(errors="replace"),
+            })
+
     try:
-        result = subprocess.run(
-            command, shell=True, capture_output=True, text=True, timeout=60,
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             cwd=os.environ.get("HOME", "/"),
         )
-        await ws.send(json.dumps({
-            "type": "exec_response",
-            "req_id": req_id,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "returncode": result.returncode,
-        }))
-    except subprocess.TimeoutExpired:
-        await ws.send(json.dumps({
-            "type": "exec_response",
-            "req_id": req_id,
-            "stdout": "",
-            "stderr": "Command timed out after 60s",
-            "returncode": -1,
-        }))
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(_pump(proc.stdout, "stdout"), _pump(proc.stderr, "stderr"), proc.wait()),
+                timeout=timeout,
+            )
+            returncode = proc.returncode
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            await _send({
+                "type": "exec_chunk", "req_id": req_id, "stream": "stderr",
+                "data": f"\nCommand timed out after {timeout:.0f}s\n",
+            })
+            returncode = -1
+        await _send({"type": "exec_done", "req_id": req_id, "returncode": returncode})
     except Exception as e:
-        await ws.send(json.dumps({
-            "type": "exec_response",
-            "req_id": req_id,
-            "stdout": "",
-            "stderr": str(e),
-            "returncode": -1,
-        }))
+        await _send({"type": "exec_chunk", "req_id": req_id, "stream": "stderr", "data": str(e)})
+        await _send({"type": "exec_done", "req_id": req_id, "returncode": -1})
 
 
 async def _handle_fs(ws, req_id: str, op: str, path: str,
@@ -156,7 +178,9 @@ async def connect_and_serve(profile_id: str, ws_url: str) -> None:
 
                     kind = msg.get("type")
                     if kind == "exec":
-                        asyncio.create_task(_handle_exec(ws, msg["req_id"], msg["command"]))
+                        asyncio.create_task(_handle_exec(
+                            ws, msg["req_id"], msg["command"], msg.get("timeout", 900),
+                        ))
                     elif kind == "fs_request":
                         asyncio.create_task(_handle_fs(
                             ws, msg["req_id"], msg.get("op", ""), msg.get("path", ""),
