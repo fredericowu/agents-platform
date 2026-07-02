@@ -14,6 +14,7 @@ import re
 import tempfile
 import threading
 import time as _time
+from datetime import timezone
 from typing import Any
 from uuid import uuid4
 
@@ -216,7 +217,13 @@ def progress_events(run_id: str, s: Session = Depends(get_session)) -> dict:
            .all())
     return {
         "status": run.status,
-        "started_at": run.started_at.timestamp() if run.started_at else None,
+        # started_at is stored as a naive UTC datetime (models._now() ==
+        # datetime.utcnow()). datetime.timestamp() assumes naive values are in
+        # local time, so on a non-UTC host it silently skews the epoch by the
+        # host's UTC offset — pushing the mini app's timer's t0 into the future
+        # and freezing it at "0s" (Math.max(0, ...) clamp). Pin tzinfo=utc so
+        # the conversion is correct regardless of process timezone.
+        "started_at": run.started_at.replace(tzinfo=timezone.utc).timestamp() if run.started_at else None,
         "events": [
             {"kind": e.kind, "node_id": e.node_id, "payload": e.payload or {}}
             for e in evs
