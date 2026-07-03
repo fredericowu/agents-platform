@@ -90,6 +90,7 @@ def _agent_to_runtime(s: Session, agent: Agent) -> dict[str, Any]:
     _data_home = _os.path.join(_aw_base, "data", "home")
     _perm_volumes: dict[str, str | list[str]] = {
         "docker": "/var/run/docker.sock:/var/run/docker.sock",
+        "tmp_access": "/tmp:/tmp",
         "github": [
             v for v in [
                 f"{_data_home}/.gitconfig:/home/ubuntu/.gitconfig:ro"
@@ -108,6 +109,22 @@ def _agent_to_runtime(s: Session, agent: Agent) -> dict[str, Any]:
                 if container not in seen_container:
                     extra_volumes.append(vol)
                     seen_container.add(container)
+    # "Agentic Workspace Folder Access" OFF means docker_agent mounts an empty
+    # tmpfs at cwd instead of the real repo (see mount_cwd below) — so `.tmp`
+    # under that cwd is a fresh, LOCAL, non-shared directory that vanishes
+    # when the container exits, even though `.tmp` is documented workspace-wide
+    # as durable state bind-mounted from `data/tmp` on the host. Any agent/tool
+    # that reads or writes a `.tmp/...` path from *inside* such a container
+    # (not just passing the path to a host-side MCP tool) silently gets a
+    # throwaway copy instead of the shared one — this bit the remote-agent
+    # update-artifact flow. Bind the SAME host path the workspace-mounted case
+    # would expose, at the identical container path, so `.tmp` behaves
+    # consistently regardless of the workspace_access toggle.
+    if not permissions.get("workspace_access", True):
+        _tmp_container = f"{_aw_base}/.tmp"
+        if _tmp_container not in seen_container:
+            extra_volumes.append(f"{_aw_base}/.tmp:{_tmp_container}")
+            seen_container.add(_tmp_container)
     if extra_volumes:
         params["extra_volumes"] = extra_volumes
     # share_network: join aw-sandbox's docker netns instead of the default bridge,
