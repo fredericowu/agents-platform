@@ -361,6 +361,10 @@ _LANG_RE = re.compile(r"\[\[LANG:\s*(\w+)\]\]", re.IGNORECASE)
 
 
 def _parse_markers(raw: str):
+    """Backward-compatible summary parse (unordered lists) — kept for any
+    external caller that wants "give me everything found" without caring
+    about position. Delivery itself uses `_parse_ordered_blocks` below so
+    each bubble goes out in the order the agent actually wrote it."""
     force_voice = bool(_VOICE_RE.search(raw))
     force_text = bool(_TEXT_RE.search(raw))
     lang_m = _LANG_RE.search(raw)
@@ -403,6 +407,68 @@ def _parse_markers(raw: str):
         "options": options_list,
         "mini_apps": mini_apps,
         "locations": locations,
+    }
+
+
+# Content markers — each produces its own Telegram bubble, in the order it
+# appears in the agent's reply. (VOICE/TEXT/LANG are modal flags, not content,
+# and are scanned/stripped separately — they can appear anywhere.)
+_CONTENT_MARKER_RE = re.compile(
+    "(?:" + "|".join([
+        _ATTACH_RE.pattern, _OPTIONS_RE.pattern, _MINIAPP_RE.pattern, _LOCATION_RE.pattern,
+    ]) + ")",
+    re.IGNORECASE,
+)
+
+
+def _parse_ordered_blocks(raw: str):
+    """Split a reply into an ordered list of delivery blocks, preserving the
+    position each marker was written in relative to surrounding prose — so
+    "text A, then options, then text B" is delivered as three bubbles in
+    that order instead of options-always-first."""
+    force_voice = bool(_VOICE_RE.search(raw))
+    force_text = bool(_TEXT_RE.search(raw))
+    lang_m = _LANG_RE.search(raw)
+    force_lang = lang_m.group(1).lower() if lang_m else ""
+
+    body = raw
+    for pat in (_VOICE_RE, _TEXT_RE, _LANG_RE):
+        body = pat.sub("", body)
+
+    blocks: list[dict] = []
+    pos = 0
+    for m in _CONTENT_MARKER_RE.finditer(body):
+        prose = body[pos:m.start()].strip()
+        if prose:
+            blocks.append({"kind": "text", "text": prose})
+
+        segment = m.group(0)
+        am = _ATTACH_RE.fullmatch(segment)
+        om = _OPTIONS_RE.fullmatch(segment)
+        mm = _MINIAPP_RE.fullmatch(segment)
+        lm = _LOCATION_RE.fullmatch(segment)
+        if am:
+            path_part = re.sub(r'\s+caption=.*$', '', am.group("path").strip()).strip()
+            blocks.append({"kind": "attach", "path": path_part, "caption": am.group("caption") or ""})
+        elif om:
+            opts = re.findall(r'[a-z]="([^"]*)"', om.group("rest"))
+            blocks.append({"kind": "options", "question": om.group("q"), "options": opts})
+        elif mm:
+            blocks.append({"kind": "miniapp", "url": mm.group("url"), "text": mm.group("text") or "Open"})
+        elif lm:
+            blocks.append({"kind": "location", "lat": float(lm.group("lat")),
+                           "lon": float(lm.group("lon")), "label": lm.group("label") or ""})
+        pos = m.end()
+
+    trailing = body[pos:].strip()
+    if trailing:
+        blocks.append({"kind": "text", "text": trailing})
+
+    return {
+        "blocks": blocks,
+        "force_voice": force_voice,
+        "force_text": force_text,
+        "force_lang": force_lang,
     }
 
 
@@ -821,81 +887,80 @@ def _deliver_reply(
     inbound_was_voice: bool,
     inbound_lang: str = "",
 ) -> None:
-    parsed = _parse_markers(raw_text or "")
-
-    # Attachments first
-    for att in parsed["attachments"]:
-        path = att["path"]
-        caption = att["caption"]
-        if not os.path.exists(path):
-            log.warning("ATTACH path not found: %s", path)
-            continue
-        ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
-        if ext in ("png", "jpg", "jpeg", "webp", "gif"):
-            try:
-                _send_photo(token, chat_id, path, caption)
-            except Exception as e:
-                log.warning("send_photo failed: %s", e)
-        else:
-            try:
-                _send_document(token, chat_id, path, caption)
-            except Exception as e:
-                log.warning("send_document failed: %s", e)
-
-    # Options
-    for opts in parsed["options"]:
-        try:
-            _send_options(token, chat_id, opts["question"], opts["options"])
-        except Exception as e:
-            log.warning("send_options failed: %s", e)
-
-    # Locations — native map bubble, tap to expand (same UX as WhatsApp),
-    # followed by the address as plain text if a label was given
-    for loc in parsed["locations"]:
-        _send_location(token, chat_id, loc["lat"], loc["lon"], loc["label"])
-
-    # Mini-apps — proper web_app inline button (launches Telegram mini-app)
-    for ma in parsed["mini_apps"]:
-        try:
-            _send_message(
-                token, chat_id,
-                ma["text"] or ma["url"],
-                reply_markup={"inline_keyboard": [[
-                    {"text": "🖥 Open", "web_app": {"url": ma["url"]}}
-                ]]},
-            )
-        except Exception as e:
-            log.warning("mini_app send failed: %s", e)
-
-    text = parsed["text"]
-    if not text or text.lower() in ("(sent)", "(done)", "ok", "okay", "."):
-        return
-
+    parsed = _parse_ordered_blocks(raw_text or "")
     wants_voice = (inbound_was_voice or parsed["force_voice"]) and not parsed["force_text"]
+    reply_lang = ""
 
-    if wants_voice:
-        reply_lang = parsed["force_lang"] or _detect_lang(text) or inbound_lang or "pt"
-        try:
-            ogg = (asyncio.run_coroutine_threadsafe(_tts(text, reply_lang), _MAIN_LOOP).result(timeout=30)
-                   if _MAIN_LOOP else asyncio.run(_tts(text, reply_lang)))
-            _send_voice(token, chat_id, ogg, caption=_md_to_html(text[:1024]))
-            return
-        except Exception as e:
-            log.warning("TTS failed, falling back to text: %s", e)
+    for block in parsed["blocks"]:
+        kind = block["kind"]
 
-    # One Telegram bubble per paragraph (each is a distinct narration step),
-    # further chunked only if a single paragraph exceeds Telegram's size limit.
-    for segment in _split_into_messages(text):
-        for chunk in _chunk_text(segment):
-            try:
-                _send_message(token, chat_id, _md_to_html(chunk), parse_mode="HTML")
-            except Exception:
+        if kind == "attach":
+            path = block["path"]
+            caption = block["caption"]
+            if not os.path.exists(path):
+                log.warning("ATTACH path not found: %s", path)
+                continue
+            ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+            if ext in ("png", "jpg", "jpeg", "webp", "gif"):
                 try:
-                    # Telegram rejected the HTML — retry as plain text (no asterisks)
-                    _send_message(token, chat_id, _strip_markdown(chunk), parse_mode="")
+                    _send_photo(token, chat_id, path, caption)
                 except Exception as e:
-                    log.warning("send_message failed: %s", e)
-                    return
+                    log.warning("send_photo failed: %s", e)
+            else:
+                try:
+                    _send_document(token, chat_id, path, caption)
+                except Exception as e:
+                    log.warning("send_document failed: %s", e)
+
+        elif kind == "options":
+            try:
+                _send_options(token, chat_id, block["question"], block["options"])
+            except Exception as e:
+                log.warning("send_options failed: %s", e)
+
+        elif kind == "location":
+            _send_location(token, chat_id, block["lat"], block["lon"], block["label"])
+
+        elif kind == "miniapp":
+            try:
+                _send_message(
+                    token, chat_id,
+                    block["text"] or block["url"],
+                    reply_markup={"inline_keyboard": [[
+                        {"text": "🖥 Open", "web_app": {"url": block["url"]}}
+                    ]]},
+                )
+            except Exception as e:
+                log.warning("mini_app send failed: %s", e)
+
+        elif kind == "text":
+            text = block["text"]
+            if not text or text.lower() in ("(sent)", "(done)", "ok", "okay", "."):
+                continue
+
+            if wants_voice:
+                if not reply_lang:
+                    reply_lang = parsed["force_lang"] or _detect_lang(text) or inbound_lang or "pt"
+                try:
+                    ogg = (asyncio.run_coroutine_threadsafe(_tts(text, reply_lang), _MAIN_LOOP).result(timeout=30)
+                           if _MAIN_LOOP else asyncio.run(_tts(text, reply_lang)))
+                    _send_voice(token, chat_id, ogg, caption=_md_to_html(text[:1024]))
+                    continue
+                except Exception as e:
+                    log.warning("TTS failed, falling back to text: %s", e)
+
+            # One Telegram bubble per paragraph (each is a distinct narration
+            # step), further chunked only if a paragraph exceeds Telegram's limit.
+            for segment in _split_into_messages(text):
+                for chunk in _chunk_text(segment):
+                    try:
+                        _send_message(token, chat_id, _md_to_html(chunk), parse_mode="HTML")
+                    except Exception:
+                        try:
+                            # Telegram rejected the HTML — retry as plain text
+                            _send_message(token, chat_id, _strip_markdown(chunk), parse_mode="")
+                        except Exception as e:
+                            log.warning("send_message failed: %s", e)
 
 
 async def deliver_recovered_run(run_id: str, output_text: str) -> None:
