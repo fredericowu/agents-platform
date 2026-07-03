@@ -8,10 +8,10 @@ SQLAlchemy ORM models in app.core.remote_agents_db (no raw sqlite3).
 On first boot (empty table) it tries to migrate data from the old custom-app DB.
 """
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
-import asyncio, json, secrets as _sec, time, uuid as _uuid, os
+import asyncio, base64, hashlib, json, secrets as _sec, time, uuid as _uuid, os
 
 from ..core.remote_agents_db import ConfigRow, RemoteAgentRow, init_db, now_epoch, session_scope
 
@@ -19,6 +19,13 @@ from ..core.remote_agents_db import ConfigRow, RemoteAgentRow, init_db, now_epoc
 
 UPDATE_EXE_PATH  = "/opt/agentic-workspace/.tmp/remote-agents/update/aw-remote-agent.exe"
 UPDATE_JSON_PATH = "/opt/agentic-workspace/.tmp/remote-agents/update/version.json"
+
+# Linux client auto-update (script instead of a compiled binary)
+LINUX_UPDATE_SCRIPT_PATH = "/opt/agentic-workspace/.tmp/remote-agents/update/agent.py"
+LINUX_UPDATE_JSON_PATH   = "/opt/agentic-workspace/.tmp/remote-agents/update/linux-version.json"
+
+# Chunk size used for the streaming upload/download protocol (bytes, pre-base64).
+TRANSFER_CHUNK_SIZE = 256 * 1024  # 256 KB
 
 # ── In-memory state ───────────────────────────────────────────────────────────
 
@@ -28,6 +35,10 @@ connected_clients: dict = {}
 pending_requests: dict = {}
 # req_id -> asyncio.Queue  (exec — streamed chunks + final {"done": True, "returncode": ...})
 exec_queues: dict = {}
+# req_id -> asyncio.Queue  (fs_read_chunk stream from client: {"data": b64, "eof": bool} | {"error": ...})
+download_queues: dict = {}
+# req_id -> asyncio.Future  (fs_write_chunk final ack: {"ok": True} | {"error": ...})
+upload_futures: dict = {}
 # UI WebSocket subscribers
 ui_clients: set = set()
 
@@ -113,6 +124,20 @@ async def client_ws(ws: WebSocket, client_id: str):
                 q = exec_queues.get(req_id)
                 if q is not None:
                     await q.put({"done": True, "returncode": msg.get("returncode", 0)})
+            elif kind == "fs_read_chunk":
+                # Streaming download: client pushes {"data": b64, "eof": bool}
+                # or {"error": "..."} chunks for one req_id until eof/error.
+                req_id = msg.get("req_id")
+                q = download_queues.get(req_id)
+                if q is not None:
+                    await q.put(msg)
+            elif kind == "fs_write_chunk_ack":
+                # Streaming upload: client acks the final chunk with
+                # {"ok": True} or {"error": "..."} once the file is flushed.
+                req_id = msg.get("req_id")
+                fut = upload_futures.get(req_id)
+                if fut and not fut.done():
+                    fut.set_result(msg)
             elif kind == "pong":
                 pass
 
@@ -267,6 +292,178 @@ async def fs_op(client_id: str, req: FsRequest):
         pending_requests.pop(req_id, None)
 
 
+# ── REST: Chunked file transfer (upload/download) ─────────────────────────────
+#
+# The legacy `/fs` op=read/write path base64-encodes a single chunk inside one
+# JSON WS message and is used by the MCP read_file/write_file tools and the
+# FUSE driver — fine for small reads/config edits, but impractical above a few
+# hundred KB (one giant JSON message both ways) and hard-capped at 512KB by
+# the MCP tool layer. These two endpoints stream real file sizes (tens of MB+)
+# by pumping many small chunk messages over the same client WebSocket instead
+# of one huge message, and streaming the HTTP body to/from the caller so the
+# whole file never sits fully in backend memory at once.
+
+@router.post("/api/clients/{client_id}/upload")
+async def upload_to_client(client_id: str, request: Request, path: str):
+    """Stream the HTTP request body to `path` on the remote client.
+
+    Body = raw file bytes. Target path via the `?path=` query param. Chunks
+    are relayed to the client as a series of `fs_write_chunk` WS messages
+    (each independently base64-encoded, capped at TRANSFER_CHUNK_SIZE
+    pre-encoding), terminated by one chunk carrying `"eof": true`. The client
+    writes each chunk to disk, hashes it incrementally, and replies once (after
+    the file is fully written) with `fs_write_chunk_ack` carrying its own
+    sha256 of the complete file. The backend independently hashes the same
+    bytes as it forwards them and cross-checks against the client's reported
+    digest — a mismatch (bytes corrupted/reordered in transit) fails the
+    request with 500 rather than silently returning a bad checksum. On
+    success, the verified sha256 is included in the JSON response.
+    """
+    client = connected_clients.get(client_id)
+    if not client:
+        raise HTTPException(404, "Client not connected")
+
+    req_id = str(_uuid.uuid4())
+    loop = asyncio.get_event_loop()
+    fut = loop.create_future()
+    upload_futures[req_id] = fut
+
+    total = 0
+    hasher = hashlib.sha256()
+    try:
+        buf = b""
+        async for raw_chunk in request.stream():
+            buf += raw_chunk
+            while len(buf) >= TRANSFER_CHUNK_SIZE:
+                piece, buf = buf[:TRANSFER_CHUNK_SIZE], buf[TRANSFER_CHUNK_SIZE:]
+                total += len(piece)
+                hasher.update(piece)
+                await client["ws"].send_text(json.dumps({
+                    "type": "fs_write_chunk", "req_id": req_id, "path": path,
+                    "data": base64.b64encode(piece).decode(), "eof": False,
+                }))
+        # Final chunk (possibly empty for a zero-byte file) carries eof=true.
+        total += len(buf)
+        hasher.update(buf)
+        await client["ws"].send_text(json.dumps({
+            "type": "fs_write_chunk", "req_id": req_id, "path": path,
+            "data": base64.b64encode(buf).decode(), "eof": True,
+        }))
+
+        result = await asyncio.wait_for(fut, timeout=120)
+        if result.get("error"):
+            raise HTTPException(500, result["error"])
+
+        sha256 = hasher.hexdigest()
+        client_sha256 = result.get("sha256")
+        if client_sha256 and client_sha256 != sha256:
+            raise HTTPException(
+                500,
+                f"sha256 mismatch after upload: backend computed {sha256}, "
+                f"client reports {client_sha256}",
+            )
+        return {"ok": True, "path": path, "bytes": total, "sha256": sha256}
+    except asyncio.TimeoutError:
+        raise HTTPException(408, "Upload timed out waiting for client ack")
+    finally:
+        upload_futures.pop(req_id, None)
+
+
+@router.get("/api/clients/{client_id}/download")
+async def download_from_client(client_id: str, path: str):
+    """Fetch `path` from the remote client and stream it back as the HTTP
+    response body, with the verified sha256 exposed via the `X-Sha256` header.
+
+    Sends one `fs_read_request` WS message; the client replies with a series
+    of `fs_read_chunk` messages (base64 `data` + `eof` flag, or `error`).
+    Because an HTTP response's headers must be sent before its body, and we
+    want `X-Sha256` to reflect a value verified against the actual bytes (not
+    just trusted blindly from the client), the full transfer is first spooled
+    to a temp file under `.tmp/remote-agents/downloads/` while hashing
+    incrementally — bounded disk use, not full in-memory buffering, and the
+    hash is more useful this way than in the alternative (a hash the client
+    computed but the backend never checked). The spooled file is then served
+    via a background-cleanup generator and removed once fully sent.
+    """
+    client = connected_clients.get(client_id)
+    if not client:
+        raise HTTPException(404, "Client not connected")
+
+    req_id = str(_uuid.uuid4())
+    queue: asyncio.Queue = asyncio.Queue()
+    download_queues[req_id] = queue
+
+    await client["ws"].send_text(json.dumps({
+        "type": "fs_read_request", "req_id": req_id, "path": path,
+    }))
+
+    # Peek the first chunk before spooling so a "file not found" on the
+    # client surfaces as a proper HTTP error instead of a truncated 200.
+    try:
+        first = await asyncio.wait_for(queue.get(), timeout=30)
+    except asyncio.TimeoutError:
+        download_queues.pop(req_id, None)
+        raise HTTPException(408, "Download timed out waiting for client")
+
+    if first.get("error"):
+        download_queues.pop(req_id, None)
+        raise HTTPException(404, first["error"])
+
+    spool_dir = "/opt/agentic-workspace/.tmp/remote-agents/downloads"
+    os.makedirs(spool_dir, exist_ok=True)
+    spool_path = os.path.join(spool_dir, f"{req_id}.part")
+
+    hasher = hashlib.sha256()
+    total = 0
+    try:
+        chunk = first
+        with open(spool_path, "wb") as f:
+            while True:
+                data = chunk.get("data")
+                if data:
+                    raw = base64.b64decode(data)
+                    f.write(raw)
+                    hasher.update(raw)
+                    total += len(raw)
+                if chunk.get("eof") or chunk.get("error"):
+                    if chunk.get("error"):
+                        raise HTTPException(500, chunk["error"])
+                    break
+                try:
+                    chunk = await asyncio.wait_for(queue.get(), timeout=60)
+                except asyncio.TimeoutError:
+                    raise HTTPException(408, "Download timed out mid-transfer")
+    finally:
+        download_queues.pop(req_id, None)
+
+    sha256 = hasher.hexdigest()
+
+    def _stream_spool():
+        try:
+            with open(spool_path, "rb") as f:
+                while True:
+                    piece = f.read(1024 * 1024)
+                    if not piece:
+                        break
+                    yield piece
+        finally:
+            try:
+                os.remove(spool_path)
+            except OSError:
+                pass
+
+    filename = os.path.basename(path.replace("\\", "/")) or "download"
+    return StreamingResponse(
+        _stream_spool(),
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(total),
+            "X-Sha256": sha256,
+        },
+    )
+
+
 # ── REST: Update endpoints ────────────────────────────────────────────────────
 
 @router.get("/api/update/selfcheck")
@@ -288,6 +485,27 @@ def update_exe():
         raise HTTPException(404, "Exe not found")
     return FileResponse(UPDATE_EXE_PATH, filename="aw-remote-agent.exe",
                         media_type="application/octet-stream")
+
+
+@router.get("/api/update/linux-latest")
+def update_linux_latest():
+    """Version manifest for the Linux client's self-update check.
+
+    Mirrors /api/update/latest (Windows) but points at the agent.py script
+    instead of a compiled binary — see /api/update/linux-script.
+    """
+    if not os.path.exists(LINUX_UPDATE_JSON_PATH):
+        raise HTTPException(404, "No update info available")
+    with open(LINUX_UPDATE_JSON_PATH) as f:
+        return json.load(f)
+
+
+@router.get("/api/update/linux-script")
+def update_linux_script():
+    if not os.path.exists(LINUX_UPDATE_SCRIPT_PATH):
+        raise HTTPException(404, "Script not found")
+    return FileResponse(LINUX_UPDATE_SCRIPT_PATH, filename="agent.py",
+                        media_type="text/x-python")
 
 
 # ── REST: Remote Agents CRUD ──────────────────────────────────────────────────

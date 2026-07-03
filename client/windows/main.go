@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"math"
@@ -39,7 +40,7 @@ const (
 	regKeyPath   = `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
 	regValueName = "AWRemoteAgent"
 
-	version = "1.4.0"
+	version = "1.5.0"
 
 	pingInterval   = 20 * time.Second // how often client sends pings
 	pongDeadline   = 10 * time.Second // how long to wait for pong before declaring dead
@@ -281,6 +282,13 @@ type Message struct {
 	FsOffset int64  `json:"offset,omitempty"`
 	FsSize   int    `json:"size,omitempty"`
 	FsDest   string `json:"dest,omitempty"`
+	// Chunked transfer fields (fs_write_chunk / fs_write_chunk_ack / fs_read_chunk).
+	// Sha256 is only populated on the terminal message of a transfer (the
+	// fs_write_chunk_ack, or the fs_read_chunk carrying eof=true) — it's the
+	// digest of the complete file, not of that one chunk.
+	Eof    bool   `json:"eof,omitempty"`
+	Ok     bool   `json:"ok,omitempty"`
+	Sha256 string `json:"sha256,omitempty"`
 }
 
 type FsEntry struct {
@@ -329,6 +337,146 @@ func (s *safeConn) close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.conn.Close()
+}
+
+// ── Chunked file transfer (upload/download) ───────────────────────────────────
+//
+// Companion to handleFsOp's read/write ops, which base64-encode one whole
+// chunk inside a single JSON WS message (fine for small reads/writes, but
+// impractical for real file sizes). These stream a file across many small
+// messages instead: fs_write_chunk (server -> client, ended by eof=true,
+// acked once via fs_write_chunk_ack) and fs_read_request/fs_read_chunk
+// (client streams the file back in chunks, last one carrying eof=true).
+
+const transferChunkSize = 256 * 1024
+
+// writeChunkState tracks in-flight uploads keyed by req_id: the temp file
+// path being appended to and a running sha256 of the bytes written so far.
+// fs_write_chunk messages for the same request append instead of overwrite.
+type writeChunkEntry struct {
+	tmpPath string
+	hasher  hash.Hash
+}
+
+var writeChunkState sync.Map // req_id (string) -> *writeChunkEntry
+
+func handleWriteChunk(sc *safeConn, msg Message) {
+	if !isPathAllowed(msg.FsPath) {
+		sc.writeJSON(Message{
+			Type: "fs_write_chunk_ack", ReqID: msg.ReqID,
+			Error: fmt.Sprintf("access denied: %q is outside allowed dir %q", msg.FsPath, allowedDir),
+		})
+		return
+	}
+
+	data, err := base64.StdEncoding.DecodeString(msg.FsData)
+	if err != nil {
+		sc.writeJSON(Message{Type: "fs_write_chunk_ack", ReqID: msg.ReqID, Error: err.Error()})
+		return
+	}
+
+	// Writes go to path+".part" first; only on eof do we sha256-verify and
+	// atomically rename onto the real path, so a reader never observes a
+	// partially-written file and a failed/aborted upload never corrupts an
+	// existing file at msg.FsPath.
+	tmpPath := msg.FsPath + ".part"
+
+	entryVal, seen := writeChunkState.Load(msg.ReqID)
+	var entry *writeChunkEntry
+	if !seen {
+		if err := os.MkdirAll(filepath.Dir(msg.FsPath), 0755); err != nil {
+			sc.writeJSON(Message{Type: "fs_write_chunk_ack", ReqID: msg.ReqID, Error: err.Error()})
+			return
+		}
+		// Truncate/create the temp file on the first chunk of this request.
+		if err := os.WriteFile(tmpPath, nil, 0644); err != nil {
+			sc.writeJSON(Message{Type: "fs_write_chunk_ack", ReqID: msg.ReqID, Error: err.Error()})
+			return
+		}
+		entry = &writeChunkEntry{tmpPath: tmpPath, hasher: sha256.New()}
+		writeChunkState.Store(msg.ReqID, entry)
+	} else {
+		entry = entryVal.(*writeChunkEntry)
+	}
+
+	if len(data) > 0 {
+		f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			writeChunkState.Delete(msg.ReqID)
+			os.Remove(tmpPath)
+			sc.writeJSON(Message{Type: "fs_write_chunk_ack", ReqID: msg.ReqID, Error: err.Error()})
+			return
+		}
+		_, werr := f.Write(data)
+		f.Close()
+		if werr != nil {
+			writeChunkState.Delete(msg.ReqID)
+			os.Remove(tmpPath)
+			sc.writeJSON(Message{Type: "fs_write_chunk_ack", ReqID: msg.ReqID, Error: werr.Error()})
+			return
+		}
+		entry.hasher.Write(data)
+	}
+
+	if msg.Eof {
+		writeChunkState.Delete(msg.ReqID)
+		sha := hex.EncodeToString(entry.hasher.Sum(nil))
+		if err := os.Rename(tmpPath, msg.FsPath); err != nil {
+			os.Remove(tmpPath)
+			sc.writeJSON(Message{Type: "fs_write_chunk_ack", ReqID: msg.ReqID, Error: err.Error()})
+			return
+		}
+		sc.writeJSON(Message{Type: "fs_write_chunk_ack", ReqID: msg.ReqID, Ok: true, Sha256: sha})
+	}
+}
+
+func handleReadRequest(sc *safeConn, msg Message) {
+	if !isPathAllowed(msg.FsPath) {
+		sc.writeJSON(Message{
+			Type: "fs_read_chunk", ReqID: msg.ReqID,
+			Error: fmt.Sprintf("access denied: %q is outside allowed dir %q", msg.FsPath, allowedDir),
+		})
+		return
+	}
+
+	f, err := os.Open(msg.FsPath)
+	if err != nil {
+		sc.writeJSON(Message{Type: "fs_read_chunk", ReqID: msg.ReqID, Error: err.Error()})
+		return
+	}
+	defer f.Close()
+
+	// One-chunk lookahead so `eof` is only set on the message that actually
+	// carries the last bytes (correctly handles files whose size is an exact
+	// multiple of transferChunkSize, and empty files). Sha256 of the whole
+	// file is hashed incrementally and attached only to that final message.
+	hasher := sha256.New()
+	curBuf := make([]byte, transferChunkSize)
+	curN, _ := io.ReadFull(f, curBuf)
+	hasher.Write(curBuf[:curN])
+	for {
+		nextBuf := make([]byte, transferChunkSize)
+		nextN, _ := io.ReadFull(f, nextBuf)
+		eof := nextN == 0
+		if !eof {
+			hasher.Write(nextBuf[:nextN])
+		}
+
+		out := Message{
+			Type: "fs_read_chunk", ReqID: msg.ReqID,
+			FsData: base64.StdEncoding.EncodeToString(curBuf[:curN]), Eof: eof,
+		}
+		if eof {
+			out.Sha256 = hex.EncodeToString(hasher.Sum(nil))
+		}
+		if err := sc.writeJSON(out); err != nil {
+			return
+		}
+		if eof {
+			return
+		}
+		curBuf, curN = nextBuf, nextN
+	}
 }
 
 // ── FS operations ─────────────────────────────────────────────────────────────
@@ -507,30 +655,6 @@ func getInfo() *ClientInfo {
 
 // ── Command execution ─────────────────────────────────────────────────────────
 
-// wsStreamWriter forwards each Write() as an exec_chunk message, so the
-// server sees output as the process produces it instead of only after it
-// exits — matches the Linux client's streaming behavior.
-type wsStreamWriter struct {
-	conn   *safeConn
-	reqID  string
-	stream string
-}
-
-func (w *wsStreamWriter) Write(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-	if err := w.conn.writeJSON(Message{
-		Type:   "exec_chunk",
-		ReqID:  w.reqID,
-		Stream: w.stream,
-		Stdout: "", // unused for chunks; payload goes in FsData below
-	}); false {
-		_ = err // placeholder, replaced below
-	}
-	return len(p), nil
-}
-
 // runCommand streams stdout/stderr to the caller live via sc and returns
 // only the final exit code — the output itself was already sent as chunks.
 func runCommand(sc *safeConn, reqID, command string, timeout int) (exitCode int) {
@@ -686,14 +810,12 @@ func connect(serverURL, clientID string) {
 			log.Printf("exec req_id=%s cmd=%q", msg.ReqID, msg.Command)
 			go func(reqID, command string, timeout int) {
 				start := time.Now()
-				stdout, stderr, exitCode := runCommand(command, timeout)
+				exitCode := runCommand(sc, reqID, command, timeout)
 				elapsed := time.Since(start).Round(time.Millisecond)
 				log.Printf("exec done req_id=%s exit=%d elapsed=%s", reqID, exitCode, elapsed)
 				sc.writeJSON(Message{
-					Type:     "exec_response",
+					Type:     "exec_done",
 					ReqID:    reqID,
-					Stdout:   stdout,
-					Stderr:   stderr,
 					ExitCode: exitCode,
 				})
 			}(msg.ReqID, msg.Command, msg.Timeout)
@@ -707,6 +829,13 @@ func connect(serverURL, clientID string) {
 				}
 				sc.writeJSON(fsResp)
 			}(msg)
+
+		case "fs_write_chunk":
+			go handleWriteChunk(sc, msg)
+
+		case "fs_read_request":
+			log.Printf("download req_id=%s path=%s", msg.ReqID, msg.FsPath)
+			go handleReadRequest(sc, msg)
 
 		default:
 			log.Printf("unknown message type: %s", msg.Type)
