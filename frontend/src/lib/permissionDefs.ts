@@ -13,4 +13,8 @@ export const PERMISSION_DEFS: { key: string; label: string; description: string;
     key: "tmp_access", label: "/tmp access",
     description: "Bind-mount the host's /tmp directory into the container at /tmp — lets the agent read/write host scratch files shared with other processes.",
   },
+  {
+    key: "verbose_replies", label: "Verbose replies", defaultOn: true,
+    description: "Deliver the full run transcript (narration + tool results, not just the post-last-tool-call text) as the chat reply, instead of truncating to the final segment. On by default — still one message, just untruncated. Turn off for an agent if its narration is too noisy for chat.",
+  },
 ];

@@ -153,7 +153,8 @@ def _agent_to_runtime(s: Session, agent: Agent) -> dict[str, Any]:
             "params": params,
             "system_prompt": system_prompt,
             "tool_specs": list(agent.tool_specs or []),
-            "skill_slugs": list(agent.skill_slugs or [])}
+            "skill_slugs": list(agent.skill_slugs or []),
+            "verbose_replies": bool(permissions.get("verbose_replies", True))}
 
 
 async def _notify_kanban_run_done(*, run_id: str, agent_slug: str,
@@ -374,9 +375,17 @@ async def run_agent(
                         await emit(meta_kind, meta_payload or {}, node=node_id or agent_slug)
                         # A new tool call means everything narrated so far was
                         # progress, not the final answer — drop it so only the
-                        # post-last-tool message reaches Telegram.
+                        # post-last-tool message reaches Telegram. Agents with
+                        # the "Verbose replies" permission opt out: they want
+                        # the full narration delivered (still as one message,
+                        # just untruncated) instead of losing everything before
+                        # the last tool call.
                         if meta_kind == "tool_call":
-                            reply_text = ""
+                            if runtime.get("verbose_replies"):
+                                if reply_text.strip() and not reply_text.endswith("\n\n"):
+                                    reply_text += "\n\n"
+                            else:
+                                reply_text = ""
                         # Persist session_id from system.init so callers can resume later.
                         if meta_kind == "system.init" and meta_payload and run_id:
                             if _t_system_init is None:
