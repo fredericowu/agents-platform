@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures as _cf
 import hmac
+import html
 import logging
 import os
 import queue
@@ -76,6 +77,21 @@ def _send_message(token: str, chat_id: str, text: str, parse_mode: str = "HTML",
             except Exception:
                 pass
         log.warning("sendMessage failed: %s", e.detail)
+
+
+def _send_location(token: str, chat_id: str, lat: float, lon: float, label: str = "") -> None:
+    """Native Telegram location bubble — a tappable map thumbnail, the same
+    UX as WhatsApp's location share. No mini-app/HTML needed; Telegram
+    renders and hosts the map itself. ``label`` (e.g. the reverse-geocoded
+    address) rides along as a plain text bubble right after — Telegram's
+    sendLocation has no caption field of its own."""
+    try:
+        _tg(token, "sendLocation", chat_id=chat_id, latitude=lat, longitude=lon)
+    except Exception as e:
+        log.warning("sendLocation failed: %s", e)
+        return
+    if label:
+        _send_message(token, chat_id, label, parse_mode="HTML")
 
 
 def _send_voice(token: str, chat_id: str, ogg_bytes: bytes, caption: str = "") -> None:
@@ -334,6 +350,11 @@ _MINIAPP_RE = re.compile(
     r'\[\[MINIAPP:\s*url=(?P<url>\S+)(?:\s+text="(?P<text>[^"]*)")?\s*\]\]',
     re.IGNORECASE,
 )
+_LOCATION_RE = re.compile(
+    r"\[\[LOCATION:\s*lat=(?P<lat>-?\d+(?:\.\d+)?)\s+lon=(?P<lon>-?\d+(?:\.\d+)?)"
+    r'(?:\s+label="(?P<label>[^"]*)")?\s*\]\]',
+    re.IGNORECASE,
+)
 _VOICE_RE = re.compile(r"\[\[VOICE\]\]", re.IGNORECASE)
 _TEXT_RE = re.compile(r"\[\[TEXT\]\]", re.IGNORECASE)
 _LANG_RE = re.compile(r"\[\[LANG:\s*(\w+)\]\]", re.IGNORECASE)
@@ -362,9 +383,14 @@ def _parse_markers(raw: str):
     for m in _MINIAPP_RE.finditer(raw):
         mini_apps.append({"url": m.group("url"), "text": m.group("text") or "Open"})
 
+    locations = []
+    for m in _LOCATION_RE.finditer(raw):
+        locations.append({"lat": float(m.group("lat")), "lon": float(m.group("lon")),
+                          "label": m.group("label") or ""})
+
     # Strip all markers from prose
     text = raw
-    for pat in (_ATTACH_RE, _OPTIONS_RE, _MINIAPP_RE, _VOICE_RE, _TEXT_RE, _LANG_RE):
+    for pat in (_ATTACH_RE, _OPTIONS_RE, _MINIAPP_RE, _LOCATION_RE, _VOICE_RE, _TEXT_RE, _LANG_RE):
         text = pat.sub("", text)
     text = text.strip()
 
@@ -376,6 +402,7 @@ def _parse_markers(raw: str):
         "attachments": attachments,
         "options": options_list,
         "mini_apps": mini_apps,
+        "locations": locations,
     }
 
 
@@ -821,6 +848,11 @@ def _deliver_reply(
             _send_options(token, chat_id, opts["question"], opts["options"])
         except Exception as e:
             log.warning("send_options failed: %s", e)
+
+    # Locations — native map bubble, tap to expand (same UX as WhatsApp),
+    # followed by the address as plain text if a label was given
+    for loc in parsed["locations"]:
+        _send_location(token, chat_id, loc["lat"], loc["lon"], loc["label"])
 
     # Mini-apps — proper web_app inline button (launches Telegram mini-app)
     for ma in parsed["mini_apps"]:
@@ -2449,6 +2481,11 @@ class TelegramInject(BaseModel):
     bot_id: str
     chat_id: str
     text: str
+    # When set, the injected text is echoed into the chat first (tagged with
+    # this label, e.g. "Apple Watch") before the agent runs — so a human
+    # reading Telegram sees what triggered the reply. Omit (the aw-tasks cron
+    # use case) and behavior is unchanged: only the agent's reply is posted.
+    source: str | None = None
 
 
 def _verify_inject_secret(x_internal_secret: str = Header(default="")) -> None:
@@ -2459,6 +2496,20 @@ def _verify_inject_secret(x_internal_secret: str = Header(default="")) -> None:
         raise HTTPException(403, "invalid X-Internal-Secret")
 
 
+@router.get("/session-lookup")
+def session_lookup(session_id: str, _auth: None = Depends(_verify_inject_secret),
+                    s: Session = Depends(get_session)) -> dict:
+    """Reverse lookup: given an AP CliSession id, find the (bot_id, chat_id)
+    it's bound to, if any. Lets a non-Telegram caller (e.g. the AW Meta
+    Glasses/Watch backend) discover whether "the session the user currently
+    has selected" is also a live Telegram conversation, before calling
+    /inject. Same trust boundary as /inject (internal secret)."""
+    row = s.query(TelegramSession).filter(TelegramSession.session_id == session_id).first()
+    if not row:
+        raise HTTPException(404, "no telegram session bound to this session_id")
+    return {"bot_id": row.bot_id, "chat_id": row.chat_id}
+
+
 @router.post("/inject")
 def inject_system_message(body: TelegramInject, _auth: None = Depends(_verify_inject_secret),
                            s: Session = Depends(get_session)) -> dict:
@@ -2467,18 +2518,25 @@ def inject_system_message(body: TelegramInject, _auth: None = Depends(_verify_in
     Reuses the same Target/session continuity as a real inbound webhook
     message (so the agent's memory treats it as part of the conversation
     history), but skips the "Processing…" progress button and typing
-    indicator since no real user is watching in real time. Only the agent's
-    reply gets posted back to the chat — the injected text itself is never
-    shown in Telegram, since it never actually arrived through Telegram.
+    indicator since no real user is watching in real time. By default the
+    injected text itself is never shown in Telegram (only the agent's reply
+    is) — pass `source` to echo it first, tagged with that label.
 
-    Internal-only: called by aw-tasks cron scripts, not exposed to the
-    outside. Guarded by AGENTS_TELEGRAM_INJECT_SECRET (X-Internal-Secret
-    header) since this endpoint can otherwise put words in any bot's mouth
-    in any chat it's already talked in.
+    Internal-only: called by aw-tasks cron scripts and the AW Meta
+    Glasses/Watch backend, not exposed to the outside. Guarded by
+    AGENTS_TELEGRAM_INJECT_SECRET (X-Internal-Secret header) since this
+    endpoint can otherwise put words in any bot's mouth in any chat it's
+    already talked in.
     """
     bot = s.query(TelegramBot).filter(TelegramBot.id == body.bot_id).first()
     if not bot or not bot.enabled:
         raise HTTPException(404, "bot not found or disabled")
+
+    if body.source and body.text:
+        _send_message(
+            bot.token, body.chat_id,
+            f"🕐 <b>{html.escape(body.source)}</b>: {html.escape(body.text)}",
+        )
 
     agent_slug = _get_agent_slug_for_chat(bot, bot.id, body.chat_id)
     if not agent_slug:
@@ -2491,15 +2549,23 @@ def inject_system_message(body: TelegramInject, _auth: None = Depends(_verify_in
     target_id = _ensure_target(bot.id, body.chat_id)
     session_id, _ = _get_or_create_session(bot.id, body.chat_id, target_id)
 
+    # `source` means a real person sent this from another channel (e.g. the
+    # AW Watch) — NOT an automated cron/system ping. The aw-agent-telegram
+    # skill's silence guard treats `origin: system` as "no real user, stay
+    # quiet", so a genuine cross-channel message must NOT be tagged that way
+    # or the agent silently drops it (no reply to either Telegram or the
+    # originating channel).
+    is_system = not body.source
     header = (
         f"/aw-agent-telegram\n"
         f"CONTEXT:\n"
         f"- source: telegram\n"
         f"- chat_id: {body.chat_id}\n"
-        f"- user_id: system\n"
+        f"- user_id: {'system' if is_system else body.source}\n"
         f"- bot_id: {bot.id}\n"
-        f"- origin: system\n"
     )
+    if is_system:
+        header += "- origin: system\n"
     full_input = header + f"USER_MESSAGE:\n{body.text}"
 
     run_id = str(uuid4())
@@ -2532,7 +2598,7 @@ def inject_system_message(body: TelegramInject, _auth: None = Depends(_verify_in
         except Exception:
             pass
 
-    return {"run_id": run_id, "status": status, "delivered": bool(output_text)}
+    return {"run_id": run_id, "status": status, "delivered": bool(output_text), "reply": output_text}
 
 
 # Self-contained Mini App page. __RUN_ID__ is substituted at request time.

@@ -44,10 +44,15 @@ def _enrich(s: Session, row: CliSession) -> dict:
 @router.get("", response_model=list[CliSessionOut])
 def list_sessions(
     q: str | None = Query(None),
+    source_slug: str | None = Query(None, description="Only sessions with at least one run from this agent/workflow slug"),
     limit: int = Query(100, ge=1, le=500),
     s: Session = Depends(get_session),
 ):
     qry = s.query(CliSession).order_by(CliSession.updated_at.desc())
+    if source_slug:
+        qry = (qry.join(Run, Run.session_id == CliSession.session_id)
+                  .filter(Run.source_slug == source_slug)
+                  .distinct())
     if q:
         like = f"%{q.lower()}%"
         from sqlalchemy import func as f, or_
