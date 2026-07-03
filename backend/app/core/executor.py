@@ -123,7 +123,14 @@ def _agent_to_runtime(s: Session, agent: Agent) -> dict[str, Any]:
     if not permissions.get("workspace_access", True):
         _tmp_container = f"{_aw_base}/.tmp"
         if _tmp_container not in seen_container:
-            extra_volumes.append(f"{_aw_base}/.tmp:{_tmp_container}")
+            # The docker socket we spawn sibling containers through belongs to
+            # the BARE-METAL host's daemon, not to aw-sandbox's own filesystem
+            # view — so a bind source of "{_aw_base}/.tmp" resolves against
+            # the host's literal /opt/agentic-workspace/.tmp (empty/stale),
+            # not against what aw-sandbox itself sees at that path (which is
+            # its own bind mount of the host's data/tmp). Use the real host
+            # source so sibling containers see the same durable .tmp state.
+            extra_volumes.append(f"{_aw_base}/data/tmp:{_tmp_container}")
             seen_container.add(_tmp_container)
     if extra_volumes:
         params["extra_volumes"] = extra_volumes
