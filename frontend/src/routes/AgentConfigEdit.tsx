@@ -123,18 +123,27 @@ export default function AgentConfigEdit() {
         <div className="card">
           <h2 className="text-base font-semibold mb-1">Extra volumes</h2>
           <p className="text-xs text-muted mb-3">
-            Docker volume mounts injected when an agent using this config runs in a container.
-            One entry per line in <code>host:container</code> format
+            Docker volume mounts injected when an agent using this config runs in a container,
+            in <code>host:container</code> format
             (e.g. <code>/var/run/docker.sock:/var/run/docker.sock</code>).
           </p>
-          <textarea rows={4}
-                    className="font-mono text-xs"
-                    placeholder="/var/run/docker.sock:/var/run/docker.sock"
-                    value={(c.extra_volumes || []).join("\n")}
-                    onChange={e => {
-                      const lines = e.target.value.split("\n").map(l => l.trim()).filter(Boolean);
-                      setC({ ...c, extra_volumes: lines });
-                    }} />
+          {(c.extra_volumes || []).map((vol, i) => (
+            <div key={i} className="flex items-center gap-2 mb-2">
+              <input className="input font-mono text-xs flex-1"
+                     value={vol}
+                     onChange={e => {
+                       const next = [...(c.extra_volumes || [])];
+                       next[i] = e.target.value;
+                       setC({ ...c, extra_volumes: next });
+                     }} />
+              <button className="btn btn-danger text-xs py-1 px-2"
+                      onClick={() => {
+                        const next = (c.extra_volumes || []).filter((_, j) => j !== i);
+                        setC({ ...c, extra_volumes: next });
+                      }}>remove</button>
+            </div>
+          ))}
+          <AddVolumeRow onAdd={vol => setC({ ...c, extra_volumes: [...(c.extra_volumes || []), vol] })} />
         </div>
 
         {/* ───── MCP Config ───── */}
@@ -187,5 +196,30 @@ export default function AgentConfigEdit() {
         </div>
       </div>
     </Page>
+  );
+}
+
+/** Single-line add-row for extra_volumes. A dedicated "Add" button (rather than
+ * relying on pressing Enter inside a shared textarea) so it works reliably on
+ * mobile/iPad soft keyboards, where the on-screen "return" key can submit/blur
+ * instead of committing the entry. Enter still works as a shortcut on desktop. */
+function AddVolumeRow({ onAdd }: { onAdd: (vol: string) => void }) {
+  const [value, setValue] = useState("");
+  const commit = () => {
+    const trimmed = value.trim();
+    if (trimmed) {
+      onAdd(trimmed);
+      setValue("");
+    }
+  };
+  return (
+    <div className="flex items-center gap-2">
+      <input className="input font-mono text-xs flex-1"
+             placeholder="/var/run/docker.sock:/var/run/docker.sock"
+             value={value}
+             onChange={e => setValue(e.target.value)}
+             onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); commit(); } }} />
+      <button className="btn text-xs py-1 px-2" onClick={commit}>+ add</button>
+    </div>
   );
 }

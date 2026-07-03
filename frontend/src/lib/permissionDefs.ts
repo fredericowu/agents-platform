@@ -9,4 +9,8 @@ export const PERMISSION_DEFS: { key: string; label: string; description: string;
     key: "workspace_access", label: "Agentic Workspace Folder Access", defaultOn: true,
     description: "Mount /opt/agentic-workspace into the container so the agent can read/edit the whole AW repo. Off = the agent runs isolated (only its own cwd + /tmp), with no access to the workspace.",
   },
+  {
+    key: "tmp_access", label: "/tmp access",
+    description: "Bind-mount the host's /tmp directory into the container at /tmp — lets the agent read/write host scratch files shared with other processes.",
+  },
 ];

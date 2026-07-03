@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .api import api_router
+from .api import openai_compat
 from .config import settings
 from .core.mcp_client import sync_mcp_servers_from_file
 from .core.executor import recover_orphaned_runs
@@ -40,6 +41,9 @@ app.add_middleware(
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 app.include_router(api_router)
+# OpenAI-compatible surface (/v1/*) — mounted at root, BEFORE the SPA
+# catch-all below so GET /v1/models isn't swallowed by the frontend fallback.
+app.include_router(openai_compat.router)
 
 
 # Serve frontend if built — with SPA fallback for client-side routes

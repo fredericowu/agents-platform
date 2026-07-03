@@ -45,5 +45,9 @@ class Settings(BaseSettings):
     max_run_concurrency: int = 16
     max_node_iterations: int = 30
 
+    # Shared secret for POST /api/telegram/inject (internal-only synthetic
+    # message injection, used by cron/task scripts). Empty disables the route.
+    telegram_inject_secret: str = ""
+
 
 settings = Settings()

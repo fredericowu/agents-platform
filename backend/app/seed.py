@@ -31,6 +31,16 @@ from .models import Agent, Eval, Model, Workflow
 
 WORKSPACE = str(settings.workspace_root)
 
+
+def _self_v1_base_url() -> str:
+    """Base URL of THIS platform's own OpenAI-compatible surface.
+
+    Used by the self-referential ``self-openai-compat`` model so an agent can
+    reach the platform through its own /v1 API (in-process HTTP loopback).
+    """
+    return f"http://127.0.0.1:{settings.port}/v1"
+
+
 def _cli_params(cli: str, model: str | None = None, *, readonly: bool = False, timeout: int = 900) -> dict:
     base = {
         "cli": cli,
@@ -106,6 +116,11 @@ SEED_MODELS = [
      "params": {"cli": "claude", "model": "haiku", "cwd": WORKSPACE,
                 "add_dirs": ["/tmp", WORKSPACE], "dangerous_skip_permissions": True,
                 "stream_json": True, "timeout_s": 600}},
+    {"slug": "claude-cli-fable", "provider": "cli", "model_id": "claude-cli-fable",
+     "display_name": "Claude CLI – Fable 5 (latest, full perms)",
+     "params": {"cli": "claude", "model": "fable", "cwd": WORKSPACE,
+                "add_dirs": ["/tmp", WORKSPACE], "dangerous_skip_permissions": True,
+                "stream_json": True, "timeout_s": 900}},
     {"slug": "claude-cli-readonly", "provider": "cli", "model_id": "claude-cli-readonly",
      "display_name": "Claude CLI – Sonnet (read-only: Read/Grep/Glob/Web)",
      "params": {"cli": "claude", "model": "sonnet", "cwd": WORKSPACE,
@@ -161,6 +176,14 @@ SEED_MODELS = [
      "display_name": "OpenAI – o1 (reasoning)", "params": {}},
     {"slug": "openai-o3-mini", "provider": "openai", "model_id": "o3-mini",
      "display_name": "OpenAI – o3-mini (reasoning, cheap)", "params": {}},
+    # Self-referential: an OpenAI-compat model whose endpoint IS this platform.
+    # ``model_id`` is an OpenAI-compat model name understood by our own /v1
+    # surface (``agent/<slug>``). An agent using this model therefore drives
+    # ANOTHER platform agent through the platform's own API. See the
+    # ``openai-compat-demo`` workflow for the end-to-end loop.
+    {"slug": "self-openai-compat", "provider": "openai", "model_id": "agent/echo-coder",
+     "display_name": "Self · OpenAI-compat → echo-coder",
+     "params": {"base_url": _self_v1_base_url(), "temperature": 0}},
     {"slug": "bedrock-sonnet-4-5", "provider": "bedrock",
      "model_id": "us.anthropic.claude-sonnet-4-5-20251022-v1:0",
      "display_name": "AWS Bedrock – Claude Sonnet 4.5", "params": {}},
@@ -475,6 +498,15 @@ SEED_AGENTS = [
      "system_prompt": "(echo agent — replies with the prompt itself, prefixed)",
      "model_slug": "echo", "tool_specs": []},
 
+    # Self-referential demo agent: its model (``self-openai-compat``) points at
+    # this platform's own OpenAI /v1 surface, so running it calls the platform
+    # through its own API (which in turn runs the echo-coder agent). Offline &
+    # deterministic — no external LLM key required.
+    {"slug": "self-openai-agent", "name": "Self OpenAI-compat Agent", "icon": "repeat", "color": "#f0c000",
+     "description": "Reaches back into THIS platform via its OpenAI-compatible /v1 API. Proves the platform can consume itself as an OpenAI model.",
+     "system_prompt": "You are a relay. Return the platform's response to the user's message.",
+     "model_slug": "self-openai-compat", "tool_specs": []},
+
     {"slug": "fake-tool-tester", "name": "Fake Tool Tester (offline)", "icon": "bot", "color": "#8b949e",
      "description": "Offline scripted agent that calls write_file once then prints a confirmation. Used by the eval smoke suite.",
      "system_prompt": "You are an offline test agent.",
@@ -497,6 +529,18 @@ SEED_WORKFLOWS = [
      "description": "Send the user's request to the Coder agent. Simplest possible workflow.",
      "graph": {"nodes": [
         {"id": "go", "agent": "coder", "label": "Coder", "input_template": "{input}"},
+     ]}},
+
+    # ===== self-referential OpenAI-compat demo =====
+    # A LangGraph (sequential) workflow whose single node runs an agent that
+    # calls back into THIS platform through its own OpenAI-compatible /v1 API.
+    # Success criterion for the llm_proxy → Agents Platform port: the platform
+    # consuming its new interface on itself, from inside a workflow.
+    {"slug": "openai-compat-demo", "name": "OpenAI-compat Self-Call (demo)", "kind": "sequential",
+     "description": "Runs an agent whose model is the platform's own OpenAI /v1 surface — the platform drives itself as an OpenAI model from within a workflow.",
+     "graph": {"nodes": [
+        {"id": "call", "agent": "self-openai-agent", "label": "Self OpenAI-compat call",
+         "input_template": "{input}"},
      ]}},
 
     # ===== pipelines =====
@@ -776,6 +820,24 @@ def _migrate_telegram_agents(s: Session) -> None:
             color="#2dd4bf",
         ))
 
+    # Create Fable variant if missing
+    if not s.query(Agent).filter(Agent.slug == "telegram-fable").first():
+        s.add(Agent(
+            slug="telegram-fable",
+            name="Telegram - Fable",
+            description=sonnet.description,
+            system_prompt="",
+            inherit_from="telegram-sonnet",
+            model_slug="claude-cli-fable",
+            tool_specs=list(sonnet.tool_specs or []),
+            skill_slugs=list(sonnet.skill_slugs or []),
+            params=dict(sonnet.params or {}),
+            mcp_config=dict(sonnet.mcp_config or {}),
+            extra_volumes=list(sonnet.extra_volumes or []),
+            icon=sonnet.icon,
+            color="#f6ad55",
+        ))
+
 
 def seed_all() -> dict:
     """Idempotent seed. Ensures every slug in SEED_* exists. Never updates
@@ -788,6 +850,11 @@ def seed_all() -> dict:
             _insert_if_missing(s, Model, "slug", m); counts["models"] += 1
         for m in _detect_ollama_models():
             _insert_if_missing(s, Model, "slug", m); counts["models"] += 1
+        # Flush models before inserting agents — agents.model_slug is an FK
+        # into models.slug, and without an explicit flush here a mid-loop
+        # autoflush can interleave the two loops' inserts out of order,
+        # tripping the FK constraint on self-referential seed rows.
+        s.flush()
         for a in SEED_AGENTS:
             _insert_if_missing(s, Agent, "slug", a); counts["agents"] += 1
         for w in SEED_WORKFLOWS:

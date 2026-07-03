@@ -6,6 +6,7 @@ Inbound webhook → STT → agent run → reply delivery (text/voice + markers).
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures as _cf
 import hmac
 import logging
 import os
@@ -19,7 +20,7 @@ from typing import Any
 from uuid import uuid4
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -1012,7 +1013,38 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
             if _MAIN_LOOP is not None:
                 # Schedule on the main event loop so asyncio.Queue (used by
                 # CliLLM WS streaming) is created and consumed in the same loop.
-                result = asyncio.run_coroutine_threadsafe(_coro, _MAIN_LOOP).result(timeout=1860)
+                future = asyncio.run_coroutine_threadsafe(_coro, _MAIN_LOOP)
+                try:
+                    result = future.result(timeout=1860)
+                except _cf.TimeoutError:
+                    # We stopped waiting, but run_coroutine_threadsafe never
+                    # cancelled the coroutine — it keeps running on
+                    # _MAIN_LOOP. Detach instead of reporting a false
+                    # failure: once it actually finishes, hand the reply to
+                    # the same idempotent path restart-recovery uses so it
+                    # still reaches the user instead of being dropped.
+                    log.warning("dispatch: run %s still running past %ss wait — "
+                                "detaching, will deliver on completion",
+                                run_id, 1860)
+                    final_state = "processing"
+                    _send_message(
+                        token, chat_id,
+                        "⏳ Isso está a demorar mais do que o normal — continuo a trabalhar "
+                        "nisso, aviso assim que terminar.")
+
+                    def _deliver_when_done(fut: "asyncio.Future", _run_id: str = run_id) -> None:
+                        try:
+                            res = fut.result()
+                        except Exception as e2:
+                            log.warning("late-finishing run %s errored: %s", _run_id, e2)
+                            return
+                        out = (res or {}).get("reply") or (res or {}).get("text", "")
+                        if out and _MAIN_LOOP is not None:
+                            asyncio.run_coroutine_threadsafe(
+                                deliver_recovered_run(_run_id, out), _MAIN_LOOP)
+
+                    future.add_done_callback(_deliver_when_done)
+                    return
             else:
                 log.warning("dispatch: _MAIN_LOOP not set, using asyncio.run() for run %s (cross-loop bug)", run_id)
                 result = asyncio.run(_coro)
@@ -1230,9 +1262,13 @@ def _approval_call_lambda(secret_name: str, token: str) -> str:
 
 
 class ApprovalRequest(BaseModel):
+    # For request_type="secret" this is the secret name; for "agent_run" it is
+    # the resource being gated (agent/workflow slug). Kept as `secret_name` for
+    # backwards compatibility with the existing secretsfs callers.
     secret_name: str
     reason: str
     scope: str = "one_shot"
+    request_type: str = "secret"   # "secret" | "agent_run"
 
 
 class ApprovalStatus(BaseModel):
@@ -1256,12 +1292,14 @@ def create_approval_request(body: ApprovalRequest, s: Session = Depends(get_sess
     if not admin_ids:
         raise HTTPException(503, "Sysadmin bot has no admin_user_ids configured")
 
+    request_type = (body.request_type or "secret").strip() or "secret"
     request_id = str(uuid4())
     now = _time_mod.time()
     _pending_approvals[request_id] = {
         "secret_name": body.secret_name,
         "reason":      body.reason,
         "scope":       body.scope,
+        "request_type": request_type,
         "status":      "pending",
         "secret_value": None,
         "created_at":  now,
@@ -1270,24 +1308,39 @@ def create_approval_request(body: ApprovalRequest, s: Session = Depends(get_sess
         "bot_token":   bot.token,
     }
 
-    text = (
-        f"🔐 *Aprovação de segredo*\n\n"
-        f"Segredo: `{body.secret_name}`\n"
-        f"Motivo: {body.reason}\n"
-        f"Escolha o escopo da liberação:"
-    )
-    # The approver picks the scope at approval time (1 use / 10 min / 60 min),
-    # like the legacy awserv flow. callback_data is limited to 64 bytes, and a
-    # uuid4 request_id is 36 chars, so the scope is encoded as a short code
-    # (1 / 10 / 60) rather than the full word — "aw_approval:approve:one_shot:<uuid>"
-    # would be 65 bytes and Telegram would silently drop the button.
-    keyboard = [[
-        {"text": "✅ 1 uso",  "callback_data": f"aw_approval:approve:1:{request_id}"},
-        {"text": "⏱ 10 min", "callback_data": f"aw_approval:approve:10:{request_id}"},
-        {"text": "⏱ 60 min", "callback_data": f"aw_approval:approve:60:{request_id}"},
-    ], [
-        {"text": "❌ Negar",   "callback_data": f"aw_approval:deny:{request_id}"},
-    ]]
+    if request_type == "agent_run":
+        # Pure human-in-the-loop gate: no secret is fetched on approve, the
+        # scope buttons (1 use / 10 / 60 min) don't apply — a run is approved
+        # once. Two buttons keep callback_data well under Telegram's 64 bytes.
+        text = (
+            f"▶️ *Aprovação de execução*\n\n"
+            f"Recurso: `{body.secret_name}`\n"
+            f"Motivo: {body.reason}\n\n"
+            f"O agente está aguardando sua liberação para rodar."
+        )
+        keyboard = [[
+            {"text": "✅ Aprovar", "callback_data": f"aw_approval:approve:{request_id}"},
+            {"text": "❌ Negar",   "callback_data": f"aw_approval:deny:{request_id}"},
+        ]]
+    else:
+        text = (
+            f"🔐 *Aprovação de segredo*\n\n"
+            f"Segredo: `{body.secret_name}`\n"
+            f"Motivo: {body.reason}\n"
+            f"Escolha o escopo da liberação:"
+        )
+        # The approver picks the scope at approval time (1 use / 10 min / 60 min),
+        # like the legacy awserv flow. callback_data is limited to 64 bytes, and a
+        # uuid4 request_id is 36 chars, so the scope is encoded as a short code
+        # (1 / 10 / 60) rather than the full word — "aw_approval:approve:one_shot:<uuid>"
+        # would be 65 bytes and Telegram would silently drop the button.
+        keyboard = [[
+            {"text": "✅ 1 uso",  "callback_data": f"aw_approval:approve:1:{request_id}"},
+            {"text": "⏱ 10 min", "callback_data": f"aw_approval:approve:10:{request_id}"},
+            {"text": "⏱ 60 min", "callback_data": f"aw_approval:approve:60:{request_id}"},
+        ], [
+            {"text": "❌ Negar",   "callback_data": f"aw_approval:deny:{request_id}"},
+        ]]
 
     for chat_id in admin_ids:
         try:
@@ -1356,13 +1409,27 @@ def _handle_approval_callback(cq_id: str, cq_data: str, chat_id: str, bot_token:
         _answer_callback_query(bot_token, cq_id, f"Já processado: {entry['status']}")
         return
 
+    is_agent_run = entry.get("request_type") == "agent_run"
+    _noun = "Execução" if is_agent_run else "Segredo"
+
     if action == "deny":
         entry["status"] = "denied"
         _answer_callback_query(bot_token, cq_id, "❌ Negado")
         msg_id = entry["message_ids"].get(str(chat_id))
         if msg_id:
             _edit_message_text(bot_token, str(chat_id), msg_id,
-                               f"❌ Segredo <code>{entry['secret_name']}</code> negado.")
+                               f"❌ {_noun} <code>{entry['secret_name']}</code> negad{'a' if is_agent_run else 'o'}.")
+        return
+
+    if is_agent_run:
+        # Pure gate — nothing to fetch. Mark approved so the polling caller
+        # (the run choke point) can dispatch. No scope reuse, no secret value.
+        entry["status"] = "approved"
+        _answer_callback_query(bot_token, cq_id, "✅ Aprovado")
+        msg_id = entry["message_ids"].get(str(chat_id))
+        if msg_id:
+            _edit_message_text(bot_token, str(chat_id), msg_id,
+                               f"✅ Execução <code>{entry['secret_name']}</code> aprovada.")
         return
 
     # approve — retrieve the actual secret value (vault-first, Lambda fallback).
@@ -2376,6 +2443,96 @@ def kanban_notify(body: KanbanNotify, s: Session = Depends(get_session)):
             log.exception("kanban notify: send failed for page %s", f.page_id)
 
     return {"ok": True, "sent": sent}
+
+
+class TelegramInject(BaseModel):
+    bot_id: str
+    chat_id: str
+    text: str
+
+
+def _verify_inject_secret(x_internal_secret: str = Header(default="")) -> None:
+    from ..config import settings
+    if not settings.telegram_inject_secret:
+        raise HTTPException(503, "telegram_inject_secret not configured (AGENTS_TELEGRAM_INJECT_SECRET)")
+    if not hmac.compare_digest(settings.telegram_inject_secret, x_internal_secret or ""):
+        raise HTTPException(403, "invalid X-Internal-Secret")
+
+
+@router.post("/inject")
+def inject_system_message(body: TelegramInject, _auth: None = Depends(_verify_inject_secret),
+                           s: Session = Depends(get_session)) -> dict:
+    """Inject a synthetic/system message into an existing (bot, chat) session.
+
+    Reuses the same Target/session continuity as a real inbound webhook
+    message (so the agent's memory treats it as part of the conversation
+    history), but skips the "Processing…" progress button and typing
+    indicator since no real user is watching in real time. Only the agent's
+    reply gets posted back to the chat — the injected text itself is never
+    shown in Telegram, since it never actually arrived through Telegram.
+
+    Internal-only: called by aw-tasks cron scripts, not exposed to the
+    outside. Guarded by AGENTS_TELEGRAM_INJECT_SECRET (X-Internal-Secret
+    header) since this endpoint can otherwise put words in any bot's mouth
+    in any chat it's already talked in.
+    """
+    bot = s.query(TelegramBot).filter(TelegramBot.id == body.bot_id).first()
+    if not bot or not bot.enabled:
+        raise HTTPException(404, "bot not found or disabled")
+
+    agent_slug = _get_agent_slug_for_chat(bot, bot.id, body.chat_id)
+    if not agent_slug:
+        raise HTTPException(400, "no agent configured for this bot/chat")
+    with session_scope() as s2:
+        agent = s2.query(Agent).filter(Agent.slug == agent_slug).first()
+        if not agent:
+            raise HTTPException(404, f"agent {agent_slug} not found")
+
+    target_id = _ensure_target(bot.id, body.chat_id)
+    session_id, _ = _get_or_create_session(bot.id, body.chat_id, target_id)
+
+    header = (
+        f"/aw-agent-telegram\n"
+        f"CONTEXT:\n"
+        f"- source: telegram\n"
+        f"- chat_id: {body.chat_id}\n"
+        f"- user_id: system\n"
+        f"- bot_id: {bot.id}\n"
+        f"- origin: system\n"
+    )
+    full_input = header + f"USER_MESSAGE:\n{body.text}"
+
+    run_id = str(uuid4())
+    from ..core.executor import run_agent
+    _coro = run_agent(
+        agent_slug, full_input, run_id=run_id, target_id=target_id,
+        session_id=session_id, initiator_kind="telegram_system",
+        initiator_id=f"{bot.id}:{body.chat_id}",
+    )
+    if _MAIN_LOOP is not None:
+        result = asyncio.run_coroutine_threadsafe(_coro, _MAIN_LOOP).result(timeout=1860)
+    else:
+        result = asyncio.run(_coro)
+
+    output_text = result.get("reply") or result.get("text", "")
+    status = result.get("status", "unknown")
+
+    with session_scope() as ss:
+        from ..models import Run as _Run
+        run_row = ss.query(_Run).filter(_Run.id == run_id).first()
+        if run_row and run_row.session_id:
+            _save_session_id(bot.id, body.chat_id, run_row.session_id, token=bot.token)
+
+    if output_text:
+        _deliver_reply(bot.token, body.chat_id, output_text, False, "")
+        try:
+            if _MAIN_LOOP is not None:
+                from ..core.redis_streams import mark_delivered
+                asyncio.run_coroutine_threadsafe(mark_delivered(run_id), _MAIN_LOOP)
+        except Exception:
+            pass
+
+    return {"run_id": run_id, "status": status, "delivered": bool(output_text)}
 
 
 # Self-contained Mini App page. __RUN_ID__ is substituted at request time.

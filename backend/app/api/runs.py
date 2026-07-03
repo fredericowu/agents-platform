@@ -50,6 +50,7 @@ def list_runs(limit: int = Query(50, ge=1, le=500),
               roots_only: bool = False,
               target_id: str | None = Query(None, description="Filter by Target id"),
               target_slug: str | None = Query(None, description="Filter by Target slug (resolved server-side)"),
+              session_id: str | None = Query(None, description="Filter by the CLI session id runs were resumed under"),
               q: str | None = None,
               summary: bool = Query(False, description="Truncate large `input` fields to ~200 chars"),
               s: Session = Depends(get_session)):
@@ -60,6 +61,8 @@ def list_runs(limit: int = Query(50, ge=1, le=500),
         qry = qry.filter(Run.status == status)
     if roots_only:
         qry = qry.filter(Run.parent_run_id.is_(None))
+    if session_id:
+        qry = qry.filter(Run.session_id == session_id)
     if target_id:
         qry = qry.filter(Run.target_id == target_id)
     if target_slug:

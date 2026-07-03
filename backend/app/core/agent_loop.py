@@ -34,9 +34,17 @@ def _build_chat_model(provider: str, model_id: str, params: dict[str, Any]):
         return ChatAnthropic(model=model_id, **{k: v for k, v in params.items() if k in {"temperature", "max_tokens", "top_p", "top_k"}})
     if p == "openai":
         from langchain_openai import ChatOpenAI
-        if not os.environ.get("OPENAI_API_KEY"):
-            raise RuntimeError("OPENAI_API_KEY not set")
-        return ChatOpenAI(model=model_id, **{k: v for k, v in params.items() if k in {"temperature", "max_tokens", "top_p", "base_url"}})
+        allowed = {k: v for k, v in params.items()
+                   if k in {"temperature", "max_tokens", "top_p", "base_url", "api_key"}}
+        # A ``base_url`` means an OpenAI-COMPATIBLE endpoint (e.g. this platform's
+        # own /v1 surface, Ollama, vLLM) — those don't need the real OpenAI key,
+        # so accept a placeholder instead of hard-failing.
+        if not os.environ.get("OPENAI_API_KEY") and not allowed.get("api_key"):
+            if allowed.get("base_url"):
+                allowed["api_key"] = "sk-local"
+            else:
+                raise RuntimeError("OPENAI_API_KEY not set")
+        return ChatOpenAI(model=model_id, **allowed)
     if p == "bedrock":
         # Use the Converse API for tool calling — the older ChatBedrock won't
         # bind tools across all models.
