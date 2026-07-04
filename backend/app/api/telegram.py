@@ -16,7 +16,7 @@ import re
 import tempfile
 import threading
 import time as _time
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -27,7 +27,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..db import get_session, session_scope
-from ..models import Agent, Run, RunEvent, Target, TelegramBot, TelegramSession
+from ..models import Agent, CrispalConversationSuggestion, Run, RunEvent, Target, TelegramBot, TelegramSession
 
 log = logging.getLogger("ap.telegram")
 
@@ -296,20 +296,6 @@ def _strip_markdown(text: str) -> str:
     text = re.sub(r"\[(.+?)\]\(https?://[^\)]+\)", r"\1", text)
     text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
     return text
-
-
-def _split_into_messages(text: str) -> list[str]:
-    """Split a reply into individual Telegram bubbles on blank-line (paragraph)
-    boundaries.
-
-    The CLI emits one assistant text block per narration between tool calls, and
-    cli.py joins them with a blank line. Delivering each paragraph as its own
-    message turns the trailing mashed blob ("...agora.Now remove...Now fix...")
-    into a readable step-by-step sequence of bubbles — what the user asked for.
-    """
-    parts = [p.strip() for p in re.split(r"\n\s*\n+", text)]
-    parts = [p for p in parts if p]
-    return parts or [text]
 
 
 def _chunk_text(text: str, limit: int = MESSAGE_LIMIT) -> list[str]:
@@ -949,18 +935,22 @@ def _deliver_reply(
                 except Exception as e:
                     log.warning("TTS failed, falling back to text: %s", e)
 
-            # One Telegram bubble per paragraph (each is a distinct narration
-            # step), further chunked only if a paragraph exceeds Telegram's limit.
-            for segment in _split_into_messages(text):
-                for chunk in _chunk_text(segment):
+            # One Telegram message for the whole reply — only paginated when it
+            # exceeds Telegram's length limit. Splitting on every blank line
+            # (`_split_into_messages`) used to explode "verbose_replies" runs
+            # (which join per-tool-call narration with "\n\n") into a dozen
+            # disjointed bubbles that read as cut off / fragmented even though
+            # the underlying text was complete — see aw-agent-telegram truncation
+            # investigation, 2026-07-03.
+            for chunk in _chunk_text(text):
+                try:
+                    _send_message(token, chat_id, _md_to_html(chunk), parse_mode="HTML")
+                except Exception:
                     try:
-                        _send_message(token, chat_id, _md_to_html(chunk), parse_mode="HTML")
-                    except Exception:
-                        try:
-                            # Telegram rejected the HTML — retry as plain text
-                            _send_message(token, chat_id, _strip_markdown(chunk), parse_mode="")
-                        except Exception as e:
-                            log.warning("send_message failed: %s", e)
+                        # Telegram rejected the HTML — retry as plain text
+                        _send_message(token, chat_id, _strip_markdown(chunk), parse_mode="")
+                    except Exception as e:
+                        log.warning("send_message failed: %s", e)
 
 
 async def deliver_recovered_run(run_id: str, output_text: str) -> None:
@@ -1698,6 +1688,103 @@ def _handle_kanban_callback(cq_id: str, cq_data: str, chat_id: str,
             pass
 
 
+def _crispal_upstream() -> dict:
+    """The Crispal store's own MCP endpoint (URL + bearer token), read from
+    AW's shared config so credentials live in exactly one place."""
+    import json as _json
+    base = os.environ.get("AW_BASE_DIR", "/opt/agentic-workspace")
+    with open(os.path.join(base, "src", "config", "mcp.json")) as f:
+        cfg = _json.load(f)
+    return cfg["mcpServers"]["crispal"]
+
+
+def _crispal_send_message(platform: str, recipient_id: str, message: str, message_type: str) -> None:
+    """Call the Crispal store's social_send_message tool directly (HTTP JSON-RPC).
+    This is the ONLY place a real customer-facing message actually goes out —
+    triggered by a human button tap, never by an LLM's own decision."""
+    upstream = _crispal_upstream()
+    payload = {
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "social_send_message", "arguments": {
+            "platform": platform, "recipient_id": recipient_id,
+            "message": message, "message_type": message_type,
+        }},
+    }
+    r = httpx.post(upstream["url"], json=payload,
+                    headers={"Accept": "application/json, text/event-stream",
+                             **upstream.get("headers", {})},
+                    timeout=30)
+    body = r.json()
+    if "error" in body:
+        raise RuntimeError(f"crispal social_send_message error: {body['error']}")
+
+
+def _handle_crispal_suggestion_callback(cq_id: str, cq_data: str, chat_id: str,
+                                        msg_id: int | None, bot_token: str) -> None:
+    """Process a crispal_suggest:send/edit/ignore callback_query button tap.
+
+    callback_data: crispal_suggest:{action}:{suggestion_id}
+
+    Pure backend action — no LLM in the loop. "send" delivers the exact
+    suggested_text via the Crispal MCP directly; "ignore" just records the
+    outcome; "edit" opens a web view (not yet built) to change the text
+    before sending. Every decision (and the actual final_text, if edited) is
+    persisted on the CrispalConversationSuggestion row — that row is the
+    traceability log for future prompt/skill tuning.
+    """
+    _answer_callback_query(bot_token, cq_id)
+
+    parts = cq_data.split(":", 2)
+    if len(parts) != 3:
+        return
+    action, suggestion_id = parts[1], parts[2]
+
+    def _edit(text: str) -> None:
+        if msg_id is not None:
+            _edit_message_text(bot_token, chat_id, msg_id, text)
+
+    with session_scope() as s:
+        row = s.query(CrispalConversationSuggestion).filter(
+            CrispalConversationSuggestion.id == suggestion_id).first()
+        if not row:
+            _edit(f"❌ Sugestão <code>{suggestion_id}</code> não encontrada (pode já ter expirado).")
+            return
+        if row.status != "pending":
+            _edit(f"⚠️ Essa sugestão já foi processada ({row.status}).")
+            return
+
+        customer_name = row.customer_name or row.customer_id
+        orig_text = row.suggested_text
+
+        if action == "ignore":
+            row.status = "ignored"
+            row.decided_at = datetime.utcnow()
+            _edit(f"🚫 Ignorado — {customer_name}\n\n{orig_text}")
+            return
+
+        if action == "edit":
+            # Web edit view lands in a follow-up change; for now just tell
+            # the operator this action isn't wired up yet (never silently
+            # no-ops without feedback).
+            _edit(f"✏️ Edição pelo Telegram ainda não implementada — {customer_name}\n\n{orig_text}")
+            return
+
+        if action != "send":
+            return
+
+        try:
+            _crispal_send_message(row.source, row.customer_id, orig_text, row.message_type)
+        except Exception as exc:
+            log.exception("crispal suggestion send failed: %s", suggestion_id)
+            _edit(f"❌ Falha ao enviar pra {customer_name}: {exc}")
+            return
+
+        row.status = "sent"
+        row.final_text = orig_text
+        row.decided_at = datetime.utcnow()
+        _edit(f"✅ Enviado — {customer_name}\n\n{orig_text}")
+
+
 # ---------------------------------------------------------------------------
 # Webhook receiver
 # ---------------------------------------------------------------------------
@@ -1896,6 +1983,17 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
                 daemon=True,
             ).start()
             return {"ok": True, "reason": "kanban callback queued"}
+
+        if cq_data.startswith("crispal_suggest:") and cq_chat_id:
+            # Crispal Social Watch suggestion approval — pure backend action,
+            # never dispatched to an agent (see _handle_crispal_suggestion_callback)
+            _cs_msg_id = cq_msg.get("message_id")
+            threading.Thread(
+                target=_handle_crispal_suggestion_callback,
+                args=(cq_id, cq_data, cq_chat_id, _cs_msg_id, bot.token),
+                daemon=True,
+            ).start()
+            return {"ok": True, "reason": "crispal suggestion callback queued"}
 
         if cq_data.startswith("ap_opt:") and cq_chat_id:
             # Format: ap_opt:{index}:{option_text[:32]}

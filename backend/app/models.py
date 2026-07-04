@@ -438,3 +438,27 @@ class TelegramSession(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
     bot: Mapped["TelegramBot"] = relationship(back_populates="sessions")
+
+
+class CrispalConversationSuggestion(Base):
+    """A drafted reply for a Crispal social-media conversation, pending human
+    approval via Telegram Action buttons (crispal_suggest:send/ignore/edit —
+    see backend/app/api/telegram.py). Sending is a deterministic backend
+    action triggered by the button tap, never an LLM decision — this row is
+    the single source of truth for what was suggested vs. what actually went
+    out, so it doubles as a traceability log for future prompt/skill tuning."""
+    __tablename__ = "crispal_conversation_suggestions"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    source: Mapped[str] = mapped_column(String)          # facebook | instagram | ...
+    conversation_id: Mapped[str] = mapped_column(String, index=True)
+    customer_id: Mapped[str] = mapped_column(String)     # recipient_id for social_send_message
+    customer_name: Mapped[str] = mapped_column(String, default="")
+    message_type: Mapped[str] = mapped_column(String, default="response")
+    suggested_text: Mapped[str] = mapped_column(Text)
+    final_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String, default="pending")  # pending|sent|ignored|edited
+    bot_id: Mapped[str] = mapped_column(String)
+    chat_id: Mapped[str] = mapped_column(String)
+    approval_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
