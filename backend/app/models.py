@@ -462,3 +462,16 @@ class CrispalConversationSuggestion(Base):
     approval_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class CrispalSuggestionFeedback(Base):
+    """Human explanation of *why* a suggested reply was edited and what the
+    correct behavior would have been — captured alongside the edit itself
+    (edit mini-app's "Instrução de Comportamento" box), separate from
+    CrispalConversationSuggestion so future prompt/skill tuning can query
+    just the feedback corpus without scanning every suggestion row."""
+    __tablename__ = "crispal_suggestion_feedback"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    suggestion_id: Mapped[str] = mapped_column(String, ForeignKey("crispal_conversation_suggestions.id"), index=True)
+    instruction_text: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)

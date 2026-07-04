@@ -27,7 +27,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..db import get_session, session_scope
-from ..models import Agent, CrispalConversationSuggestion, Run, RunEvent, Target, TelegramBot, TelegramSession
+from ..models import Agent, CrispalConversationSuggestion, CrispalSuggestionFeedback, Run, RunEvent, Target, TelegramBot, TelegramSession
 
 log = logging.getLogger("ap.telegram")
 
@@ -275,6 +275,7 @@ def suggestion_edit_data(suggestion_id: str, s: Session = Depends(get_session)) 
 
 class SuggestionEditSubmit(BaseModel):
     final_text: str
+    behavior_instruction: str | None = None
 
 
 @router.post("/suggestion/{suggestion_id}/edit", include_in_schema=False)
@@ -301,6 +302,11 @@ def suggestion_edit_submit(suggestion_id: str, body: SuggestionEditSubmit,
     row.status = "edited"
     row.final_text = final_text
     row.decided_at = datetime.utcnow()
+
+    instruction_text = (body.behavior_instruction or "").strip()
+    if instruction_text:
+        s.add(CrispalSuggestionFeedback(suggestion_id=suggestion_id, instruction_text=instruction_text))
+
     s.commit()
 
     bot = s.query(TelegramBot).filter(TelegramBot.id == row.bot_id).first()
@@ -3037,10 +3043,12 @@ window.Telegram&&window.Telegram.WebApp&&window.Telegram.WebApp.expand&&window.T
 """
 
 # ---------------------------------------------------------------------------
-# Crispal suggestion edit mini-app — plain textarea + Save, delivered via the
-# Telegram WebApp shell's MainButton. Save calls back to this same backend
-# (POST /suggestion/{id}/edit), which sends the edited text directly — no
-# LLM round-trip, same as the "Enviar" Action button.
+# Crispal suggestion edit mini-app — message textarea + optional "Instrução de
+# Comportamento" textarea + Save, delivered via the Telegram WebApp shell's
+# MainButton. Save calls back to this same backend (POST /suggestion/{id}/edit),
+# which sends the edited text directly (no LLM round-trip, same as the
+# "Enviar" Action button) and persists the behavior instruction, if any, to
+# CrispalSuggestionFeedback for future prompt/skill tuning.
 # ---------------------------------------------------------------------------
 _SUGGESTION_EDIT_HTML = r"""<!DOCTYPE html>
 <html lang="pt">
@@ -3056,8 +3064,12 @@ html,body{height:100%}
 body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:flex;flex-direction:column;padding:14px;gap:12px}
 #head{font-size:13px;color:var(--hint)}
 #head b{color:var(--fg)}
-textarea{flex:1;min-height:220px;background:var(--surface);color:var(--fg);border:1px solid var(--border);border-radius:10px;padding:12px;font-size:15px;line-height:1.5;resize:vertical;font-family:inherit}
+label{font-size:12px;color:var(--hint);font-weight:600}
+textarea{background:var(--surface);color:var(--fg);border:1px solid var(--border);border-radius:10px;padding:12px;font-size:15px;line-height:1.5;resize:vertical;font-family:inherit}
 textarea:focus{outline:none;border-color:#0a84ff}
+#text{flex:1;min-height:180px}
+#instruction{min-height:90px}
+.field{display:flex;flex-direction:column;gap:6px}
 #hint{font-size:11px;color:var(--hint)}
 #status{font-size:13px;padding:8px 0}
 #status.ok{color:var(--green)}
@@ -3068,14 +3080,22 @@ textarea:focus{outline:none;border-color:#0a84ff}
 </head>
 <body>
 <div id="head">Editar sugestão pra <b id="customer">…</b></div>
-<textarea id="text" placeholder="Carregando…"></textarea>
-<div id="hint">Edite o texto acima e toque em "Salvar e Enviar" — vai direto pro cliente, sem passar por nenhum agente.</div>
+<div class="field">
+  <label for="text">Mensagem</label>
+  <textarea id="text" placeholder="Carregando…"></textarea>
+</div>
+<div class="field">
+  <label for="instruction">Instrução de Comportamento (opcional)</label>
+  <textarea id="instruction" placeholder="Por que editou? Qual seria a forma correta de responder nesse tipo de caso?"></textarea>
+</div>
+<div id="hint">Edite o texto e toque em "Salvar e Enviar" — vai direto pro cliente, sem passar por nenhum agente. A instrução de comportamento fica salva pra ajustar o agente no futuro.</div>
 <div id="status"></div>
 <button id="save">Salvar e Enviar</button>
 <script>
 const SUGGESTION_ID = "__SUGGESTION_ID__";
 const tg = window.Telegram && window.Telegram.WebApp;
 const textEl = document.getElementById("text");
+const instructionEl = document.getElementById("instruction");
 const customerEl = document.getElementById("customer");
 const statusEl = document.getElementById("status");
 const saveBtn = document.getElementById("save");
@@ -3091,6 +3111,7 @@ async function load() {
       statusEl.textContent = `Essa sugestão já foi ${d.status}.`;
       statusEl.className = "err";
       textEl.disabled = true;
+      instructionEl.disabled = true;
     }
   } catch (e) {
     statusEl.textContent = "Erro ao carregar: " + e.message;
@@ -3106,12 +3127,13 @@ async function save() {
     const r = await fetch(`/api/telegram/suggestion/${SUGGESTION_ID}/edit`, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({final_text: textEl.value}),
+      body: JSON.stringify({final_text: textEl.value, behavior_instruction: instructionEl.value}),
     });
     if (!r.ok) throw new Error(await r.text());
     statusEl.textContent = "✅ Enviado!";
     statusEl.className = "ok";
     textEl.disabled = true;
+    instructionEl.disabled = true;
     setTimeout(() => { tg && tg.close && tg.close(); }, 900);
   } catch (e) {
     statusEl.textContent = "Erro ao enviar: " + e.message;
