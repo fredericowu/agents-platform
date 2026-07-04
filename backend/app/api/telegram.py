@@ -249,6 +249,69 @@ def progress_events(run_id: str, s: Session = Depends(get_session)) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Crispal suggestion edit mini-app — opened from the "Editar" Action button.
+# Served publicly (Caddy whitelists /api/telegram/suggestion/*), same reason
+# as the progress mini-app: the Telegram WebApp shell has no aw_jwt cookie.
+# ---------------------------------------------------------------------------
+
+@router.get("/suggestion/{suggestion_id}/edit", include_in_schema=False)
+def suggestion_edit_page(suggestion_id: str) -> HTMLResponse:
+    return HTMLResponse(_SUGGESTION_EDIT_HTML.replace("__SUGGESTION_ID__", suggestion_id))
+
+
+@router.get("/suggestion/{suggestion_id}/edit/data", include_in_schema=False)
+def suggestion_edit_data(suggestion_id: str, s: Session = Depends(get_session)) -> dict:
+    row = s.query(CrispalConversationSuggestion).filter(
+        CrispalConversationSuggestion.id == suggestion_id).first()
+    if not row:
+        raise HTTPException(404, "suggestion not found")
+    return {
+        "status": row.status,
+        "customer_name": row.customer_name,
+        "source": row.source,
+        "suggested_text": row.suggested_text,
+    }
+
+
+class SuggestionEditSubmit(BaseModel):
+    final_text: str
+
+
+@router.post("/suggestion/{suggestion_id}/edit", include_in_schema=False)
+def suggestion_edit_submit(suggestion_id: str, body: SuggestionEditSubmit,
+                           s: Session = Depends(get_session)) -> dict:
+    """The edit mini-app's Save button — sends the human-edited text via the
+    same deterministic backend path as the "Enviar" button (no LLM call)."""
+    row = s.query(CrispalConversationSuggestion).filter(
+        CrispalConversationSuggestion.id == suggestion_id).first()
+    if not row:
+        raise HTTPException(404, "suggestion not found")
+    if row.status != "pending":
+        raise HTTPException(409, f"suggestion already {row.status}")
+
+    final_text = body.final_text.strip()
+    if not final_text:
+        raise HTTPException(400, "final_text is required")
+
+    try:
+        _crispal_send_message(row.source, row.customer_id, final_text, row.message_type)
+    except Exception as exc:
+        raise HTTPException(502, f"send failed: {exc}")
+
+    row.status = "edited"
+    row.final_text = final_text
+    row.decided_at = datetime.utcnow()
+    s.commit()
+
+    bot = s.query(TelegramBot).filter(TelegramBot.id == row.bot_id).first()
+    if bot and row.approval_message_id:
+        _edit_message_text(bot.token, row.chat_id, row.approval_message_id,
+                           f"✏️ Editado e enviado — {row.customer_name}\n\n{final_text}")
+
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
 # Helpers — text formatting
 # ---------------------------------------------------------------------------
 
@@ -1763,10 +1826,13 @@ def _handle_crispal_suggestion_callback(cq_id: str, cq_data: str, chat_id: str,
             return
 
         if action == "edit":
-            # Web edit view lands in a follow-up change; for now just tell
-            # the operator this action isn't wired up yet (never silently
-            # no-ops without feedback).
-            _edit(f"✏️ Edição pelo Telegram ainda não implementada — {customer_name}\n\n{orig_text}")
+            base = os.environ.get("AP_PUBLIC_URL", "https://agents-platform.app.aw.tekflox.com")
+            edit_url = f"{base}/api/telegram/suggestion/{suggestion_id}/edit"
+            _send_button_message(
+                bot_token, chat_id,
+                f"✏️ Editar sugestão — {customer_name}",
+                "📝 Abrir editor", edit_url, web_app=True,
+            )
             return
 
         if action != "send":
@@ -2965,6 +3031,109 @@ async function poll(){
 poll();
 window.Telegram&&window.Telegram.WebApp&&window.Telegram.WebApp.ready&&window.Telegram.WebApp.ready();
 window.Telegram&&window.Telegram.WebApp&&window.Telegram.WebApp.expand&&window.Telegram.WebApp.expand();
+</script>
+</body>
+</html>
+"""
+
+# ---------------------------------------------------------------------------
+# Crispal suggestion edit mini-app — plain textarea + Save, delivered via the
+# Telegram WebApp shell's MainButton. Save calls back to this same backend
+# (POST /suggestion/{id}/edit), which sends the edited text directly — no
+# LLM round-trip, same as the "Enviar" Action button.
+# ---------------------------------------------------------------------------
+_SUGGESTION_EDIT_HTML = r"""<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Editar sugestão</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0d0d0f;--surface:#1a1a1f;--border:#2a2a32;--fg:#e8e8ed;--hint:#8e8e98;--red:#ff453a;--green:#30d158}
+html,body{height:100%}
+body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:flex;flex-direction:column;padding:14px;gap:12px}
+#head{font-size:13px;color:var(--hint)}
+#head b{color:var(--fg)}
+textarea{flex:1;min-height:220px;background:var(--surface);color:var(--fg);border:1px solid var(--border);border-radius:10px;padding:12px;font-size:15px;line-height:1.5;resize:vertical;font-family:inherit}
+textarea:focus{outline:none;border-color:#0a84ff}
+#hint{font-size:11px;color:var(--hint)}
+#status{font-size:13px;padding:8px 0}
+#status.ok{color:var(--green)}
+#status.err{color:var(--red)}
+#save{display:none;background:var(--green);color:#000;border:none;border-radius:10px;padding:12px;font-size:15px;font-weight:600}
+</style>
+</head>
+<body>
+<div id="head">Editar sugestão pra <b id="customer">…</b></div>
+<textarea id="text" placeholder="Carregando…"></textarea>
+<div id="hint">Edite o texto acima e toque em "Salvar e Enviar" — vai direto pro cliente, sem passar por nenhum agente.</div>
+<div id="status"></div>
+<button id="save">Salvar e Enviar</button>
+<script>
+const SUGGESTION_ID = "__SUGGESTION_ID__";
+const tg = window.Telegram && window.Telegram.WebApp;
+const textEl = document.getElementById("text");
+const customerEl = document.getElementById("customer");
+const statusEl = document.getElementById("status");
+const saveBtn = document.getElementById("save");
+
+async function load() {
+  try {
+    const r = await fetch(`/api/telegram/suggestion/${SUGGESTION_ID}/edit/data`);
+    if (!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    customerEl.textContent = d.customer_name || "cliente";
+    textEl.value = d.suggested_text || "";
+    if (d.status !== "pending") {
+      statusEl.textContent = `Essa sugestão já foi ${d.status}.`;
+      statusEl.className = "err";
+      textEl.disabled = true;
+    }
+  } catch (e) {
+    statusEl.textContent = "Erro ao carregar: " + e.message;
+    statusEl.className = "err";
+  }
+}
+
+async function save() {
+  saveBtn.disabled = true;
+  statusEl.textContent = "Enviando…";
+  statusEl.className = "";
+  try {
+    const r = await fetch(`/api/telegram/suggestion/${SUGGESTION_ID}/edit`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({final_text: textEl.value}),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    statusEl.textContent = "✅ Enviado!";
+    statusEl.className = "ok";
+    setTimeout(() => { tg && tg.close && tg.close(); }, 900);
+  } catch (e) {
+    statusEl.textContent = "Erro ao enviar: " + e.message;
+    statusEl.className = "err";
+    saveBtn.disabled = false;
+  }
+}
+
+saveBtn.addEventListener("click", save);
+saveBtn.style.display = "block";
+load();
+if (tg) {
+  tg.ready && tg.ready();
+  tg.expand && tg.expand();
+  // Native MainButton only renders inside the real Telegram app shell — it
+  // may be a no-op in a plain browser tab (e.g. testing outside Telegram),
+  // so always keep the in-page button too rather than hiding it based on
+  // MainButton merely existing as an object.
+  if (tg.MainButton) {
+    tg.MainButton.setText("Salvar e Enviar");
+    tg.MainButton.show();
+    tg.MainButton.onClick(save);
+  }
+}
 </script>
 </body>
 </html>
