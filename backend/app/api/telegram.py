@@ -3062,7 +3062,8 @@ textarea:focus{outline:none;border-color:#0a84ff}
 #status{font-size:13px;padding:8px 0}
 #status.ok{color:var(--green)}
 #status.err{color:var(--red)}
-#save{display:none;background:var(--green);color:#000;border:none;border-radius:10px;padding:12px;font-size:15px;font-weight:600}
+#save{display:none;background:var(--green);color:#000;border:none;border-radius:10px;padding:12px;font-size:15px;font-weight:600;cursor:pointer}
+#save:disabled{background:var(--border);color:var(--hint);cursor:not-allowed}
 </style>
 </head>
 <body>
@@ -3110,6 +3111,7 @@ async function save() {
     if (!r.ok) throw new Error(await r.text());
     statusEl.textContent = "✅ Enviado!";
     statusEl.className = "ok";
+    textEl.disabled = true;
     setTimeout(() => { tg && tg.close && tg.close(); }, 900);
   } catch (e) {
     statusEl.textContent = "Erro ao enviar: " + e.message;
