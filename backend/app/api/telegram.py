@@ -1216,6 +1216,13 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
             elif status in ("cancelled", "canceled", "aborted"):
                 final_state = "cancelled"
 
+            if result.get("auto_compacted"):
+                _send_message(
+                    token, chat_id,
+                    "🗜️ Sua conversa cresceu bastante — compactei o contexto "
+                    "automaticamente antes de responder, pra manter tudo rápido e barato."
+                )
+
             # Persist the new session_id for conversation continuity
             with session_scope() as ss:
                 from ..models import Run as _Run

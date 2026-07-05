@@ -404,6 +404,7 @@ async def run_agent(
     # is processed. Settings → General → "Auto-compact threshold (tokens)";
     # 0 disables. Guarded by skip_auto_compact so the compact call itself
     # doesn't try to compact itself.
+    auto_compacted = False
     if session_id and not skip_auto_compact and user_input.strip() != "/compact":
         from .security import get_setting
         try:
@@ -423,6 +424,7 @@ async def run_agent(
                     target_id=target_id, session_id=session_id,
                     skip_auto_compact=True,
                 )
+                auto_compacted = True
 
     text = ""
     # The concluding answer — the assistant text emitted AFTER the last tool
@@ -684,7 +686,7 @@ async def run_agent(
     # transcript (for storage / progress). Fall back to full text if the run
     # ended on a tool call with no trailing message.
     return {"run_id": run_id, "text": text, "reply": (reply_text.strip() or text),
-            "status": status, "error": err,
+            "status": status, "error": err, "auto_compacted": auto_compacted,
             "tokens_in": tin, "tokens_out": tout, "cost_usd": cost, "timing": _timing}
 
 
