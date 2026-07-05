@@ -2504,6 +2504,8 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
                         session_id=sess_id,
                         initiator_kind="telegram",
                         initiator_id=f"{b_id}:{c_id}",
+                        skip_auto_compact=True,
+                        raw_cli_prompt=True,
                     )
                     if _MAIN_LOOP is not None:
                         result = _aio.run_coroutine_threadsafe(_coro, _MAIN_LOOP).result(timeout=120)
@@ -2512,6 +2514,16 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
                     output_text = (result.get("text") or "").strip()
                     status = result.get("status", "unknown")
                     if status in ("success", "completed"):
+                        # /clear makes the CLI mint a fresh session_id — persist
+                        # it so the next message resumes the cleared session, not
+                        # the old (still-full) transcript.
+                        _clear_run_id = result.get("run_id")
+                        if _clear_run_id:
+                            with session_scope() as _rs:
+                                _rr = _rs.query(Run).filter(Run.id == _clear_run_id).first()
+                                _new_sid = _rr.session_id if _rr else None
+                            if _new_sid and _new_sid != sess_id:
+                                _save_session_id(b_id, c_id, _new_sid, token=tg_token)
                         if output_text and output_text != "(empty response)":
                             _send_message(tg_token, c_id,
                                           f"🧹 Context cleared.\n\n{_md_to_html(output_text)}",
