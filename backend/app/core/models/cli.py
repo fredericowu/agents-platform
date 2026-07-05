@@ -359,7 +359,13 @@ class CliLLM(BaseLLM):
                         "permission_mode": evt.get("permissionMode"),
                     })
                 elif et == "assistant":
-                    for block in (evt.get("message", {}).get("content") or []):
+                    _acontent = evt.get("message", {}).get("content")
+                    if isinstance(_acontent, str):
+                        # Same string-content shape as compact user events.
+                        _acontent = [{"type": "text", "text": _acontent}]
+                    for block in (_acontent or []):
+                        if not isinstance(block, dict):
+                            continue
                         bt = block.get("type")
                         if bt == "thinking":
                             t = block.get("thinking", "")
@@ -388,7 +394,15 @@ class CliLLM(BaseLLM):
                         tin = usage.get("input_tokens", 0) + usage.get("cache_creation_input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
                         tout = usage.get("output_tokens", 0) or tout
                 elif et == "user":
-                    for block in (evt.get("message", {}).get("content") or []):
+                    # message.content is usually a list of blocks, but compact
+                    # turns emit user events with a plain-string content (the
+                    # injected summary + "<local-command-stdout>Compacted</…>").
+                    _ucontent = evt.get("message", {}).get("content")
+                    if not isinstance(_ucontent, list):
+                        _ucontent = []
+                    for block in _ucontent:
+                        if not isinstance(block, dict):
+                            continue
                         if block.get("type") == "tool_result":
                             content = block.get("content")
                             if isinstance(content, list):
