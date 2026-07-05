@@ -840,9 +840,29 @@ def _chat_worker(key: tuple[str, str], q: "queue.Queue[tuple]") -> None:
             log.debug("tg chat worker: queue depth after dispatch for %s = %d", key, q.qsize())
 
 
+_ACK_POOL = _cf.ThreadPoolExecutor(max_workers=8, thread_name_prefix="tg-ack")
+
+
+def _send_processing_ack(token: str, chat_id: str, run_id: str) -> tuple:
+    """Send the '⚡ Processing…' bubble with its progress button. Submitted to
+    _ACK_POOL straight from the webhook handler (with a pre-generated run_id)
+    so the user gets instant feedback even while the chat's FIFO worker is
+    still busy with a previous run. Returns (msg_id, web_app, progress_url)
+    for _dispatch to reuse instead of sending its own bubble."""
+    _send_chat_action(token, chat_id)
+    ap_url = os.environ.get("AP_PUBLIC_URL", "https://agents-platform.app.aw.tekflox.com")
+    progress_url = f"{ap_url}/api/telegram/progress/{run_id}"
+    msg_id, web_app = _send_button_message(
+        token, chat_id, "⚡ Processing…",
+        "📊 View Progress [processing]", progress_url, web_app=True)
+    return msg_id, web_app, progress_url
+
+
 def _enqueue_dispatch(bot: TelegramBot, chat_id: str, user_id: str,
                       text: str, is_voice: bool, inbound_lang: str,
-                      inbound_id: str | None = None) -> None:
+                      inbound_id: str | None = None,
+                      pre_run_id: str | None = None,
+                      ack_future: "_cf.Future | None" = None) -> None:
     """Append a message to the per-(bot, chat) FIFO queue.
 
     The chat's worker thread is created lazily on first use. Messages for one
@@ -854,6 +874,11 @@ def _enqueue_dispatch(bot: TelegramBot, chat_id: str, user_id: str,
     call, so the message survives an agents-platform restart even if it's
     sitting in this in-memory queue when the process dies. None for internal
     callers (callback-query dispatches) that have no durable row.
+
+    ``pre_run_id`` / ``ack_future`` — set by webhook() when it already sent the
+    "Processing…" bubble (via _send_processing_ack on _ACK_POOL) so the ack is
+    instant even when this chat's worker is busy; _dispatch then reuses that
+    bubble and run id instead of creating its own.
     """
     key = (bot.id, chat_id)
     with _CHAT_QUEUES_META:
@@ -865,7 +890,8 @@ def _enqueue_dispatch(bot: TelegramBot, chat_id: str, user_id: str,
                 target=_chat_worker, args=(key, q), daemon=True,
                 name=f"tg-chatq-{bot.id}-{chat_id}",
             ).start()
-    q.put((bot, chat_id, user_id, text, is_voice, inbound_lang, _time.perf_counter(), inbound_id))
+    q.put((bot, chat_id, user_id, text, is_voice, inbound_lang, _time.perf_counter(),
+           pre_run_id, ack_future, inbound_id))
 
 
 def recover_pending_telegram_messages() -> None:
@@ -1166,14 +1192,30 @@ async def deliver_recovered_run(run_id: str, output_text: str) -> None:
 
 def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
               text: str, is_voice: bool, inbound_lang: str,
-              t_enqueue: float | None = None) -> None:
+              t_enqueue: float | None = None,
+              pre_run_id: str | None = None,
+              ack_future: "_cf.Future | None" = None) -> None:
     t_dispatch = _time.perf_counter()
     token = bot.token
     agent_slug = _get_agent_slug_for_chat(bot, bot.id, chat_id)
 
+    def _flip_pre_ack(state: str) -> None:
+        # Early exit after webhook() already showed "Processing…" — don't
+        # leave that bubble stuck on [processing] forever.
+        if ack_future is None:
+            return
+        try:
+            _mid, _wapp, _purl = ack_future.result(timeout=15)
+            if _mid:
+                _edit_button_label(token, chat_id, _mid,
+                                   f"📊 View Progress [{state}]", _purl, web_app=_wapp)
+        except Exception:
+            pass
+
     if not agent_slug:
         _send_message(token, chat_id,
                       "⚠️ This bot has no agent configured. Use /agent to pick one.")
+        _flip_pre_ack("error")
         return
 
     # Verify agent exists
@@ -1182,6 +1224,7 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
         if not agent:
             _send_message(token, chat_id,
                           f"⚠️ Agent <code>{agent_slug}</code> not found. Use /agent to pick another.")
+            _flip_pre_ack("error")
             return
 
     # Ordering + serialization is owned by the per-chat FIFO worker
@@ -1212,19 +1255,30 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
         else:
             full_input = header + f"USER_MESSAGE:\n{text}"
 
-        # Pre-generate run_id so we can share the progress link immediately
-        run_id = str(uuid4())
+        # Pre-generate run_id so we can share the progress link immediately.
+        # webhook() may have already generated it (pre_run_id) — the progress
+        # button it sent points at that id, so we must run under the same one.
+        run_id = pre_run_id or str(uuid4())
         ap_url = os.environ.get("AP_PUBLIC_URL", "https://agents-platform.app.aw.tekflox.com")
         # Mini App progress view (faithful port of the AW WorkspaceAgent view).
         progress_url = f"{ap_url}/api/telegram/progress/{run_id}"
 
         # Progress button — the label carries the lifecycle state, mirroring the
         # AW WorkspaceAgent: [processing] → [done] / [error] / [cancelled].
+        # When webhook() already sent it (instant ack), just collect the ids.
         t_button_start = _time.perf_counter()
-        _send_chat_action(token, chat_id)
-        proc_msg_id, proc_web_app = _send_button_message(
-            token, chat_id, "⚡ Processing…",
-            "📊 View Progress [processing]", progress_url, web_app=True)
+        proc_msg_id = proc_web_app = None
+        if ack_future is not None:
+            try:
+                proc_msg_id, proc_web_app, progress_url = ack_future.result(timeout=15)
+            except Exception:
+                log.warning("pre-sent Processing ack failed for bot=%s chat=%s — resending",
+                            bot.id, chat_id)
+        if not proc_msg_id:
+            _send_chat_action(token, chat_id)
+            proc_msg_id, proc_web_app = _send_button_message(
+                token, chat_id, "⚡ Processing…",
+                "📊 View Progress [processing]", progress_url, web_app=True)
         t_button_done = _time.perf_counter()
 
         _stop_typing = threading.Event()
@@ -2388,6 +2442,7 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
                         session_id=sess_id,
                         initiator_kind="telegram",
                         initiator_id=f"{b_id}:{c_id}",
+                        raw_cli_prompt=True,
                     )
                     if _MAIN_LOOP is not None:
                         result = _aio.run_coroutine_threadsafe(_coro, _MAIN_LOOP).result(timeout=300)
@@ -2603,8 +2658,14 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
             text=text_raw, is_voice=is_voice, inbound_lang=inbound_lang,
         ))
 
+    # Instant "Processing…" ack: pre-generate the run id, fire the bubble from
+    # the ack pool right now (the chat's FIFO worker may still be busy with the
+    # previous run), and hand both to _dispatch so it reuses them.
+    pre_run_id = str(uuid4())
+    ack_future = _ACK_POOL.submit(_send_processing_ack, bot.token, chat_id, pre_run_id)
+
     _enqueue_dispatch(bot_snapshot, chat_id, user_id, text_raw, is_voice, inbound_lang,
-                      inbound_id=inbound_id)
+                      inbound_id=inbound_id, pre_run_id=pre_run_id, ack_future=ack_future)
 
     return {"ok": True}
 

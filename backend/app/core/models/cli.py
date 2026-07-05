@@ -120,6 +120,10 @@ class CliLLM(BaseLLM):
         # When set, astream() does NOT launch a container — it re-attaches to the
         # run's durable Redis Stream and replays it (platform-restart recovery).
         self.attach_run_id = _.get("attach_run_id")
+        # When set, the prompt is the last user message verbatim — no
+        # [SYSTEM]/[USER] framing. Required for CLI slash commands ("/compact"):
+        # the claude CLI only recognises them at position 0 of the prompt.
+        self.raw_prompt = bool(_.get("raw_prompt"))
 
     def _build_argv(self, prompt: str, ws_token: str | None = None,
                     redis_url: str | None = None) -> list[str]:
@@ -208,6 +212,12 @@ class CliLLM(BaseLLM):
             else:
                 parts.append(f"[USER]\n{c}\n")
         prompt = "\n".join(parts).strip()
+        if self.raw_prompt:
+            # Slash commands ("/compact") must be the whole prompt — any framing
+            # makes the CLI treat them as ordinary text the model answers to.
+            prompt = next((m.get("content", "") for m in reversed(messages)
+                           if m.get("role", "user") not in ("system", "assistant")),
+                          prompt)
 
         rid: str | None = current_run_id.get()
 

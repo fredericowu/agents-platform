@@ -45,6 +45,13 @@ _SONNET_PRICE_OUTPUT = 15.00
 _SONNET_PRICE_CACHE_WRITE = 3.75
 _SONNET_PRICE_CACHE_READ = 0.30
 
+# Sessions whose auto-compact ran but did NOT bring the token total back under
+# the threshold — mapped to a monotonic deadline before which we won't try
+# again. Prevents a compact storm (one full-context turn billed per message)
+# when compaction is broken or ineffective for a session.
+_AUTO_COMPACT_COOLDOWN: dict[str, float] = {}
+_AUTO_COMPACT_COOLDOWN_S = 1800
+
 
 def _recover_cost_from_transcript(
     session_id: str, window_start: datetime, window_end: datetime
@@ -123,6 +130,14 @@ def _current_session_token_total(session_id: str) -> int | None:
                 try:
                     obj = json.loads(line)
                 except json.JSONDecodeError:
+                    continue
+                # A compact_boundary invalidates every usage entry before it —
+                # the context the NEXT turn sees is the compacted one, whose
+                # size only shows up in the next real turn's usage. Without
+                # this reset the last pre-compact usage (still > threshold)
+                # would re-trigger auto-compact on every message.
+                if obj.get("subtype") == "compact_boundary":
+                    last_usage = None
                     continue
                 usage = (obj.get("message") or {}).get("usage")
                 if usage:
@@ -319,6 +334,7 @@ async def run_agent(
     notion_task_id: str | None = None,
     attach: bool = False,
     skip_auto_compact: bool = False,
+    raw_cli_prompt: bool = False,
 ) -> dict[str, Any]:
     """Run an agent and return ``{run_id, text, status, error, tokens_in, tokens_out}``.
 
@@ -328,6 +344,10 @@ async def run_agent(
                     instead of launching a new one (platform-restart recovery).
     ``skip_auto_compact`` internal — set on the nested "/compact" call itself
                     so it doesn't try to trigger another compaction of itself.
+    ``raw_cli_prompt`` pass ``user_input`` to the CLI verbatim — no system
+                    prompt, no [SYSTEM]/[USER] framing. Required for CLI slash
+                    commands ("/compact"), which the claude CLI only recognises
+                    at position 0 of the prompt.
     """
     # If the workflow that spawned us was already cancelled (or our own row was
     # marked while pending), bail out before spinning up an LLM subprocess.
@@ -411,7 +431,8 @@ async def run_agent(
             threshold = int(get_setting("auto_compact_threshold_tokens", 500_000) or 0)
         except (TypeError, ValueError):
             threshold = 500_000
-        if threshold > 0:
+        cooldown_until = _AUTO_COMPACT_COOLDOWN.get(session_id, 0.0)
+        if threshold > 0 and _time.monotonic() >= cooldown_until:
             current_tokens = _current_session_token_total(session_id)
             if current_tokens is not None and current_tokens > threshold:
                 _exec_log.info(
@@ -423,8 +444,26 @@ async def run_agent(
                     parent_run_id=run_id, initiator_kind="auto_compact",
                     target_id=target_id, session_id=session_id,
                     skip_auto_compact=True,
+                    raw_cli_prompt=True,
                 )
-                auto_compacted = True
+                # Verify it worked: a real compact writes a compact_boundary,
+                # which makes the token total drop (or read as None until the
+                # next real turn). If it's still above threshold, something is
+                # off — back off for 30 min instead of re-compacting (and
+                # re-billing a full-context turn) on every single message.
+                after_tokens = _current_session_token_total(session_id)
+                if after_tokens is not None and after_tokens > threshold:
+                    _exec_log.warning(
+                        "auto-compact: session %s still at %d tokens after compact "
+                        "(threshold %d) — cooling down for %ds",
+                        session_id, after_tokens, threshold, _AUTO_COMPACT_COOLDOWN_S,
+                    )
+                    _AUTO_COMPACT_COOLDOWN[session_id] = (
+                        _time.monotonic() + _AUTO_COMPACT_COOLDOWN_S
+                    )
+                else:
+                    _AUTO_COMPACT_COOLDOWN.pop(session_id, None)
+                    auto_compacted = True
 
     text = ""
     # The concluding answer — the assistant text emitted AFTER the last tool
@@ -449,6 +488,12 @@ async def run_agent(
             content = load_skill(sslug)
             if content:
                 sys_blocks.append(f"[skill:{sslug}]\n{content}")
+        if raw_cli_prompt:
+            # CLI slash-command turn ("/compact"): the prompt must reach the CLI
+            # verbatim — no system prompt, no skills, no framing.
+            sys_blocks = []
+            extra_messages = None
+            runtime["params"]["raw_prompt"] = True
         messages: list[dict] = []
         if sys_blocks:
             messages.append({"role": "system", "content": "\n\n".join(sys_blocks)})
