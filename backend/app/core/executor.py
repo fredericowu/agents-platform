@@ -15,7 +15,7 @@ import logging
 import os
 import time as _time
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Callable
 
 _exec_log = logging.getLogger("ap.executor")
 
@@ -399,10 +399,23 @@ async def run_agent(
     attach: bool = False,
     skip_auto_compact: bool = False,
     raw_cli_prompt: bool = False,
+    on_state: "Callable[[str], None] | None" = None,
 ) -> dict[str, Any]:
     """Serializing wrapper: runs resuming the same ``session_id`` execute
     strictly one at a time, in arrival order (see _SESSION_LOCKS above).
-    Runs without a session_id (fresh sessions) are unaffected."""
+    Runs without a session_id (fresh sessions) are unaffected.
+
+    ``on_state`` — optional lifecycle callback for UI surfaces (Telegram
+    progress button): called with "waiting" when this run queues behind the
+    session lock and "processing" when it actually starts. Must be cheap /
+    non-blocking; exceptions are swallowed."""
+    def _signal(state: str) -> None:
+        if on_state is not None:
+            try:
+                on_state(state)
+            except Exception:
+                pass
+
     kwargs = dict(
         run_id=run_id, event_run_id=event_run_id, parent_run_id=parent_run_id,
         initiator_kind=initiator_kind, initiator_id=initiator_id,
@@ -411,8 +424,14 @@ async def run_agent(
         skip_auto_compact=skip_auto_compact, raw_cli_prompt=raw_cli_prompt,
     )
     if not session_id:
+        _signal("processing")
         return await _run_agent_impl(agent_slug, user_input, **kwargs)
+    _lk = _SESSION_LOCKS.get(session_id)
+    if (_lk is not None and _lk.locked()
+            and _SESSION_LOCK_OWNER.get(session_id) is not asyncio.current_task()):
+        _signal("waiting")
     acquired = await _acquire_session_lock(session_id)
+    _signal("processing")
     try:
         return await _run_agent_impl(agent_slug, user_input, **kwargs)
     finally:

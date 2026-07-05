@@ -178,7 +178,8 @@ def _send_button_message(token: str, chat_id: str, text: str, label: str,
     """Send a message with a single inline button; return (message_id, used_web_app).
 
     Used for the live "View Progress" button whose label carries the run
-    lifecycle state ([processing] → [done] / [error] / [cancelled]). Prefers a
+    lifecycle state ([waiting] → [processing] → [done] / [error] /
+    [cancelled]). Prefers a
     Telegram Mini App (web_app) button so the progress view opens inside
     Telegram; falls back to a plain url button (opens in the browser) if the
     bot/domain isn't set up for web apps.
@@ -841,21 +842,36 @@ def _chat_worker(key: tuple[str, str], q: "queue.Queue[tuple]") -> None:
 
 
 _ACK_POOL = _cf.ThreadPoolExecutor(max_workers=8, thread_name_prefix="tg-ack")
+# Live label edits ([waiting] → [processing]) must apply in order — a single
+# worker keeps them FIFO so a stale state can never overwrite a newer one.
+_LABEL_POOL = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="tg-label")
 
 
-def _send_processing_ack(token: str, chat_id: str, run_id: str) -> tuple:
+def _chat_queue_busy(bot_id: str, chat_id: str) -> bool:
+    """True when this chat's FIFO worker still has work in flight, i.e. a new
+    message will sit [waiting] rather than start processing immediately."""
+    with _CHAT_QUEUES_META:
+        q = _CHAT_QUEUES.get((bot_id, chat_id))
+    return bool(q is not None and q.unfinished_tasks > 0)
+
+
+def _send_processing_ack(token: str, chat_id: str, run_id: str,
+                         busy: bool = False) -> tuple:
     """Send the '⚡ Processing…' bubble with its progress button. Submitted to
     _ACK_POOL straight from the webhook handler (with a pre-generated run_id)
     so the user gets instant feedback even while the chat's FIFO worker is
-    still busy with a previous run. Returns (msg_id, web_app, progress_url)
-    for _dispatch to reuse instead of sending its own bubble."""
+    still busy with a previous run. Returns (msg_id, web_app, progress_url,
+    initial_state) for _dispatch to reuse instead of sending its own bubble.
+    ``busy`` labels the button [waiting] instead of [processing] — flipped
+    live once the run actually starts."""
     _send_chat_action(token, chat_id)
     ap_url = os.environ.get("AP_PUBLIC_URL", "https://agents-platform.app.aw.tekflox.com")
     progress_url = f"{ap_url}/api/telegram/progress/{run_id}"
+    state = "waiting" if busy else "processing"
     msg_id, web_app = _send_button_message(
         token, chat_id, "⚡ Processing…",
-        "📊 View Progress [processing]", progress_url, web_app=True)
-    return msg_id, web_app, progress_url
+        f"📊 View Progress [{state}]", progress_url, web_app=True)
+    return msg_id, web_app, progress_url, state
 
 
 def _enqueue_dispatch(bot: TelegramBot, chat_id: str, user_id: str,
@@ -1205,7 +1221,7 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
         if ack_future is None:
             return
         try:
-            _mid, _wapp, _purl = ack_future.result(timeout=15)
+            _mid, _wapp, _purl, _ = ack_future.result(timeout=15)
             if _mid:
                 _edit_button_label(token, chat_id, _mid,
                                    f"📊 View Progress [{state}]", _purl, web_app=_wapp)
@@ -1268,9 +1284,10 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
         # When webhook() already sent it (instant ack), just collect the ids.
         t_button_start = _time.perf_counter()
         proc_msg_id = proc_web_app = None
+        btn_state = "processing"
         if ack_future is not None:
             try:
-                proc_msg_id, proc_web_app, progress_url = ack_future.result(timeout=15)
+                proc_msg_id, proc_web_app, progress_url, btn_state = ack_future.result(timeout=15)
             except Exception:
                 log.warning("pre-sent Processing ack failed for bot=%s chat=%s — resending",
                             bot.id, chat_id)
@@ -1279,7 +1296,22 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
             proc_msg_id, proc_web_app = _send_button_message(
                 token, chat_id, "⚡ Processing…",
                 "📊 View Progress [processing]", progress_url, web_app=True)
+            btn_state = "processing"
         t_button_done = _time.perf_counter()
+
+        # Live label updates while the run is queued/starting:
+        # [waiting] → [processing] (terminal states are set in the finally
+        # block). Called by executor.run_agent (event loop) — the edit runs on
+        # the single-worker _LABEL_POOL so updates apply strictly in order.
+        _btn_cur = {"state": btn_state}
+
+        def _set_btn_state(state: str) -> None:
+            if not proc_msg_id or _btn_cur["state"] == state:
+                return
+            _btn_cur["state"] = state
+            _LABEL_POOL.submit(_edit_button_label, token, chat_id, proc_msg_id,
+                               f"📊 View Progress [{state}]", progress_url,
+                               web_app=proc_web_app)
 
         _stop_typing = threading.Event()
 
@@ -1303,6 +1335,7 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
                 session_id=session_id,
                 initiator_kind="telegram",
                 initiator_id=f"{bot.id}:{chat_id}",
+                on_state=_set_btn_state,
             )
             log.info("dispatch: _MAIN_LOOP=%s run_id=%s agent=%s", _MAIN_LOOP, run_id, agent_slug)
             if _MAIN_LOOP is not None:
@@ -2601,7 +2634,8 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
     # the ack pool right now (the chat's FIFO worker may still be busy with the
     # previous run), and hand both to _dispatch so it reuses them.
     pre_run_id = str(uuid4())
-    ack_future = _ACK_POOL.submit(_send_processing_ack, bot.token, chat_id, pre_run_id)
+    ack_future = _ACK_POOL.submit(_send_processing_ack, bot.token, chat_id, pre_run_id,
+                                  _chat_queue_busy(bot.id, chat_id))
 
     _enqueue_dispatch(bot_snapshot, chat_id, user_id, text_raw, is_voice, inbound_lang,
                       inbound_id=inbound_id, pre_run_id=pre_run_id, ack_future=ack_future)
