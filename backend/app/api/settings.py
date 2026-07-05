@@ -6,6 +6,9 @@ Persisted via the ``Setting`` model (key/value JSON). Tracked keys:
   * ``security_mode``           — global default ``insecure`` | ``secure``
   * ``command_allowlist``       — allow-list of command prefixes (secure mode only)
   * ``command_denylist``        — regex deny-list (always enforced)
+  * ``auto_compact_threshold_tokens`` — run "/compact" before a turn once the
+    resumed session's context exceeds this many tokens (default 500,000; 0
+    disables). See executor.run_agent's auto-compact check.
 
 Unknown keys are accepted (they round-trip through the API) so future
 settings don't need a code change — but only the ones above are read by
@@ -27,7 +30,10 @@ _KNOWN = {"command_timeout_seconds", "security_mode",
           "rag_provider", "retro_score_weights",
           "github_sync_enabled", "github_repo", "github_webhook_secret",
           "tts_provider", "stt_provider", "openai_api_key",
-          "tts_voice", "edge_voice", "edge_voices"}
+          "tts_voice", "edge_voice", "edge_voices",
+          "auto_compact_threshold_tokens"}
+
+DEFAULT_AUTO_COMPACT_THRESHOLD_TOKENS = 500_000
 
 
 class SettingPatch(BaseModel):
@@ -53,6 +59,9 @@ def get_all_settings():
         "edge_voice": security.get_setting("edge_voice", voice.DEFAULT_EDGE_VOICE),
         "edge_voices": security.get_setting("edge_voices", {}) or {},
         "openai_key_configured": bool(voice.get_openai_api_key()),
+        "auto_compact_threshold_tokens": security.get_setting(
+            "auto_compact_threshold_tokens", DEFAULT_AUTO_COMPACT_THRESHOLD_TOKENS
+        ),
         # exposed for the UI so it can show "(default)" badges
         "_defaults": {
             "command_timeout_seconds": security.DEFAULT_COMMAND_TIMEOUT,
@@ -64,6 +73,7 @@ def get_all_settings():
             "stt_provider":            "openai",
             "tts_voice":               voice.DEFAULT_VOICE,
             "edge_voice":              voice.DEFAULT_EDGE_VOICE,
+            "auto_compact_threshold_tokens": DEFAULT_AUTO_COMPACT_THRESHOLD_TOKENS,
         },
     }
 
@@ -154,6 +164,14 @@ def update_setting(key: str, body: SettingPatch):
         if not isinstance(body.value, dict) or not all(isinstance(v, str) for v in body.value.values()):
             raise HTTPException(400, "edge_voices must be a JSON object of lang -> voice id")
         security.set_setting(key, body.value)
+    elif key == "auto_compact_threshold_tokens":
+        try:
+            v = int(body.value)
+        except Exception:
+            raise HTTPException(400, "auto_compact_threshold_tokens must be an integer")
+        if v != 0 and (v < 10_000 or v > 5_000_000):
+            raise HTTPException(400, "auto_compact_threshold_tokens must be 0 (disabled) or 10,000–5,000,000")
+        security.set_setting(key, v)
     else:
         # Unknown setting: accept verbatim (forward-compatible)
         security.set_setting(key, body.value)

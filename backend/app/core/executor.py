@@ -104,6 +104,40 @@ def _recover_cost_from_transcript(
     return cost
 
 
+def _current_session_token_total(session_id: str) -> int | None:
+    """Context size (input + cache_read + cache_creation) as of the LAST
+    recorded turn in this session's transcript — used by the auto-compact
+    check to decide whether the session has grown past the configured
+    threshold before processing the next real turn. Returns None (never
+    raises) if the transcript is missing or has no usage data yet."""
+    path = os.path.join(_CLAUDE_PROJECTS_DIR, f"{session_id}.jsonl")
+    if not os.path.exists(path):
+        return None
+    last_usage: dict | None = None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                usage = (obj.get("message") or {}).get("usage")
+                if usage:
+                    last_usage = usage
+    except OSError:
+        return None
+    if not last_usage:
+        return None
+    return (
+        last_usage.get("input_tokens", 0)
+        + last_usage.get("cache_read_input_tokens", 0)
+        + last_usage.get("cache_creation_input_tokens", 0)
+    )
+
+
 def _resolve_agent_config(s: Session, agent: Agent) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
     """Return (permissions, extra_volumes, mcp_config) for *agent*. When
     ``agent.agent_config_slug`` points at an AgentConfig, that record wins —
@@ -284,6 +318,7 @@ async def run_agent(
     session_id: str | None = None,
     notion_task_id: str | None = None,
     attach: bool = False,
+    skip_auto_compact: bool = False,
 ) -> dict[str, Any]:
     """Run an agent and return ``{run_id, text, status, error, tokens_in, tokens_out}``.
 
@@ -291,6 +326,8 @@ async def run_agent(
     ``event_run_id`` publish events on this id too (so workflows roll up nicely)
     ``attach``      re-attach to an already-running container via its Redis Stream
                     instead of launching a new one (platform-restart recovery).
+    ``skip_auto_compact`` internal — set on the nested "/compact" call itself
+                    so it doesn't try to trigger another compaction of itself.
     """
     # If the workflow that spawned us was already cancelled (or our own row was
     # marked while pending), bail out before spinning up an LLM subprocess.
@@ -360,6 +397,32 @@ async def run_agent(
                               "model_slug": runtime["model_slug"],
                               "run_id": run_id,
                               "parent_run_id": parent_run_id}, node=node_id or agent_slug)
+
+    # Auto-compact: a resumed session that's grown past the configured
+    # threshold gets a "/compact" turn first — same session_id, its own Run
+    # row (initiator_kind="auto_compact") — before this turn's real message
+    # is processed. Settings → General → "Auto-compact threshold (tokens)";
+    # 0 disables. Guarded by skip_auto_compact so the compact call itself
+    # doesn't try to compact itself.
+    if session_id and not skip_auto_compact and user_input.strip() != "/compact":
+        from .security import get_setting
+        try:
+            threshold = int(get_setting("auto_compact_threshold_tokens", 500_000) or 0)
+        except (TypeError, ValueError):
+            threshold = 500_000
+        if threshold > 0:
+            current_tokens = _current_session_token_total(session_id)
+            if current_tokens is not None and current_tokens > threshold:
+                _exec_log.info(
+                    "auto-compact: session %s at %d tokens (> %d threshold) — "
+                    "compacting before run %s", session_id, current_tokens, threshold, run_id,
+                )
+                await run_agent(
+                    agent_slug, "/compact",
+                    parent_run_id=run_id, initiator_kind="auto_compact",
+                    target_id=target_id, session_id=session_id,
+                    skip_auto_compact=True,
+                )
 
     text = ""
     # The concluding answer — the assistant text emitted AFTER the last tool

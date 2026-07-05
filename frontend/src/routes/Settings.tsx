@@ -65,6 +65,7 @@ export default function Settings() {
 
   // local editable mirrors (so users can type freely before save)
   const [timeoutStr, setTimeoutStr] = useState("");
+  const [autoCompactStr, setAutoCompactStr] = useState("");
   const [allow, setAllow] = useState("");
   const [deny, setDeny]   = useState("");
   const [ragJson, setRagJson] = useState("");
@@ -105,6 +106,7 @@ export default function Settings() {
       const res = await api.getSettings();
       setS(res);
       setTimeoutStr(String(res.command_timeout_seconds));
+      setAutoCompactStr(String(res.auto_compact_threshold_tokens ?? 500000));
       setAllow((res.command_allowlist || []).join("\n"));
       setDeny((res.command_denylist || []).join("\n"));
       setRagJson(JSON.stringify(res.rag_provider || {}, null, 2));
@@ -195,6 +197,7 @@ export default function Settings() {
       const res = await api.resetSettings();
       setS(res);
       setTimeoutStr(String(res.command_timeout_seconds));
+      setAutoCompactStr(String(res.auto_compact_threshold_tokens ?? 500000));
       setAllow((res.command_allowlist || []).join("\n"));
       setDeny((res.command_denylist || []).join("\n"));
       setMsg("reset to defaults");
@@ -232,6 +235,38 @@ export default function Settings() {
             </button>
             {!isDefaultTimeout && (
               <span className="text-xs text-muted">overrides default ({s._defaults?.command_timeout_seconds}s)</span>
+            )}
+          </div>
+        </FormRow>
+      </div>
+
+      {/* ─────── Auto-compact ─────── */}
+      <div className="card mb-4">
+        <h2 className="text-base font-semibold mb-1">Auto-compact</h2>
+        <div className="text-xs text-muted mb-3">
+          A resumed agent session's context only ever grows (claude-cli's own
+          auto-compact never triggers in headless mode). Once a session's
+          context exceeds this many tokens, a "/compact" turn runs
+          automatically before the next real message is processed. Set to 0
+          to disable.
+        </div>
+
+        <FormRow label="threshold (tokens)"
+                 hint={`Default: ${s._defaults?.auto_compact_threshold_tokens?.toLocaleString()} tokens. 0 disables auto-compact.`}>
+          <div className="flex items-center gap-2">
+            <input type="number" min={0} max={5000000} step={10000} className="w-40"
+                   value={autoCompactStr}
+                   onChange={e => setAutoCompactStr(e.target.value)}
+                   data-testid="settings-auto-compact-threshold" />
+            <button className="btn btn-primary"
+                    disabled={saving === "auto_compact_threshold_tokens" ||
+                              autoCompactStr === String(s.auto_compact_threshold_tokens)}
+                    onClick={() => save("auto_compact_threshold_tokens", parseInt(autoCompactStr, 10) || 0)}
+                    data-testid="settings-auto-compact-threshold-save">
+              {saving === "auto_compact_threshold_tokens" ? "saving..." : "save"}
+            </button>
+            {s.auto_compact_threshold_tokens !== s._defaults?.auto_compact_threshold_tokens && (
+              <span className="text-xs text-muted">overrides default ({s._defaults?.auto_compact_threshold_tokens?.toLocaleString()})</span>
             )}
           </div>
         </FormRow>
