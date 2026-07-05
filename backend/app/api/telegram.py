@@ -2323,7 +2323,13 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
             _send_agent_picker(bot.token, chat_id)
             return {"ok": True, "reason": "slash /agent"}
 
-        if cmd in ("new", "newsession", "reset"):
+        # "/clear" aliases "/new": passing a literal "/clear" to the CLI in
+        # headless -p mode does NOT clear context — it mints a new session_id
+        # whose next --resume still carries the full history (verified
+        # 2026-07-05: post-/clear session answered a secret word from the
+        # pre-clear turns with cache_read≈28k). The only real clear is a
+        # fresh session binding.
+        if cmd in ("new", "newsession", "reset", "clear"):
             existed = False
             with session_scope() as ss:
                 row = (ss.query(TelegramSession)
@@ -2470,82 +2476,6 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
             ).start()
             return {"ok": True, "reason": "slash /compact queued"}
 
-        if cmd == "clear":
-            # Unlike /new (which drops session_id and starts a brand-new CLI
-            # session), /clear passes the literal "/clear" straight through to
-            # the running CLI on the SAME session_id — the CLI's own /clear
-            # handles wiping its context in place. Mirrors the /compact block.
-            with session_scope() as ss:
-                _clear_row = (ss.query(TelegramSession)
-                              .filter(TelegramSession.bot_id == bot_id,
-                                      TelegramSession.chat_id == chat_id)
-                              .first())
-                _clear_session_id = _clear_row.session_id if _clear_row else None
-                _clear_slug = (_clear_row.agent_slug_override if _clear_row else None) or bot.agent_slug
-            if not _clear_slug:
-                _send_message(bot.token, chat_id, "⚠️ No agent configured for this chat.")
-                return {"ok": True, "reason": "slash /clear no agent"}
-            if not _clear_session_id:
-                _send_message(bot.token, chat_id,
-                              "⚠️ No active session. Send a message first to start one.")
-                return {"ok": True, "reason": "slash /clear no session"}
-            _clear_target_id = _ensure_target(bot.id, chat_id)
-            _clear_token = bot.token
-            _clear_bot_id = bot.id
-            _clear_chat_id = chat_id
-
-            def _do_clear(slug, sess_id, target_id, tg_token, b_id, c_id):
-                import asyncio as _aio
-                try:
-                    from ..core.executor import run_agent as _run_agent
-                    _coro = _run_agent(
-                        slug, "/clear",
-                        target_id=target_id,
-                        session_id=sess_id,
-                        initiator_kind="telegram",
-                        initiator_id=f"{b_id}:{c_id}",
-                        skip_auto_compact=True,
-                        raw_cli_prompt=True,
-                    )
-                    if _MAIN_LOOP is not None:
-                        result = _aio.run_coroutine_threadsafe(_coro, _MAIN_LOOP).result(timeout=120)
-                    else:
-                        result = _aio.run(_coro)
-                    output_text = (result.get("text") or "").strip()
-                    status = result.get("status", "unknown")
-                    if status in ("success", "completed"):
-                        # /clear makes the CLI mint a fresh session_id — persist
-                        # it so the next message resumes the cleared session, not
-                        # the old (still-full) transcript.
-                        _clear_run_id = result.get("run_id")
-                        if _clear_run_id:
-                            with session_scope() as _rs:
-                                _rr = _rs.query(Run).filter(Run.id == _clear_run_id).first()
-                                _new_sid = _rr.session_id if _rr else None
-                            if _new_sid and _new_sid != sess_id:
-                                _save_session_id(b_id, c_id, _new_sid, token=tg_token)
-                        if output_text and output_text != "(empty response)":
-                            _send_message(tg_token, c_id,
-                                          f"🧹 Context cleared.\n\n{_md_to_html(output_text)}",
-                                          parse_mode="HTML")
-                        else:
-                            _send_message(tg_token, c_id, "🧹 Context cleared.")
-                    else:
-                        _send_message(tg_token, c_id,
-                                      f"⚠️ Clear finished with status: <code>{status}</code>",
-                                      parse_mode="HTML")
-                except Exception as _e:
-                    log.exception("clear failed for bot=%s chat=%s", b_id, c_id)
-                    _send_message(tg_token, c_id, f"⚠️ Clear failed: {_e}")
-
-            threading.Thread(
-                target=_do_clear,
-                args=(_clear_slug, _clear_session_id, _clear_target_id,
-                      _clear_token, _clear_bot_id, _clear_chat_id),
-                daemon=True, name=f"clear-{bot.id}-{chat_id}",
-            ).start()
-            return {"ok": True, "reason": "slash /clear queued"}
-
         if cmd in ("help", "?"):
             _send_message(bot.token, chat_id,
                           "🤖 <b>Agents Platform commands</b>\n"
@@ -2556,7 +2486,7 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
                           "/rename — rename the current session (no args → prompt)\n"
                           "/abort — stop the run in progress\n"
                           "/compact — compress conversation context to save tokens\n"
-                          "/clear — clear the CLI's context in place (keeps the same session)\n"
+                          "/clear — same as /new: start a fresh conversation\n"
                           "/help — show this message")
             return {"ok": True, "reason": "slash /help"}
         # Unknown slash command → fall through to the agent dispatch below.
