@@ -10,9 +10,11 @@ Lineage:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import time as _time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 _exec_log = logging.getLogger("ap.executor")
@@ -29,6 +31,77 @@ from . import hops
 from .models import make_llm
 from .orchestrators import dispatch as dispatch_workflow
 from .tools.langchain_tools import tools_for_agent
+
+# Every docker agent runs with cwd pinned to /opt/agentic-workspace (see
+# _agent_to_runtime's params["cwd"] = _aw_base below), so the claude CLI's
+# --resume session store is always this one shared project dir.
+_CLAUDE_PROJECTS_DIR = os.path.expanduser(
+    "~/.claude/projects/-opt-agentic-workspace"
+)
+# Published Anthropic per-million-token rates for the Sonnet tier used here
+# (claude-cli-sonnet / claude-sonnet-5) — $/MTok.
+_SONNET_PRICE_INPUT = 3.00
+_SONNET_PRICE_OUTPUT = 15.00
+_SONNET_PRICE_CACHE_WRITE = 3.75
+_SONNET_PRICE_CACHE_READ = 0.30
+
+
+def _recover_cost_from_transcript(
+    session_id: str, window_start: datetime, window_end: datetime
+) -> float | None:
+    """Fallback for a run whose cost_usd stayed 0.0 because claude-cli's own
+    "result" event (which carries total_cost_usd) never arrived — the usual
+    cause is the docker process getting killed mid-turn by an awserv/
+    agents-platform restart, before the CLI printed its final summary. The
+    session's transcript file on disk still has the real per-message usage
+    breakdown regardless (the CLI persists it incrementally, independent of
+    whatever our own stream capture managed to see), so recompute cost from
+    the last usage block in the run's time window instead of leaving it at 0.
+
+    Returns None (never raises) if the transcript is missing or has no usage
+    data in range — the caller just keeps whatever cost it already had.
+    """
+    path = os.path.join(_CLAUDE_PROJECTS_DIR, f"{session_id}.jsonl")
+    if not os.path.exists(path):
+        return None
+    # A little slack for clock skew between our own started_at/ended_at
+    # bookkeeping and the CLI process's own event timestamps.
+    lo = window_start - timedelta(seconds=5)
+    hi = window_end + timedelta(seconds=15)
+    last_usage: dict | None = None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts_raw = obj.get("timestamp")
+                if not ts_raw:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).replace(tzinfo=None)
+                except ValueError:
+                    continue
+                if not (lo <= ts <= hi):
+                    continue
+                usage = (obj.get("message") or {}).get("usage")
+                if usage:
+                    last_usage = usage
+    except OSError:
+        return None
+    if not last_usage:
+        return None
+    cost = (
+        last_usage.get("input_tokens", 0) * _SONNET_PRICE_INPUT
+        + last_usage.get("output_tokens", 0) * _SONNET_PRICE_OUTPUT
+        + last_usage.get("cache_creation_input_tokens", 0) * _SONNET_PRICE_CACHE_WRITE
+        + last_usage.get("cache_read_input_tokens", 0) * _SONNET_PRICE_CACHE_READ
+    ) / 1_000_000
+    return cost
 
 
 def _resolve_agent_config(s: Session, agent: Agent) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
@@ -455,16 +528,29 @@ async def run_agent(
         status = "error" if err else "success"
     _gh_issue_number = None
     _run_ws_data: dict | None = None
+    _ended_at = datetime.utcnow()
     with session_scope() as s:
         r = s.query(Run).filter(Run.id == run_id).first()
         if r:
+            # claude-cli's own "result" event never arrived (process killed
+            # mid-turn, usually by a backend restart) — the CLI's session
+            # transcript on disk still has the real usage, so recompute cost
+            # from that instead of persisting a misleading 0.0.
+            if cost == 0.0 and tin > 0 and r.session_id:
+                recovered = _recover_cost_from_transcript(r.session_id, r.started_at, _ended_at)
+                if recovered:
+                    _exec_log.info(
+                        "recovered cost_usd=%.6f for run %s from transcript (was 0.0, tokens_in=%d)",
+                        recovered, run_id, tin,
+                    )
+                    cost = recovered
             r.status = status
             r.output = {"text": text}
             r.error = err
             r.tokens_in = tin
             r.tokens_out = tout
             r.cost_usd = cost
-            r.ended_at = datetime.utcnow()
+            r.ended_at = _ended_at
             _gh_issue_number = getattr(r, "github_issue_number", None)
             from .events import _run_to_ws_dict
             _run_ws_data = _run_to_ws_dict(r)
