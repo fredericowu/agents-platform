@@ -301,7 +301,8 @@ class ScheduledWakeup(Base):
     agent_slug: Mapped[str] = mapped_column(String)
     target_id: Mapped[str | None] = mapped_column(String, nullable=True)
     session_id: Mapped[str] = mapped_column(String, index=True)
-    initiator_id: Mapped[str] = mapped_column(String)                # "{bot_id}:{chat_id}"
+    initiator_id: Mapped[str] = mapped_column(String)                # telegram: "{bot_id}:{chat_id}" · watch/meta: device session id
+    channel: Mapped[str] = mapped_column(String, default="telegram") # telegram|watch — which delivery path ships the reply
     prompt: Mapped[str] = mapped_column(Text)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     fire_at: Mapped[datetime] = mapped_column(DateTime)
