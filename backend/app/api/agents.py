@@ -5,7 +5,8 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..core.executor import start_agent_run_bg
@@ -375,3 +376,66 @@ async def run_agent_ep(slug: str, body: RunInput, s: Session = Depends(get_sessi
     except __import__("backend.app.core.executor", fromlist=["TargetBudgetExceeded"]).TargetBudgetExceeded as e:
         raise HTTPException(429, f"target budget exceeded: {e}")
     return {"run_id": rid, "target_id": target_id}
+
+
+class RunSyncInput(BaseModel):
+    input: str
+    # Stable per-device/per-conversation key from the caller (e.g. the Watch's
+    # own generated session id) — used to auto-create a Target and to look up
+    # conversation continuity across calls, since the caller has no CliSession
+    # id to hand back until after the first run.
+    external_id: str
+    initiator_kind: str = "agent_run"
+
+
+def _verify_internal_secret(x_internal_secret: str = Header(default="")) -> None:
+    """Shared trust boundary for server-to-server calls into Agents Platform
+    from awserv (Telegram's /inject, this run_sync endpoint, etc.) — one
+    secret (AGENTS_TELEGRAM_INJECT_SECRET) covers all of them."""
+    from ..config import settings
+    import hmac as _hmac
+    if not settings.telegram_inject_secret:
+        raise HTTPException(503, "telegram_inject_secret not configured (AGENTS_TELEGRAM_INJECT_SECRET)")
+    if not _hmac.compare_digest(settings.telegram_inject_secret, x_internal_secret or ""):
+        raise HTTPException(403, "invalid X-Internal-Secret")
+
+
+@router.post("/{slug}/run_sync")
+async def run_agent_sync_ep(slug: str, body: RunSyncInput,
+                             _auth: None = Depends(_verify_internal_secret),
+                             s: Session = Depends(get_session)) -> dict:
+    """Run an agent and block for its reply — for non-Telegram channels (e.g.
+    the AW Meta Glasses/Watch) that need a synchronous request/response, the
+    same way the Telegram dispatcher does internally. Auto-provisions a
+    Target per ``external_id`` and resumes the most recent session for it."""
+    a = s.query(Agent).filter(Agent.slug == slug, Agent.deleted_at.is_(None)).first()
+    if not a:
+        raise HTTPException(404, f"agent '{slug}' not found")
+
+    from ..models import Target, Run
+    target_slug = f"{slug}-{body.external_id}"
+    target = s.query(Target).filter(Target.slug == target_slug).first()
+    if target is None:
+        target = Target(slug=target_slug, name=f"{a.name or slug} / {body.external_id}",
+                         source_kind="external", source_ref=body.external_id)
+        s.add(target)
+        s.flush()
+        s.commit()
+    session_id = (
+        s.query(Run.session_id)
+        .filter(Run.target_id == target.id, Run.session_id.isnot(None))
+        .order_by(Run.started_at.desc())
+        .limit(1)
+        .scalar()
+    )
+
+    from ..core.executor import run_agent
+    result = await run_agent(
+        slug, body.input, target_id=target.id, session_id=session_id,
+        initiator_kind=body.initiator_kind, initiator_id=body.external_id,
+    )
+    return {
+        "reply": result.get("reply") or result.get("text", ""),
+        "run_id": result.get("run_id"),
+        "status": result.get("status"),
+    }

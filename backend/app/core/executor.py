@@ -90,7 +90,13 @@ def _agent_to_runtime(s: Session, agent: Agent) -> dict[str, Any]:
     _data_home = _os.path.join(_aw_base, "data", "home")
     _perm_volumes: dict[str, str | list[str]] = {
         "docker": "/var/run/docker.sock:/var/run/docker.sock",
-        "tmp_access": "/tmp:/tmp",
+        # Naive "/tmp:/tmp" would be resolved by the BARE-METAL host's dockerd
+        # (docker.sock is a sibling-container passthrough, same gotcha as the
+        # .tmp case below) — that's the physical host's /tmp, not the
+        # sandbox's own. Use the real host path the sandbox's own /tmp is
+        # bind-mounted from (see docker-compose.yml aw-sandbox volumes) so
+        # agent containers actually share the sandbox's /tmp.
+        "tmp_access": f"{_aw_base}/data/sandbox-tmp:/tmp",
         "github": [
             v for v in [
                 f"{_data_home}/.gitconfig:/home/ubuntu/.gitconfig:ro"
@@ -109,29 +115,25 @@ def _agent_to_runtime(s: Session, agent: Agent) -> dict[str, Any]:
                 if container not in seen_container:
                     extra_volumes.append(vol)
                     seen_container.add(container)
-    # "Agentic Workspace Folder Access" OFF means docker_agent mounts an empty
-    # tmpfs at cwd instead of the real repo (see mount_cwd below) — so `.tmp`
-    # under that cwd is a fresh, LOCAL, non-shared directory that vanishes
-    # when the container exits, even though `.tmp` is documented workspace-wide
-    # as durable state bind-mounted from `data/tmp` on the host. Any agent/tool
-    # that reads or writes a `.tmp/...` path from *inside* such a container
-    # (not just passing the path to a host-side MCP tool) silently gets a
-    # throwaway copy instead of the shared one — this bit the remote-agent
-    # update-artifact flow. Bind the SAME host path the workspace-mounted case
-    # would expose, at the identical container path, so `.tmp` behaves
-    # consistently regardless of the workspace_access toggle.
-    if not permissions.get("workspace_access", True):
-        _tmp_container = f"{_aw_base}/.tmp"
-        if _tmp_container not in seen_container:
-            # The docker socket we spawn sibling containers through belongs to
-            # the BARE-METAL host's daemon, not to aw-sandbox's own filesystem
-            # view — so a bind source of "{_aw_base}/.tmp" resolves against
-            # the host's literal /opt/agentic-workspace/.tmp (empty/stale),
-            # not against what aw-sandbox itself sees at that path (which is
-            # its own bind mount of the host's data/tmp). Use the real host
-            # source so sibling containers see the same durable .tmp state.
-            extra_volumes.append(f"{_aw_base}/data/tmp:{_tmp_container}")
-            seen_container.add(_tmp_container)
+    # `.tmp` under the agent's cwd must resolve to the SAME durable host dir
+    # awserv itself reads/writes (`data/tmp`), regardless of workspace_access:
+    # OFF means docker_agent mounts an empty tmpfs at cwd (so `.tmp` would be a
+    # fresh, non-shared dir that vanishes on container exit); ON means the real
+    # repo is bind-mounted (so `.tmp` would just be that repo's checked-in,
+    # stale subdir — not the live data/tmp content). Either way, an explicit,
+    # more-specific bind mount is needed to shadow whatever `.tmp` would
+    # otherwise resolve to. Always add it.
+    _tmp_container = f"{_aw_base}/.tmp"
+    if _tmp_container not in seen_container:
+        # The docker socket we spawn sibling containers through belongs to
+        # the BARE-METAL host's daemon, not to aw-sandbox's own filesystem
+        # view — so a bind source of "{_aw_base}/.tmp" resolves against
+        # the host's literal /opt/agentic-workspace/.tmp (empty/stale),
+        # not against what aw-sandbox itself sees at that path (which is
+        # its own bind mount of the host's data/tmp). Use the real host
+        # source so sibling containers see the same durable .tmp state.
+        extra_volumes.append(f"{_aw_base}/data/tmp:{_tmp_container}")
+        seen_container.add(_tmp_container)
     if extra_volumes:
         params["extra_volumes"] = extra_volumes
     # share_network: join aw-sandbox's docker netns instead of the default bridge,
@@ -161,7 +163,7 @@ def _agent_to_runtime(s: Session, agent: Agent) -> dict[str, Any]:
             "system_prompt": system_prompt,
             "tool_specs": list(agent.tool_specs or []),
             "skill_slugs": list(agent.skill_slugs or []),
-            "verbose_replies": bool(permissions.get("verbose_replies", True))}
+            "verbose_replies": bool(permissions.get("verbose_replies", False))}
 
 
 async def _notify_kanban_run_done(*, run_id: str, agent_slug: str,

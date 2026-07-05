@@ -169,14 +169,22 @@ def build_docker_argv(
 
     # ── Volume mounts ──────────────────────────────────────────────────────────
     seen_mounts: set[str] = set()
+    # Docker rejects two -v flags targeting the same container path ("Duplicate
+    # mount point") even if their host sources differ. Track container paths
+    # separately so the FIRST mount to a given container path wins and later
+    # callers silently no-op instead of producing a rejected docker invocation.
+    seen_containers: set[str] = set()
 
     def add_mount(host: str, container: str, readonly: bool = False) -> None:
+        if container in seen_containers:
+            return
         host_abs = str(Path(host).resolve())
         flag = f"{host_abs}:{container}"
         if readonly:
             flag += ":ro"
         if flag not in seen_mounts:
             seen_mounts.add(flag)
+            seen_containers.add(container)
             argv.extend(["-v", flag])
 
     # Working directory: use /home/ubuntu when using agent-specific MCP config to
@@ -243,6 +251,17 @@ def build_docker_argv(
             if creds_file_host.is_file():
                 add_mount(str(creds_file_host), f"/home/ubuntu/{creds_file}")
 
+    # Per-agent extra volumes (e.g. ["/var/run/docker.sock:/var/run/docker.sock"]).
+    # Applied BEFORE the generic --add-dir mounts below so an explicit permission
+    # grant (e.g. tmp_access's real "/tmp" source) wins the container path over a
+    # naive same-path add-dir mount — add_mount() is first-wins per container path.
+    for vol in (extra_volumes or []):
+        if ":" in vol:
+            h, c = vol.split(":", 1)
+            add_mount(h, c)
+        else:
+            add_mount(vol, vol)
+
     # --add-dir targets: mount and track for CLI flag
     add_dir_mounts: list[str] = []
     for raw in add_dirs:
@@ -274,14 +293,6 @@ def build_docker_argv(
         codex_mcp_host = Path(mcp_config_dir) / "mcp_codex.toml"
         if cli == "codex" and codex_mcp_host.is_file():
             add_mount(str(codex_mcp_host.resolve()), "/home/ubuntu/.codex/agentmcp.config.toml", readonly=True)
-
-    # Per-agent extra volumes (e.g. ["/var/run/docker.sock:/var/run/docker.sock"])
-    for vol in (extra_volumes or []):
-        if ":" in vol:
-            h, c = vol.split(":", 1)
-            add_mount(h, c)
-        else:
-            add_mount(vol, vol)
 
     # ── Environment ────────────────────────────────────────────────────────────
     if env_file:
