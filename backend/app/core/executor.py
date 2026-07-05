@@ -490,10 +490,12 @@ async def run_agent(
                 sys_blocks.append(f"[skill:{sslug}]\n{content}")
         if raw_cli_prompt:
             # CLI slash-command turn ("/compact"): the prompt must reach the CLI
-            # verbatim — no system prompt, no skills, no framing.
+            # verbatim — no system prompt, no skills, no framing, and no
+            # --append-system-prompt from model/agent params either.
             sys_blocks = []
             extra_messages = None
             runtime["params"]["raw_prompt"] = True
+            runtime["params"]["append_system_prompt"] = None
         messages: list[dict] = []
         if sys_blocks:
             messages.append({"role": "system", "content": "\n\n".join(sys_blocks)})

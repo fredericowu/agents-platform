@@ -2448,15 +2448,12 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
                         result = _aio.run_coroutine_threadsafe(_coro, _MAIN_LOOP).result(timeout=300)
                     else:
                         result = _aio.run(_coro)
-                    output_text = (result.get("text") or "").strip()
                     status = result.get("status", "unknown")
                     if status in ("success", "completed"):
-                        if output_text and output_text != "(empty response)":
-                            _send_message(tg_token, c_id,
-                                          f"✅ Context compacted.\n\n{_md_to_html(output_text)}",
-                                          parse_mode="HTML")
-                        else:
-                            _send_message(tg_token, c_id, "✅ Context compacted.")
+                        # Just the confirmation — the CLI's own result text is
+                        # the compact summary (or, pre-raw_cli_prompt, a confused
+                        # model reply); neither belongs in the chat.
+                        _send_message(tg_token, c_id, "✅ Context compacted.")
                     else:
                         _send_message(tg_token, c_id,
                                       f"⚠️ Compact finished with status: <code>{status}</code>",
