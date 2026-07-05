@@ -112,13 +112,25 @@ class EventBus:
             "payload": payload or {},
             "ts": datetime.utcnow().isoformat(),
         }
-        # persist
-        try:
-            with session_scope() as s:
-                s.add(RunEvent(run_id=run_id, kind=kind, node_id=node_id, payload=payload or {}))
-        except Exception as e:
-            # never let observability crash the run
-            print(f"[eventbus] persist failed: {e}")
+        # Persist off the event loop. This is a synchronous SQLAlchemy write
+        # (INSERT + commit) and publish() is on the hottest path in the whole
+        # system — every llm_token/tool_call/tool_result for every run, and
+        # ALL dispatches (every bot, every chat) share this one event loop
+        # (see telegram.py's _MAIN_LOOP). A single heavy run can emit
+        # thousands of these; before this fix each one blocked the entire
+        # loop for its DB round-trip, and the cumulative stall across one
+        # big run (observed: a ~24M-token run) was long enough that
+        # Telegram's webhook delivery timed out and silently dropped
+        # messages from OTHER chats sent during that window — not a per-chat
+        # queueing bug, a total event-loop-starvation bug.
+        def _persist() -> None:
+            try:
+                with session_scope() as s:
+                    s.add(RunEvent(run_id=run_id, kind=kind, node_id=node_id, payload=payload or {}))
+            except Exception as e:
+                # never let observability crash the run
+                print(f"[eventbus] persist failed: {e}")
+        await asyncio.to_thread(_persist)
         # fan out
         async with self._lock:
             queues = list(self._subs.get(run_id, ()))
