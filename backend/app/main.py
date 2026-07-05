@@ -28,6 +28,11 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[main] run recovery skipped: {e}")
     try:
+        from .api.telegram import recover_pending_telegram_messages
+        recover_pending_telegram_messages()
+    except Exception as e:
+        print(f"[main] telegram message recovery skipped: {e}")
+    try:
         sync_mcp_servers_from_file()
     except Exception as e:
         print(f"[main] mcp sync skipped: {e}")

@@ -27,7 +27,8 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..db import get_session, session_scope
-from ..models import Agent, CrispalConversationSuggestion, CrispalSuggestionFeedback, Run, RunEvent, Target, TelegramBot, TelegramSession
+from ..models import (Agent, CrispalConversationSuggestion, CrispalSuggestionFeedback, Run, RunEvent,
+                      Target, TelegramBot, TelegramInboundMessage, TelegramSession)
 
 log = logging.getLogger("ap.telegram")
 
@@ -806,12 +807,32 @@ _CHAT_QUEUES: dict[tuple[str, str], "queue.Queue[tuple]"] = {}
 _CHAT_QUEUES_META = threading.Lock()
 
 
+def _mark_message_dispatched(inbound_id: str | None) -> None:
+    """Flip a TelegramInboundMessage row from pending -> dispatched, right as
+    the chat worker picks it up (not on completion — the durability guarantee
+    this table provides is "survived being queued", not "survived
+    processing"; a long-running run already has its own restart-recovery via
+    recover_orphaned_runs)."""
+    if not inbound_id:
+        return
+    try:
+        with session_scope() as s:
+            row = s.query(TelegramInboundMessage).filter(TelegramInboundMessage.id == inbound_id).first()
+            if row:
+                row.status = "dispatched"
+                row.dispatched_at = datetime.utcnow()
+    except Exception:
+        log.exception("failed to mark inbound message %s dispatched", inbound_id)
+
+
 def _chat_worker(key: tuple[str, str], q: "queue.Queue[tuple]") -> None:
     """Drain one chat's queue forever, in FIFO order, one dispatch at a time."""
     while True:
         item = q.get()
+        *dispatch_args, inbound_id = item
+        _mark_message_dispatched(inbound_id)
         try:
-            _dispatch(*item)
+            _dispatch(*dispatch_args)
         except Exception:
             log.exception("tg chat worker: dispatch failed for %s", key)
         finally:
@@ -820,12 +841,19 @@ def _chat_worker(key: tuple[str, str], q: "queue.Queue[tuple]") -> None:
 
 
 def _enqueue_dispatch(bot: TelegramBot, chat_id: str, user_id: str,
-                      text: str, is_voice: bool, inbound_lang: str) -> None:
+                      text: str, is_voice: bool, inbound_lang: str,
+                      inbound_id: str | None = None) -> None:
     """Append a message to the per-(bot, chat) FIFO queue.
 
     The chat's worker thread is created lazily on first use. Messages for one
     chat are then processed strictly in arrival order, one at a time — so the
     same session uuid is never resumed by two runs at once.
+
+    ``inbound_id`` — the TelegramInboundMessage row already persisted by the
+    caller (webhook() or recover_pending_telegram_messages()) BEFORE this
+    call, so the message survives an agents-platform restart even if it's
+    sitting in this in-memory queue when the process dies. None for internal
+    callers (callback-query dispatches) that have no durable row.
     """
     key = (bot.id, chat_id)
     with _CHAT_QUEUES_META:
@@ -837,7 +865,44 @@ def _enqueue_dispatch(bot: TelegramBot, chat_id: str, user_id: str,
                 target=_chat_worker, args=(key, q), daemon=True,
                 name=f"tg-chatq-{bot.id}-{chat_id}",
             ).start()
-    q.put((bot, chat_id, user_id, text, is_voice, inbound_lang, _time.perf_counter()))
+    q.put((bot, chat_id, user_id, text, is_voice, inbound_lang, _time.perf_counter(), inbound_id))
+
+
+def recover_pending_telegram_messages() -> None:
+    """Startup recovery: re-enqueue any TelegramInboundMessage still marked
+    "pending" — durably persisted before their webhook handler acked
+    Telegram, but the in-memory dispatch queue that would have drained them
+    doesn't survive a process restart. Mirrors what
+    executor.recover_orphaned_runs does for the run layer; call this from
+    the same lifespan hook.
+    """
+    with session_scope() as s:
+        pending = (s.query(TelegramInboundMessage)
+                   .filter(TelegramInboundMessage.status == "pending")
+                   .order_by(TelegramInboundMessage.created_at.asc())
+                   .all())
+        items = [(p.id, p.bot_id, p.chat_id, p.user_id, p.text, p.is_voice, p.inbound_lang)
+                 for p in pending]
+    if not items:
+        return
+    log.warning("recovering %d pending Telegram message(s) from a prior restart", len(items))
+    with session_scope() as s:
+        bot_snapshots = {
+            b.id: TelegramBot(id=b.id, name=b.name, token=b.token,
+                              webhook_secret=b.webhook_secret, enabled=b.enabled,
+                              agent_slug=b.agent_slug, admin_user_ids=list(b.admin_user_ids or []))
+            for b in s.query(TelegramBot).filter(
+                TelegramBot.id.in_({i[1] for i in items})
+            ).all()
+        }
+    for inbound_id, bot_id, chat_id, user_id, text, is_voice, inbound_lang in items:
+        bot_snapshot = bot_snapshots.get(bot_id)
+        if not bot_snapshot:
+            log.warning("recover_pending_telegram_messages: bot %s not found, skipping %s",
+                        bot_id, inbound_id)
+            continue
+        _enqueue_dispatch(bot_snapshot, chat_id, user_id, text, is_voice, inbound_lang,
+                          inbound_id=inbound_id)
 
 
 # ---------------------------------------------------------------------------
@@ -2527,7 +2592,19 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
         agent_slug=bot.agent_slug, admin_user_ids=list(bot.admin_user_ids or []),
     )
 
-    _enqueue_dispatch(bot_snapshot, chat_id, user_id, text_raw, is_voice, inbound_lang)
+    # Persist BEFORE acking Telegram (the `return` below is this handler's
+    # 200 OK) — the in-memory dispatch queue doesn't survive a restart, and
+    # once Telegram has its 200 it never retries, so a message queued but not
+    # yet drained when the process dies was previously lost for good.
+    inbound_id = str(uuid4())
+    with session_scope() as _s:
+        _s.add(TelegramInboundMessage(
+            id=inbound_id, bot_id=bot.id, chat_id=chat_id, user_id=user_id,
+            text=text_raw, is_voice=is_voice, inbound_lang=inbound_lang,
+        ))
+
+    _enqueue_dispatch(bot_snapshot, chat_id, user_id, text_raw, is_voice, inbound_lang,
+                      inbound_id=inbound_id)
 
     return {"ok": True}
 

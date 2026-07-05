@@ -414,6 +414,31 @@ class TelegramBot(Base):
     )
 
 
+class TelegramInboundMessage(Base):
+    """Durable record of an inbound Telegram message, written BEFORE the
+    webhook handler acks Telegram with 200.
+
+    The actual dispatch queue (telegram.py's per-chat ``_CHAT_QUEUES``) is a
+    plain in-memory ``queue.Queue`` — it does not survive an agents-platform
+    restart. Previously, a message that was already queued (Telegram got its
+    200 OK) but not yet drained when the process restarted was lost forever:
+    Telegram never retries a webhook call it believes succeeded. This table
+    is the durability layer — on startup, any row still ``pending`` gets
+    re-enqueued (see telegram.recover_pending_telegram_messages).
+    """
+    __tablename__ = "telegram_inbound_messages"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    bot_id: Mapped[str] = mapped_column(String, index=True)
+    chat_id: Mapped[str] = mapped_column(String, index=True)
+    user_id: Mapped[str] = mapped_column(String, default="")
+    text: Mapped[str] = mapped_column(Text, default="")
+    is_voice: Mapped[bool] = mapped_column(Boolean, default=False)
+    inbound_lang: Mapped[str] = mapped_column(String, default="")
+    status: Mapped[str] = mapped_column(String, default="pending", index=True)  # pending | dispatched
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class CliSession(Base):
     """Named CLI session — tracks a claude --resume session_id with a human-friendly name."""
     __tablename__ = "cli_sessions"
