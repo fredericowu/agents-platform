@@ -52,6 +52,26 @@ _SONNET_PRICE_CACHE_READ = 0.30
 _AUTO_COMPACT_COOLDOWN: dict[str, float] = {}
 _AUTO_COMPACT_COOLDOWN_S = 1800
 
+# ---------------- per-session serialization ----------------
+# Two runs resuming the same CLI session id concurrently corrupt/fork the
+# session transcript. The Telegram dispatcher already serializes per
+# (bot, chat), but other entry points resume the same session ids without
+# any coordination: /run_sync (Meta Glasses / Watch), the internal
+# telegram inject endpoint (telegram_system), restart-recovery re-attach,
+# and openai-compat. Every one of them funnels through run_agent, so the
+# rule lives here: same session_id → strictly one run at a time, FIFO in
+# arrival order (asyncio.Lock wakes waiters in acquire order).
+#
+# Re-entrant per asyncio task: the nested auto-compact "/compact" run is
+# awaited inside the parent run with the same session_id and must not
+# deadlock against its own parent's lock.
+_SESSION_LOCKS: dict[str, asyncio.Lock] = {}
+_SESSION_LOCK_OWNER: dict[str, "asyncio.Task"] = {}
+_SESSION_LOCK_REFS: dict[str, int] = {}
+# Safety valve: if a run hangs holding the lock, don't wedge the session's
+# queue forever — after this long, proceed unserialized with a loud warning.
+_SESSION_LOCK_MAX_WAIT_S = 1800
+
 
 def _recover_cost_from_transcript(
     session_id: str, window_start: datetime, window_end: datetime
@@ -318,7 +338,89 @@ async def _notify_kanban_run_done(*, run_id: str, agent_slug: str,
         pass
 
 
+async def _acquire_session_lock(session_id: str) -> bool:
+    """Wait for exclusive rights to resume ``session_id``. Returns True when
+    the lock was actually acquired (caller must release), False when this task
+    already owns it (re-entrant) or the safety-valve timeout expired."""
+    task = asyncio.current_task()
+    if task is not None and _SESSION_LOCK_OWNER.get(session_id) is task:
+        return False  # nested call (auto-compact) inside the owning run
+    lock = _SESSION_LOCKS.setdefault(session_id, asyncio.Lock())
+    _SESSION_LOCK_REFS[session_id] = _SESSION_LOCK_REFS.get(session_id, 0) + 1
+    if lock.locked():
+        _exec_log.info("session %s busy — queueing run behind the one in flight",
+                       session_id)
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=_SESSION_LOCK_MAX_WAIT_S)
+    except asyncio.TimeoutError:
+        _exec_log.warning(
+            "session %s: lock wait exceeded %ss — proceeding unserialized "
+            "(previous run likely hung)", session_id, _SESSION_LOCK_MAX_WAIT_S)
+        _release_session_ref(session_id)
+        return False
+    _SESSION_LOCK_OWNER[session_id] = task
+    return True
+
+
+def _release_session_ref(session_id: str) -> None:
+    """Drop one waiter/holder reference; garbage-collect the lock at zero."""
+    n = _SESSION_LOCK_REFS.get(session_id, 1) - 1
+    if n <= 0:
+        _SESSION_LOCK_REFS.pop(session_id, None)
+        lock = _SESSION_LOCKS.get(session_id)
+        if lock is not None and not lock.locked():
+            _SESSION_LOCKS.pop(session_id, None)
+    else:
+        _SESSION_LOCK_REFS[session_id] = n
+
+
+def _release_session_lock(session_id: str) -> None:
+    _SESSION_LOCK_OWNER.pop(session_id, None)
+    lock = _SESSION_LOCKS.get(session_id)
+    if lock is not None and lock.locked():
+        lock.release()
+    _release_session_ref(session_id)
+
+
 async def run_agent(
+    agent_slug: str,
+    user_input: str,
+    *,
+    run_id: str | None = None,
+    event_run_id: str | None = None,
+    parent_run_id: str | None = None,
+    initiator_kind: str = "agent_run",
+    initiator_id: str | None = None,
+    node_id: str | None = None,
+    target_id: str | None = None,
+    extra_messages: list[dict] | None = None,
+    session_id: str | None = None,
+    notion_task_id: str | None = None,
+    attach: bool = False,
+    skip_auto_compact: bool = False,
+    raw_cli_prompt: bool = False,
+) -> dict[str, Any]:
+    """Serializing wrapper: runs resuming the same ``session_id`` execute
+    strictly one at a time, in arrival order (see _SESSION_LOCKS above).
+    Runs without a session_id (fresh sessions) are unaffected."""
+    kwargs = dict(
+        run_id=run_id, event_run_id=event_run_id, parent_run_id=parent_run_id,
+        initiator_kind=initiator_kind, initiator_id=initiator_id,
+        node_id=node_id, target_id=target_id, extra_messages=extra_messages,
+        session_id=session_id, notion_task_id=notion_task_id, attach=attach,
+        skip_auto_compact=skip_auto_compact, raw_cli_prompt=raw_cli_prompt,
+    )
+    if not session_id:
+        return await _run_agent_impl(agent_slug, user_input, **kwargs)
+    acquired = await _acquire_session_lock(session_id)
+    try:
+        return await _run_agent_impl(agent_slug, user_input, **kwargs)
+    finally:
+        if acquired:
+            _release_session_lock(session_id)
+
+
+async def _run_agent_impl(
     agent_slug: str,
     user_input: str,
     *,

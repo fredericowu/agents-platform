@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from datetime import datetime
@@ -378,6 +379,11 @@ async def run_agent_ep(slug: str, body: RunInput, s: Session = Depends(get_sessi
     return {"run_id": rid, "target_id": target_id}
 
 
+# One lock per run_sync Target — serializes the session-read + run sequence
+# for external channels (Watch/Glasses) that share an external_id.
+_RUN_SYNC_TARGET_LOCKS: dict[str, "asyncio.Lock"] = {}
+
+
 class RunSyncInput(BaseModel):
     input: str
     # Stable per-device/per-conversation key from the caller (e.g. the Watch's
@@ -421,19 +427,27 @@ async def run_agent_sync_ep(slug: str, body: RunSyncInput,
         s.add(target)
         s.flush()
         s.commit()
-    session_id = (
-        s.query(Run.session_id)
-        .filter(Run.target_id == target.id, Run.session_id.isnot(None))
-        .order_by(Run.started_at.desc())
-        .limit(1)
-        .scalar()
-    )
 
+    # Queue concurrent messages for the same target (e.g. rapid-fire Watch /
+    # Glasses inputs sharing external_id): the "latest session" read must
+    # happen only after the previous run has finished and persisted ITS
+    # session id — otherwise both runs read the same stale id and fork the
+    # conversation. run_agent's own per-session lock guards the resume itself;
+    # this lock guards the read-then-run sequence.
+    lock = _RUN_SYNC_TARGET_LOCKS.setdefault(target.id, asyncio.Lock())
     from ..core.executor import run_agent
-    result = await run_agent(
-        slug, body.input, target_id=target.id, session_id=session_id,
-        initiator_kind=body.initiator_kind, initiator_id=body.external_id,
-    )
+    async with lock:
+        session_id = (
+            s.query(Run.session_id)
+            .filter(Run.target_id == target.id, Run.session_id.isnot(None))
+            .order_by(Run.started_at.desc())
+            .limit(1)
+            .scalar()
+        )
+        result = await run_agent(
+            slug, body.input, target_id=target.id, session_id=session_id,
+            initiator_kind=body.initiator_kind, initiator_id=body.external_id,
+        )
     return {
         "reply": result.get("reply") or result.get("text", ""),
         "run_id": result.get("run_id"),
