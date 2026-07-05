@@ -201,13 +201,33 @@ def _send_button_message(token: str, chat_id: str, text: str, label: str,
 
 def _edit_button_label(token: str, chat_id: str, message_id: int,
                        label: str, url: str, web_app: bool = False) -> None:
-    """Update an inline button's label in place (e.g. [processing] → [done])."""
+    """Update an inline button's label in place (e.g. [processing] → [done]).
+
+    This is the terminal-state edit users rely on to know a run actually
+    finished — if it silently fails, "Processing..." is the last thing they
+    ever see even though the real reply already arrived. Was logged at DEBUG
+    (effectively invisible in production) with no retry; a transient
+    Telegram error (rate limit, brief API hiccup) would strand the button
+    forever with zero trace of why. One retry after a short backoff, logged
+    at WARNING with the real Telegram error message on final failure.
+    """
     btn = {"text": label, "web_app": {"url": url}} if web_app else {"text": label, "url": url}
-    try:
-        _tg(token, "editMessageReplyMarkup", chat_id=chat_id, message_id=message_id,
-            reply_markup={"inline_keyboard": [[btn]]})
-    except Exception:
-        log.debug("edit progress button failed", exc_info=True)
+    last_err: Exception | None = None
+    for attempt in range(2):
+        try:
+            _tg(token, "editMessageReplyMarkup", chat_id=chat_id, message_id=message_id,
+                reply_markup={"inline_keyboard": [[btn]]})
+            return
+        except Exception as e:
+            last_err = e
+            # "message is not modified" means the label was already correct
+            # (e.g. a duplicate finally-block run) — not a real failure.
+            if "not modified" in str(e).lower():
+                return
+            if attempt == 0:
+                _time.sleep(1.5)
+    log.warning("edit progress button failed for chat=%s message_id=%s: %s",
+                chat_id, message_id, last_err)
 
 
 # ---------------------------------------------------------------------------
