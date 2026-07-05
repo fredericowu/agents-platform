@@ -36,6 +36,11 @@ async def lifespan(app: FastAPI):
         sync_mcp_servers_from_file()
     except Exception as e:
         print(f"[main] mcp sync skipped: {e}")
+    try:
+        from .core.wakeups import rearm_pending_wakeups
+        rearm_pending_wakeups()
+    except Exception as e:
+        print(f"[main] wakeup re-arm skipped: {e}")
     yield
 
 

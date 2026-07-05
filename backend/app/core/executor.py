@@ -575,6 +575,9 @@ async def _run_agent_impl(
     # the trailing message survives; `text` keeps the full transcript for the
     # run history / View Progress.
     reply_text = ""
+    # Last ScheduleWakeup tool_call seen in the stream — the one-shot CLI
+    # process can't hold the timer, so we honour it ourselves (core.wakeups).
+    _wakeup_req: dict | None = None
     tin = tout = 0
     cost = 0.0
     err: str | None = None
@@ -677,6 +680,8 @@ async def _run_agent_impl(
                         # just untruncated) instead of losing everything before
                         # the last tool call.
                         if meta_kind == "tool_call":
+                            if (meta_payload or {}).get("name") == "ScheduleWakeup":
+                                _wakeup_req = dict((meta_payload or {}).get("input") or {})
                             if runtime.get("verbose_replies"):
                                 if reply_text.strip() and not reply_text.endswith("\n\n"):
                                     reply_text += "\n\n"
@@ -742,6 +747,7 @@ async def _run_agent_impl(
         status = "error" if err else "success"
     _gh_issue_number = None
     _run_ws_data: dict | None = None
+    _wu_ctx: tuple | None = None
     _ended_at = datetime.utcnow()
     with session_scope() as s:
         r = s.query(Run).filter(Run.id == run_id).first()
@@ -766,8 +772,21 @@ async def _run_agent_impl(
             r.cost_usd = cost
             r.ended_at = _ended_at
             _gh_issue_number = getattr(r, "github_issue_number", None)
+            _wu_ctx = (r.session_id, r.target_id, r.initiator_kind, r.initiator_id)
             from .events import _run_to_ws_dict
             _run_ws_data = _run_to_ws_dict(r)
+    # Honour a ScheduleWakeup the model issued during this run: persist + arm a
+    # follow-up run on the same session (see core.wakeups for why AP must do
+    # this instead of the CLI harness).
+    try:
+        if status == "success" and _wakeup_req and _wu_ctx:
+            from .wakeups import schedule_wakeup
+            schedule_wakeup(origin_run_id=run_id, agent_slug=agent_slug,
+                            target_id=_wu_ctx[1], session_id=_wu_ctx[0],
+                            initiator_kind=_wu_ctx[2], initiator_id=_wu_ctx[3],
+                            req=_wakeup_req)
+    except Exception as _we:
+        _exec_log.warning("wakeup scheduling failed run=%s: %s", run_id, _we)
     score_run_terminal(run_id)
     # WS broadcast — push terminal state to all connected clients
     try:

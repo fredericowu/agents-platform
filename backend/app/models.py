@@ -288,6 +288,29 @@ class RunArtefact(Base):
     run: Mapped["Run"] = relationship(back_populates="artefacts")
 
 
+class ScheduledWakeup(Base):
+    """A ``ScheduleWakeup`` tool call captured from a CLI run's event stream.
+
+    The claude-cli harness would hold the timer and re-invoke the model, but in
+    AP each run is a one-shot ``claude -p`` process — the timer dies with it.
+    We persist the request here and fire a follow-up run on the same session
+    when it comes due (see ``core.wakeups``)."""
+    __tablename__ = "scheduled_wakeups"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    origin_run_id: Mapped[str] = mapped_column(String, index=True)
+    agent_slug: Mapped[str] = mapped_column(String)
+    target_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    session_id: Mapped[str] = mapped_column(String, index=True)
+    initiator_id: Mapped[str] = mapped_column(String)                # "{bot_id}:{chat_id}"
+    prompt: Mapped[str] = mapped_column(Text)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    fire_at: Mapped[datetime] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(String, default="pending", index=True)  # pending|firing|fired|error
+    fired_run_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
 class RunEvent(Base):
     __tablename__ = "run_events"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)

@@ -1153,7 +1153,7 @@ async def deliver_recovered_run(run_id: str, output_text: str) -> None:
 
     with session_scope() as s:
         run = s.query(Run).filter(Run.id == run_id).first()
-        if not run or run.initiator_kind != "telegram" or not run.initiator_id:
+        if not run or run.initiator_kind not in ("telegram", "wakeup") or not run.initiator_id:
             return
         initiator_id = run.initiator_id
         session_id = run.session_id
