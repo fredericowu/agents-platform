@@ -351,6 +351,7 @@ async def run_agent_ep(slug: str, body: RunInput, s: Session = Depends(get_sessi
     target_slug = body.target_slug or (extra.get("target_slug") if isinstance(extra, dict) else None)
     session_id = body.session_id or (extra.get("session_id") if isinstance(extra, dict) else None)
     notion_task_id = body.notion_task_id or (extra.get("notion_task_id") if isinstance(extra, dict) else None)
+    raw_cli_prompt = body.raw_cli_prompt or (bool(extra.get("raw_cli_prompt")) if isinstance(extra, dict) else False)
     from ..models import Target
     if target_id is None and target_slug:
         t = s.query(Target).filter(Target.slug == target_slug).first()
@@ -373,7 +374,7 @@ async def run_agent_ep(slug: str, body: RunInput, s: Session = Depends(get_sessi
         target_id = adhoc.id
     try:
         rid = start_agent_run_bg(slug, payload, target_id=target_id, session_id=session_id,
-                                 notion_task_id=notion_task_id)
+                                 notion_task_id=notion_task_id, raw_cli_prompt=raw_cli_prompt)
     except __import__("backend.app.core.executor", fromlist=["TargetBudgetExceeded"]).TargetBudgetExceeded as e:
         raise HTTPException(429, f"target budget exceeded: {e}")
     return {"run_id": rid, "target_id": target_id}

@@ -1149,6 +1149,45 @@ def _deliver_reply(
                         log.warning("send_message failed: %s", e)
 
 
+def finalize_progress_bubble(run_id: str, status: str | None = None) -> None:
+    """Flip a run's persisted Telegram progress button to its terminal state.
+
+    Live dispatch flips [processing]→[done]/[error] in ``_dispatch``'s finally
+    block, but a platform restart kills that thread first, stranding the bubble
+    on [processing]/[waiting] even after the reply is delivered by recovery.
+    Restart recovery (``executor._reattach_run`` / ``_reattach_or_wait``) calls
+    this once it knows the run's terminal status, so the user sees the button
+    settle exactly like a normal completion would. Idempotent — Telegram's
+    "message is not modified" is treated as success, so re-calling is harmless.
+    """
+    try:
+        with session_scope() as s:
+            run = s.query(Run).filter(Run.id == run_id).first()
+            if (not run or not run.proc_msg_id
+                    or run.initiator_kind != "telegram" or not run.initiator_id):
+                return
+            proc_msg_id, initiator_id = run.proc_msg_id, run.initiator_id
+            st = (status or run.status or "").lower()
+        bot_id, _, chat_id = initiator_id.rpartition(":")
+        if not bot_id or not chat_id:
+            return
+        with session_scope() as s:
+            bot = s.query(TelegramBot).filter(TelegramBot.id == bot_id).first()
+            token = bot.token if bot else ""
+        if not token:
+            return
+        state = ("done" if st in ("success", "completed")
+                 else "cancelled" if st in ("cancelled", "canceled", "aborted")
+                 else "error")
+        ap_url = os.environ.get("AP_PUBLIC_URL", "https://agents-platform.app.aw.tekflox.com")
+        progress_url = f"{ap_url}/api/telegram/progress/{run_id}"
+        _edit_button_label(token, chat_id, int(proc_msg_id),
+                           f"📊 View Progress [{state}]", progress_url, web_app=True)
+        log.info("recovery: finalized progress bubble run=%s state=%s", run_id, state)
+    except Exception:
+        log.debug("finalize progress bubble failed for run %s", run_id, exc_info=True)
+
+
 async def deliver_recovered_run(run_id: str, output_text: str) -> None:
     """Deliver a recovered run's reply to its originating Telegram chat.
 
@@ -1336,6 +1375,7 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
                 initiator_kind="telegram",
                 initiator_id=f"{bot.id}:{chat_id}",
                 on_state=_set_btn_state,
+                proc_msg_id=str(proc_msg_id) if proc_msg_id else None,
             )
             log.info("dispatch: _MAIN_LOOP=%s run_id=%s agent=%s", _MAIN_LOOP, run_id, agent_slug)
             if _MAIN_LOOP is not None:
@@ -1416,6 +1456,7 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
                     session_id=None,  # fresh session
                     initiator_kind="telegram",
                     initiator_id=f"{bot.id}:{chat_id}",
+                    proc_msg_id=str(proc_msg_id) if proc_msg_id else None,
                 )
                 if _MAIN_LOOP is not None:
                     result = asyncio.run_coroutine_threadsafe(_coro2, _MAIN_LOOP).result(timeout=1860)

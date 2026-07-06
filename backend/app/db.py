@@ -85,6 +85,9 @@ def _apply_inline_migrations() -> None:
         ("target_id", "VARCHAR NOT NULL DEFAULT 'unlinked'"),
         # Which agent or workflow actually ran — separate from target_slug (the Target).
         ("source_slug", "VARCHAR"),
+        # Telegram progress-bubble message id — lets restart recovery flip the
+        # [processing] button to [done] after re-attaching an interrupted run.
+        ("proc_msg_id", "VARCHAR"),
     ]
     with engine.begin() as conn:
         for col, ddl in additions:

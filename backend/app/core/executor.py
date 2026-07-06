@@ -358,6 +358,25 @@ async def _acquire_session_lock(session_id: str) -> bool:
             "(previous run likely hung)", session_id, _SESSION_LOCK_MAX_WAIT_S)
         _release_session_ref(session_id)
         return False
+    except RuntimeError as e:
+        # Self-heal a stale lock bound to a dead event loop. This happens when a
+        # lock was first created under a throwaway asyncio.run() loop (e.g. the
+        # telegram dispatcher's fallback when _MAIN_LOOP wasn't captured yet):
+        # the loop dies but the Lock stays cached in _SESSION_LOCKS, so every
+        # later acquire on the real loop raises "bound to a different event
+        # loop" and wedges the session forever. Replace it with a fresh lock on
+        # the current loop and acquire that.
+        if "different event loop" not in str(e):
+            raise
+        _exec_log.warning("session %s: stale cross-loop lock — recreating", session_id)
+        lock = asyncio.Lock()
+        _SESSION_LOCKS[session_id] = lock
+        _SESSION_LOCK_OWNER.pop(session_id, None)
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=_SESSION_LOCK_MAX_WAIT_S)
+        except asyncio.TimeoutError:
+            _release_session_ref(session_id)
+            return False
     _SESSION_LOCK_OWNER[session_id] = task
     return True
 
@@ -400,6 +419,7 @@ async def run_agent(
     skip_auto_compact: bool = False,
     raw_cli_prompt: bool = False,
     on_state: "Callable[[str], None] | None" = None,
+    proc_msg_id: str | None = None,
 ) -> dict[str, Any]:
     """Serializing wrapper: runs resuming the same ``session_id`` execute
     strictly one at a time, in arrival order (see _SESSION_LOCKS above).
@@ -422,6 +442,7 @@ async def run_agent(
         node_id=node_id, target_id=target_id, extra_messages=extra_messages,
         session_id=session_id, notion_task_id=notion_task_id, attach=attach,
         skip_auto_compact=skip_auto_compact, raw_cli_prompt=raw_cli_prompt,
+        proc_msg_id=proc_msg_id,
     )
     if not session_id:
         _signal("processing")
@@ -456,6 +477,7 @@ async def _run_agent_impl(
     attach: bool = False,
     skip_auto_compact: bool = False,
     raw_cli_prompt: bool = False,
+    proc_msg_id: str | None = None,
 ) -> dict[str, Any]:
     """Run an agent and return ``{run_id, text, status, error, tokens_in, tokens_out}``.
 
@@ -507,7 +529,8 @@ async def _run_agent_impl(
                     node_id=node_id,
                     target_id=target_id,
                     model_slug=runtime["model_slug"],
-                    source_slug=agent_slug)
+                    source_slug=agent_slug,
+                    proc_msg_id=proc_msg_id)
             s.add(r); s.flush()
             run_id = r.id
         else:
@@ -521,8 +544,11 @@ async def _run_agent_impl(
                         node_id=node_id,
                         target_id=target_id,
                         model_slug=runtime["model_slug"],
-                        source_slug=agent_slug)
+                        source_slug=agent_slug,
+                        proc_msg_id=proc_msg_id)
                 s.add(r)
+            elif proc_msg_id and not r.proc_msg_id:
+                r.proc_msg_id = proc_msg_id
 
     ev_ids = {run_id}
     if event_run_id and event_run_id != run_id:
@@ -891,9 +917,13 @@ async def _reattach_run(run_id: str, agent_slug: str, user_input: str,
         # with the restart). Idempotent — guarded by a Redis dedup claim.
         try:
             output_text = (result or {}).get("reply") or (result or {}).get("text", "")
+            from ..api.telegram import deliver_recovered_run, finalize_progress_bubble
             if output_text:
-                from ..api.telegram import deliver_recovered_run
                 await deliver_recovered_run(run_id, output_text)
+            # Settle the "Processing…" bubble the killed dispatch thread never
+            # got to flip — [processing]/[waiting] → [done]/[error]/[cancelled].
+            await asyncio.to_thread(finalize_progress_bubble, run_id,
+                                    (result or {}).get("status"))
         except Exception as de:
             _exec_log.warning("recovery delivery failed run=%s: %s", run_id, de)
     except Exception as e:
@@ -906,6 +936,8 @@ async def _reattach_run(run_id: str, agent_slug: str, user_input: str,
                     r.status = "cancelled"
                     r.error = f"re-attach failed: {e}"
                     r.ended_at = datetime.utcnow()
+            from ..api.telegram import finalize_progress_bubble
+            await asyncio.to_thread(finalize_progress_bubble, run_id, "cancelled")
         except Exception:
             pass
 
@@ -949,6 +981,11 @@ async def _reattach_or_wait(run_id: str, agent_slug: str, user_input: str,
             r.status = "cancelled"
             r.error = "server restarted — no live run stream to resume"
             r.ended_at = datetime.utcnow()
+    try:
+        from ..api.telegram import finalize_progress_bubble
+        await asyncio.to_thread(finalize_progress_bubble, run_id, "cancelled")
+    except Exception:
+        pass
     _exec_log.info("recovery: run %s had no stream after %ss — marked cancelled",
                    run_id, int(_RECOVER_STREAM_GRACE_S))
 
@@ -1274,7 +1311,8 @@ def start_agent_run_bg(agent_slug: str, user_input: str, *,
                        node_id: str | None = None,
                        target_id: str | None = None,
                        session_id: str | None = None,
-                       notion_task_id: str | None = None) -> str:
+                       notion_task_id: str | None = None,
+                       raw_cli_prompt: bool = False) -> str:
     """Schedule an agent run in the background; return its run_id."""
     if target_id is None and parent_run_id is None:
         raise ValueError("target_id is required for top-level agent runs")
@@ -1325,7 +1363,8 @@ def start_agent_run_bg(agent_slug: str, user_input: str, *,
                             initiator_id=initiator_id,
                             session_id=session_id,
                             target_id=target_id,
-                            notion_task_id=notion_task_id)
+                            notion_task_id=notion_task_id,
+                            raw_cli_prompt=raw_cli_prompt)
         finally:
             await bus.publish(rid, "done", {})
             await bus.close(rid)

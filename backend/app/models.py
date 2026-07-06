@@ -118,6 +118,11 @@ class Run(Base):
     github_issue_url: Mapped[str | None] = mapped_column(String, nullable=True)
     # CLI session ID (captured from system.init event; used for --resume on next run)
     session_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Telegram "Processing…" progress-bubble message id (per-chat). Persisted so
+    # restart recovery can flip its inline button [processing]→[done] after
+    # re-attaching the run — a live dispatch flips it in its finally block, but a
+    # restart kills that thread before it runs, leaving the bubble stuck.
+    proc_msg_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
     events: Mapped[list["RunEvent"]] = relationship(back_populates="run", cascade="all, delete-orphan")
     children: Mapped[list["Run"]] = relationship("Run",

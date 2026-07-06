@@ -21,6 +21,20 @@ from .seed import seed_all
 async def lifespan(app: FastAPI):
     init_db()
     seed_all()
+    # Capture the running event loop NOW, before any recovery runs. Startup
+    # recovery re-enqueues pending Telegram messages whose chat-worker threads
+    # bridge back to this loop via asyncio.run_coroutine_threadsafe(_MAIN_LOOP).
+    # Previously _MAIN_LOOP was only captured on the first webhook request, so a
+    # boot-time recovery had _MAIN_LOOP=None → the re-enqueued messages hit the
+    # cross-loop asyncio.run() fallback and never drained (stuck 'pending'
+    # forever, blocking the chat's FIFO queue). Setting it here makes the
+    # startup auto-heal actually deliver.
+    try:
+        import asyncio as _asyncio
+        from .api.telegram import _set_main_loop
+        _set_main_loop(_asyncio.get_running_loop())
+    except Exception as e:
+        print(f"[main] main-loop capture skipped: {e}")
     # Re-attach interrupted runs that still have a durable Redis Stream; cancel
     # the rest. Replaces the old blind cancel-all so runs survive a restart.
     try:
