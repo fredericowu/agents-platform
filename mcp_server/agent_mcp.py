@@ -530,11 +530,67 @@ async def _list_tools() -> list[Tool]:
              description="Cancel every currently-running run on the platform.",
              inputSchema={"type": "object", "properties": {}}),
 
+        # ----- self-service session hygiene -----
+        Tool(name="clear_session",
+             description=("Queue a hard reset of the CURRENT conversation's CLI session. "
+                          "Does NOT act immediately (a running session can't be reset "
+                          "mid-turn) — it's applied automatically right before your NEXT "
+                          "turn in this same session, before that turn's message is "
+                          "processed, then removed from the queue. The next turn effectively "
+                          "starts a brand-new session (no memory of this one). Call this "
+                          "when the user asks to 'clear the session' / 'limpa a sessão' / "
+                          "'reseta a conversa'. You need your own session_id — get it with "
+                          "`echo $AW_SESSION_ID` (Bash tool) if you don't already have it."),
+             inputSchema={"type": "object",
+                          "properties": {"session_id": {"type": "string",
+                              "description": "This session's claude CLI session_id (from $AW_SESSION_ID)."}},
+                          "required": ["session_id"]}),
+        Tool(name="compact_session",
+             description=("Queue a /compact (context summarization) for the CURRENT "
+                          "conversation's CLI session. Applied automatically right before "
+                          "your NEXT turn in this same session, before that turn's message "
+                          "is processed, then removed from the queue — the conversation "
+                          "keeps going, just with a shorter context. Call this when the user "
+                          "asks to 'compact the session' / 'compacta a sessão'. You need "
+                          "your own session_id — get it with `echo $AW_SESSION_ID` (Bash "
+                          "tool) if you don't already have it."),
+             inputSchema={"type": "object",
+                          "properties": {"session_id": {"type": "string",
+                              "description": "This session's claude CLI session_id (from $AW_SESSION_ID)."}},
+                          "required": ["session_id"]}),
+
         # ----- legacy alias -----
         Tool(name="get_run",
              description="Alias for run_status — fetches a Run row by id.",
              inputSchema={"type": "object",
                           "properties": {"run_id": {"type": "string"}},
+                          "required": ["run_id"]}),
+
+        # ----- global run listing / deep-dive -----
+        Tool(name="list_runs",
+             description=("GLOBAL run listing across ALL targets, ordered by recency "
+                          "(most recent first). Unlike `list_target_runs` this is not "
+                          "scoped to one Target. Each row: run_id, target_slug, "
+                          "agent/source_slug, status, started_at, ended_at, a truncated "
+                          "`input` preview, cost_usd, tokens_in, tokens_out.\n\n"
+                          "No hard cap on `limit` — pass 100-200+ for a wide recency "
+                          "window."),
+             inputSchema={"type": "object",
+                          "properties": {"limit": {"type": "integer",
+                                                    "description": "Max rows to return. Default 20."},
+                                         "status": {"type": "string",
+                                                    "description": "Filter by status: pending|running|success|error|cancelled."}}}),
+        Tool(name="get_run_detail",
+             description=("FULL record for one Run: untruncated input/output, status, "
+                          "timestamps, target_slug, agent/source_slug, cost, tokens, "
+                          "error, session_id — PLUS the ordered event trace (tool_call/"
+                          "tool_result/node_start/node_end/…). Combines `get_run` + "
+                          "`run_events` in a single call. Use plain `get_run`/"
+                          "`run_status` instead if you don't need the event trace."),
+             inputSchema={"type": "object",
+                          "properties": {"run_id": {"type": "string"},
+                                         "events_limit": {"type": "integer",
+                                                           "description": "Cap on returned events. Default 500."}},
                           "required": ["run_id"]}),
 
         # ----- Targets (overall delivery goals) -----
@@ -1167,6 +1223,22 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
         if name == "run_tree":
             r = await c.get(f"{BASE}/api/runs/{args['run_id']}/tree")
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "list_runs":
+            params = {"limit": str(args.get("limit") or 20), "summary": "true"}
+            if args.get("status"):
+                params["status"] = args["status"]
+            r = await c.get(f"{BASE}/api/runs", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "get_run_detail":
+            run_id = args["run_id"]
+            r = await c.get(f"{BASE}/api/runs/{run_id}")
+            if r.status_code != 200:
+                return _err(r.status_code, r.text)
+            run = r.json()
+            ev_params = {"limit": str(args.get("events_limit") or 500)}
+            er = await c.get(f"{BASE}/api/runs/{run_id}/events", params=ev_params)
+            run["events"] = er.json() if er.status_code == 200 else []
+            return _ok(run)
         if name == "wait_run":
             # Use a separate client with a larger timeout — the server itself
             # waits up to timeout_s, and we need our HTTP read budget to cover it.
@@ -1194,6 +1266,14 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "cancel_run":
             r = await c.post(f"{BASE}/api/runs/{args['run_id']}/cancel")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name in ("clear_session", "compact_session"):
+            sid = (args.get("session_id") or "").strip()
+            if not sid:
+                return _err(400, "session_id is required — get it with `echo $AW_SESSION_ID`.")
+            command = "clear" if name == "clear_session" else "compact"
+            r = await c.post(f"{BASE}/api/sessions/{sid}/pending-command",
+                             json={"command": command})
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "cancel_all_runs":
             r = await c.post(f"{BASE}/api/runs/cancel_all")

@@ -44,7 +44,7 @@ def _maybe_truncate(r: Run, summary: bool) -> Run:
 
 
 @router.get("", response_model=list[RunOut])
-def list_runs(limit: int = Query(50, ge=1, le=500),
+def list_runs(limit: int = Query(50, ge=1, le=5000),
               kind: str | None = None,
               status: str | None = None,
               roots_only: bool = False,
