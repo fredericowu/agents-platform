@@ -372,9 +372,21 @@ async def run_agent_ep(slug: str, body: RunInput, s: Session = Depends(get_sessi
             s.add(adhoc)
             s.commit()
         target_id = adhoc.id
+    from ..core.executor import AgentChainLoopError, _resolve_hop_count
+    caller_run_id = body.caller_run_id
+    try:
+        hop_count = _resolve_hop_count(caller_run_id)
+    except AgentChainLoopError as e:
+        from .telegram import notify_sysadmins
+        notify_sysadmins(
+            f"🔁 Agent chain loop guard tripped\n\n"
+            f"Blocked {slug} dispatch from run {caller_run_id}.\n{e}"
+        )
+        raise HTTPException(429, str(e))
     try:
         rid = start_agent_run_bg(slug, payload, target_id=target_id, session_id=session_id,
-                                 notion_task_id=notion_task_id, raw_cli_prompt=raw_cli_prompt)
+                                 notion_task_id=notion_task_id, raw_cli_prompt=raw_cli_prompt,
+                                 parent_run_id=caller_run_id, hop_count=hop_count)
     except __import__("backend.app.core.executor", fromlist=["TargetBudgetExceeded"]).TargetBudgetExceeded as e:
         raise HTTPException(429, f"target budget exceeded: {e}")
     return {"run_id": rid, "target_id": target_id}

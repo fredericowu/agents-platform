@@ -170,6 +170,12 @@ class CliLLM(BaseLLM):
             rid = self.run_id or current_run_id.get() or ""
             _extra_env["AW_RUN_ID"] = rid
             _extra_env["AW_REDIS_URL"] = redis_url
+        # AW_SESSION_ID: always injected (unlike AW_RUN_ID above, not gated on
+        # ws/redis streaming) so a resumed session can read its own claude CLI
+        # session_id — e.g. `echo $AW_SESSION_ID` — to pass to the
+        # clear_session/compact_session MCP tools without extra plumbing.
+        if self.session_id:
+            _extra_env["AW_SESSION_ID"] = self.session_id
         return build_docker_argv(
             cli=cli,
             prompt=prompt,

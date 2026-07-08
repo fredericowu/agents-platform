@@ -55,6 +55,11 @@ async def lifespan(app: FastAPI):
         rearm_pending_wakeups()
     except Exception as e:
         print(f"[main] wakeup re-arm skipped: {e}")
+    try:
+        from .core.wakeups import rearm_pending_agent_callbacks
+        rearm_pending_agent_callbacks()
+    except Exception as e:
+        print(f"[main] agent-callback re-arm skipped: {e}")
     yield
 
 
@@ -68,6 +73,13 @@ app.include_router(api_router)
 # OpenAI-compatible surface (/v1/*) — mounted at root, BEFORE the SPA
 # catch-all below so GET /v1/models isn't swallowed by the frontend fallback.
 app.include_router(openai_compat.router)
+
+
+# Public static files (e.g. remote-agent install page) — mounted before the
+# SPA catch-all so /static/* wins; not gated by any auth middleware here.
+static_public = settings.repo_root / "static_public"
+if static_public.exists():
+    app.mount("/static", StaticFiles(directory=str(static_public), html=True), name="static")
 
 
 # Serve frontend if built — with SPA fallback for client-side routes

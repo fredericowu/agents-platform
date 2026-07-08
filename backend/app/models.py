@@ -124,6 +124,23 @@ class Run(Base):
     # restart kills that thread before it runs, leaving the bubble stuck.
     proc_msg_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
+    # Agent-to-agent "call me back" (core.wakeups.register_agent_callback):
+    # set on THIS run (the dispatched child) when whoever called it via
+    # run_agent_async/run_workflow_async asked to be notified on completion
+    # (call_me_back, default true). callback_origin_run_id points back at the
+    # caller's own run; callback_done flips true once the callback has been
+    # attempted (success or failure) so a restart's rearm doesn't refire it.
+    call_me_back: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    callback_done: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    callback_origin_run_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+
+    # Agent-to-agent chain depth (loop guard): 0 for a human/root-initiated run,
+    # else caller's hop_count + 1. Set at dispatch time in api/agents.py and
+    # api/workflows.py from the RunInput.caller_run_id the calling agent's own
+    # AW_RUN_ID (auto-forwarded by mcp_server/agent_mcp.py). Checked against the
+    # `agent_chain_max_hops` setting to abort runaway A→B→A call chains.
+    hop_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
     events: Mapped[list["RunEvent"]] = relationship(back_populates="run", cascade="all, delete-orphan")
     children: Mapped[list["Run"]] = relationship("Run",
         primaryjoin="Run.id == foreign(Run.parent_run_id)",
@@ -479,6 +496,17 @@ class CliSession(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
 
+class PendingSessionCommand(Base):
+    """A /clear or /compact queued via the clear_session/compact_session MCP
+    tools — applied to ``session_id`` right before its next resumed turn
+    (see executor.run_agent), then deleted. One row per session at a time."""
+    __tablename__ = "pending_session_commands"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(String, unique=True, index=True)
+    command: Mapped[str] = mapped_column(String)  # "clear" | "compact"
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
 class TelegramSession(Base):
     """Tracks the last Claude session_id per (bot, chat) for conversation continuity."""
     __tablename__ = "telegram_sessions"
@@ -510,10 +538,15 @@ class CrispalConversationSuggestion(Base):
     message_type: Mapped[str] = mapped_column(String, default="response")
     suggested_text: Mapped[str] = mapped_column(Text)
     final_text: Mapped[str | None] = mapped_column(Text, nullable=True)
-    status: Mapped[str] = mapped_column(String, default="pending")  # pending|sent|ignored|edited
+    status: Mapped[str] = mapped_column(String, default="pending")  # pending|sent|ignored|edited|stale
     bot_id: Mapped[str] = mapped_column(String)
     chat_id: Mapped[str] = mapped_column(String)
     approval_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # message_ids of the context bubbles sent by _send_history (text + photos),
+    # in send order — needed so a stale suggestion can be fully cleaned up from
+    # Telegram (see crispal_watch_check.py's cleanup step), not just its
+    # approval_message_id.
+    history_message_ids: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 

@@ -54,3 +54,5 @@ coverage.xml
 *.swp
 *.swo
 Thumbs.db
+
+static_public/

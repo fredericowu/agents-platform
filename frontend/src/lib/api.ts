@@ -215,6 +215,7 @@ export type PlatformSettings = {
   edge_voices?: Record<string, string>;
   openai_key_configured?: boolean;
   auto_compact_threshold_tokens?: number;
+  agent_chain_max_hops?: number;
   _defaults?: {
     command_timeout_seconds: number;
     security_mode: "insecure" | "secure";
@@ -226,6 +227,7 @@ export type PlatformSettings = {
     tts_voice?: string;
     edge_voice?: string;
     auto_compact_threshold_tokens?: number;
+    agent_chain_max_hops?: number;
   };
 };
 

@@ -3,9 +3,9 @@
 Exposes the same API paths as the standalone aw-remote-agent custom app so the
 Windows agent exe and FUSE driver can connect without modification.
 
-DB is stored at /opt/agentic-workspace/.tmp/remote-agents.db, accessed via the
-SQLAlchemy ORM models in app.core.remote_agents_db (no raw sqlite3).
-On first boot (empty table) it tries to migrate data from the old custom-app DB.
+DB lives in the `remote_agents` / `remote_agents_config` tables of the main
+agents-platform Postgres database, accessed via the SQLAlchemy ORM models in
+app.core.remote_agents_db (no raw SQL).
 """
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException, Request

@@ -9,6 +9,10 @@ Persisted via the ``Setting`` model (key/value JSON). Tracked keys:
   * ``auto_compact_threshold_tokens`` — run "/compact" before a turn once the
     resumed session's context exceeds this many tokens (default 500,000; 0
     disables). See executor.run_agent's auto-compact check.
+  * ``agent_chain_max_hops`` — max agent-to-agent dispatch depth via
+    ``run_agent_async``/``run_workflow_async`` before a new run is rejected
+    as a runaway loop (default 8). See api/agents.py & api/workflows.py
+    ``/run`` endpoints and ``Run.hop_count``.
 
 Unknown keys are accepted (they round-trip through the API) so future
 settings don't need a code change — but only the ones above are read by
@@ -31,9 +35,10 @@ _KNOWN = {"command_timeout_seconds", "security_mode",
           "github_sync_enabled", "github_repo", "github_webhook_secret",
           "tts_provider", "stt_provider", "openai_api_key",
           "tts_voice", "edge_voice", "edge_voices",
-          "auto_compact_threshold_tokens"}
+          "auto_compact_threshold_tokens", "agent_chain_max_hops"}
 
 DEFAULT_AUTO_COMPACT_THRESHOLD_TOKENS = 500_000
+DEFAULT_AGENT_CHAIN_MAX_HOPS = 8
 
 
 class SettingPatch(BaseModel):
@@ -62,6 +67,9 @@ def get_all_settings():
         "auto_compact_threshold_tokens": security.get_setting(
             "auto_compact_threshold_tokens", DEFAULT_AUTO_COMPACT_THRESHOLD_TOKENS
         ),
+        "agent_chain_max_hops": security.get_setting(
+            "agent_chain_max_hops", DEFAULT_AGENT_CHAIN_MAX_HOPS
+        ),
         # exposed for the UI so it can show "(default)" badges
         "_defaults": {
             "command_timeout_seconds": security.DEFAULT_COMMAND_TIMEOUT,
@@ -74,6 +82,7 @@ def get_all_settings():
             "tts_voice":               voice.DEFAULT_VOICE,
             "edge_voice":              voice.DEFAULT_EDGE_VOICE,
             "auto_compact_threshold_tokens": DEFAULT_AUTO_COMPACT_THRESHOLD_TOKENS,
+            "agent_chain_max_hops":    DEFAULT_AGENT_CHAIN_MAX_HOPS,
         },
     }
 
@@ -171,6 +180,14 @@ def update_setting(key: str, body: SettingPatch):
             raise HTTPException(400, "auto_compact_threshold_tokens must be an integer")
         if v != 0 and (v < 10_000 or v > 5_000_000):
             raise HTTPException(400, "auto_compact_threshold_tokens must be 0 (disabled) or 10,000–5,000,000")
+        security.set_setting(key, v)
+    elif key == "agent_chain_max_hops":
+        try:
+            v = int(body.value)
+        except Exception:
+            raise HTTPException(400, "agent_chain_max_hops must be an integer")
+        if v < 1 or v > 50:
+            raise HTTPException(400, "agent_chain_max_hops must be 1–50")
         security.set_setting(key, v)
     else:
         # Unknown setting: accept verbatim (forward-compatible)

@@ -3,7 +3,7 @@
 The agents-platform stores **lessons learned** (and potentially other long-form
 knowledge) in two places:
 
-  1. The structured ``target_lessons`` SQLite table (tag-overlap, confidence,
+  1. The structured ``target_lessons`` table (Postgres; tag-overlap, confidence,
      applications). This is the SOURCE OF TRUTH for metadata.
   2. A vector / RAG store for semantic search. This is REPLICATED from #1 and
      kept in sync via this provider.

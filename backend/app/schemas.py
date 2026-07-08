@@ -175,6 +175,9 @@ class RunInput(BaseModel):
     session_id: str | None = None    # resume a prior CLI session (e.g. claude --resume)
     notion_task_id: str | None = None  # Notion page ID of the kanban card that originated this run
     raw_cli_prompt: bool = False     # pass input to the CLI verbatim (e.g. "/compact")
+    caller_run_id: str | None = None  # the calling agent's own run_id (agent-to-agent chain
+                                       # loop guard) — auto-forwarded by mcp_server/agent_mcp.py
+                                       # from its AW_RUN_ID env var, not something the LLM sets.
 
 
 class RunOut(_Base):
@@ -191,6 +194,7 @@ class RunOut(_Base):
     started_at: datetime
     ended_at: datetime | None
     parent_run_id: str | None = None
+    hop_count: int = 0
     initiator_kind: str = "agent_run"
     initiator_id: str | None = None
     node_id: str | None = None

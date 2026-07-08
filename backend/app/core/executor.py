@@ -565,6 +565,41 @@ async def _run_agent_impl(
                               "run_id": run_id,
                               "parent_run_id": parent_run_id}, node=node_id or agent_slug)
 
+    # Pending session command: clear_session/compact_session (MCP tools) queue
+    # a row in pending_session_commands instead of acting mid-conversation —
+    # neither slash command can run inside an already-open turn. It's applied
+    # here, before THIS turn's real prompt, then deleted (once per queue call).
+    # "compact" mirrors auto-compact below: a nested "/compact" child run on
+    # the same session_id. "clear" can't be sent to the CLI headless (verified
+    # no-op — see memory/claude-cli-headless-clear-noop.md); the only real
+    # clear is a fresh session, so we just drop session_id for this call —
+    # no --resume, a brand-new session_id gets minted and captured onto this
+    # Run row below exactly like any other fresh run, so whatever caller reads
+    # run.session_id to persist "next session to resume" picks it up naturally.
+    if session_id and not skip_auto_compact and user_input.strip() not in ("/compact", "/clear"):
+        from ..models import PendingSessionCommand
+        with session_scope() as _pcs:
+            _pending = (_pcs.query(PendingSessionCommand)
+                        .filter(PendingSessionCommand.session_id == session_id)
+                        .first())
+            _pending_cmd = _pending.command if _pending else None
+            if _pending:
+                _pcs.delete(_pending)
+        if _pending_cmd == "compact":
+            _exec_log.info(
+                "pending compact: session %s before run %s", session_id, run_id)
+            await run_agent(
+                agent_slug, "/compact",
+                parent_run_id=run_id, initiator_kind="pending_compact",
+                target_id=target_id, session_id=session_id,
+                skip_auto_compact=True, raw_cli_prompt=True,
+            )
+        elif _pending_cmd == "clear":
+            _exec_log.info(
+                "pending clear: session %s before run %s — starting a fresh "
+                "session instead", session_id, run_id)
+            session_id = None
+
     # Auto-compact: a resumed session that's grown past the configured
     # threshold gets a "/compact" turn first — same session_id, its own Run
     # row (initiator_kind="auto_compact") — before this turn's real message
@@ -623,6 +658,12 @@ async def _run_agent_impl(
     # Last ScheduleWakeup tool_call seen in the stream — the one-shot CLI
     # process can't hold the timer, so we honour it ourselves (core.wakeups).
     _wakeup_req: dict | None = None
+    # run_agent_async / run_workflow_async tool_call ids seen with
+    # call_me_back not explicitly false (the default is to call back) —
+    # matched against their tool_result to learn the dispatched child's
+    # run_id, so we can arm an agent-callback once THIS run ends.
+    _pending_callback_calls: dict[str, str] = {}   # tool_use_id -> agent_slug (this agent, for the callback re-entry)
+    _callback_watch_run_ids: list[str] = []
     tin = tout = 0
     cost = 0.0
     err: str | None = None
@@ -727,11 +768,32 @@ async def _run_agent_impl(
                         if meta_kind == "tool_call":
                             if (meta_payload or {}).get("name") == "ScheduleWakeup":
                                 _wakeup_req = dict((meta_payload or {}).get("input") or {})
+                            _tc_name = (meta_payload or {}).get("name") or ""
+                            _tc_short = _tc_name.rsplit("__", 1)[-1]
+                            if _tc_short in ("run_agent_async", "run_workflow_async"):
+                                _tc_input = (meta_payload or {}).get("input") or {}
+                                _tc_id = (meta_payload or {}).get("id")
+                                # call_me_back defaults to true — an agent must opt OUT
+                                # (call_me_back:false) to get the old pure fire-and-forget.
+                                if _tc_id and _tc_input.get("call_me_back") is not False:
+                                    _pending_callback_calls[_tc_id] = agent_slug
                             if runtime.get("verbose_replies"):
                                 if reply_text.strip() and not reply_text.endswith("\n\n"):
                                     reply_text += "\n\n"
                             else:
                                 reply_text = ""
+                        elif meta_kind == "tool_result" and _pending_callback_calls:
+                            _tr_id = (meta_payload or {}).get("tool_use_id")
+                            _origin_agent_slug = _pending_callback_calls.pop(_tr_id, None)
+                            if _origin_agent_slug:
+                                import re as _re
+                                _m = _re.search(r'"run_id"\s*:\s*"([^"]+)"',
+                                               str((meta_payload or {}).get("content") or ""))
+                                if _m:
+                                    _callback_watch_run_ids.append(_m.group(1))
+                                else:
+                                    _exec_log.warning("agent-callback: no run_id found in tool_result "
+                                                      "for %s (tool_use_id=%s)", _origin_agent_slug, _tr_id)
                         # Persist session_id from system.init so callers can resume later.
                         if meta_kind == "system.init" and meta_payload and run_id:
                             if _t_system_init is None:
@@ -832,6 +894,20 @@ async def _run_agent_impl(
                             req=_wakeup_req)
     except Exception as _we:
         _exec_log.warning("wakeup scheduling failed run=%s: %s", run_id, _we)
+    # Agent-to-agent "call me back": for every run_agent_async/run_workflow_async
+    # dispatch this run made with call_me_back not explicitly false, persist +
+    # arm an event-driven callback that re-invokes THIS session when the
+    # dispatched child run finishes (see core.wakeups.register_agent_callback).
+    # Persisted on the CHILD run's own row — no in-memory context needed here
+    # beyond the two ids, so this survives an AP restart mid-flight.
+    if status == "success" and _callback_watch_run_ids:
+        from .wakeups import register_agent_callback
+        for _watch_id in _callback_watch_run_ids:
+            try:
+                register_agent_callback(watch_run_id=_watch_id, origin_run_id=run_id)
+            except Exception as _ce:
+                _exec_log.warning("agent-callback registration failed run=%s watch=%s: %s",
+                                  run_id, _watch_id, _ce)
     score_run_terminal(run_id)
     # WS broadcast — push terminal state to all connected clients
     try:
@@ -1274,6 +1350,38 @@ class TargetBudgetExceeded(Exception):
     """Raised when a new run dispatch would violate a Target's hard budget."""
 
 
+class AgentChainLoopError(Exception):
+    """Raised when an agent-to-agent dispatch chain would exceed agent_chain_max_hops."""
+
+
+def _resolve_hop_count(caller_run_id: str | None) -> int:
+    """Compute a new run's hop_count from its caller's, enforcing agent_chain_max_hops.
+
+    A run started with no ``caller_run_id`` (human/UI/task-initiated) is hop 0.
+    A run dispatched via ``run_agent_async``/``run_workflow_async`` inherits
+    caller.hop_count + 1. Raises AgentChainLoopError once the chain would
+    exceed the configured cap (default 8) — this is the loop guard for
+    runaway A→B→A "call me back" cycles. Callers should surface the error to
+    whoever dispatched the run (HTTPException) and alert the sysadmin bot.
+    """
+    if not caller_run_id:
+        return 0
+    from .security import get_setting
+    max_hops = get_setting("agent_chain_max_hops", 8)
+    with session_scope() as s:
+        from ..models import Run
+        caller = s.query(Run).filter(Run.id == caller_run_id).first()
+        caller_hops = caller.hop_count if caller else 0
+    new_hops = caller_hops + 1
+    if new_hops > max_hops:
+        raise AgentChainLoopError(
+            f"agent chain depth {new_hops} would exceed agent_chain_max_hops={max_hops} "
+            f"(caller_run_id={caller_run_id}) — this looks like a runaway agent-to-agent "
+            f"call loop rather than legitimate depth; raise the limit in Settings if not."
+        )
+    return new_hops
+
+
 def _check_target_budget(target_id: str | None) -> None:
     """If target_id refers to a Target with enforce_budget=true and the rolled-up
     spend already exceeds its caps, raise TargetBudgetExceeded.
@@ -1308,6 +1416,7 @@ def start_agent_run_bg(agent_slug: str, user_input: str, *,
                        initiator_kind: str = "agent_run",
                        initiator_id: str | None = None,
                        parent_run_id: str | None = None,
+                       hop_count: int = 0,
                        node_id: str | None = None,
                        target_id: str | None = None,
                        session_id: str | None = None,
@@ -1339,6 +1448,7 @@ def start_agent_run_bg(agent_slug: str, user_input: str, *,
                 initiator_kind=initiator_kind,
                 initiator_id=initiator_id,
                 parent_run_id=parent_run_id,
+                hop_count=hop_count,
                 node_id=node_id,
                 target_id=target_id,
                 model_slug=model_slug,
@@ -1418,6 +1528,8 @@ def start_agent_run_bg(agent_slug: str, user_input: str, *,
 def start_workflow_run_bg(workflow_slug: str, user_input: Any, *,
                           initiator_kind: str = "workflow_run",
                           initiator_id: str | None = None,
+                          parent_run_id: str | None = None,
+                          hop_count: int = 0,
                           target_id: str | None = None) -> str:
     if target_id is None:
         raise ValueError("target_id is required for workflow runs")
@@ -1433,6 +1545,8 @@ def start_workflow_run_bg(workflow_slug: str, user_input: Any, *,
                 input={"input": user_input},
                 initiator_kind=initiator_kind,
                 initiator_id=initiator_id or workflow_slug,
+                parent_run_id=parent_run_id,
+                hop_count=hop_count,
                 target_id=target_id,
                 source_slug=workflow_slug)
         s.add(r); s.flush()

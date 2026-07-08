@@ -44,7 +44,7 @@ def get_session() -> Iterator[Session]:
 
 def init_db() -> None:
     """Create all tables. Idempotent. Also runs trivial inline migrations:
-    adds new columns to existing SQLite tables without dropping data."""
+    adds new columns to existing tables (Postgres) without dropping data."""
     from . import models  # noqa: F401 — ensure models register
     Base.metadata.create_all(engine)
     _apply_inline_migrations()
@@ -69,7 +69,8 @@ def _ensure_column(conn, table: str, column: str, ddl: str) -> None:
 
 
 def _apply_inline_migrations() -> None:
-    """Add missing columns to existing tables. SQLite-only; for dev convenience."""
+    """Add missing columns to existing tables (Postgres in prod; DDL below must
+    use Postgres-valid literals, e.g. BOOLEAN DEFAULT false/true, not 0/1)."""
     from sqlalchemy import inspect, text
     insp = inspect(engine)
     if "runs" not in insp.get_table_names():
@@ -88,6 +89,13 @@ def _apply_inline_migrations() -> None:
         # Telegram progress-bubble message id — lets restart recovery flip the
         # [processing] button to [done] after re-attaching an interrupted run.
         ("proc_msg_id", "VARCHAR"),
+        # Agent-to-agent "call me back" persistence (core.wakeups) — survives
+        # an AP restart mid-flight via rearm_pending_agent_callbacks().
+        ("call_me_back", "BOOLEAN DEFAULT false"),
+        ("callback_done", "BOOLEAN DEFAULT false"),
+        ("callback_origin_run_id", "VARCHAR"),
+        # Agent-to-agent chain depth loop guard (see Run.hop_count).
+        ("hop_count", "INTEGER DEFAULT 0"),
     ]
     with engine.begin() as conn:
         for col, ddl in additions:
@@ -131,7 +139,7 @@ def _apply_inline_migrations() -> None:
         target_cols = {c["name"] for c in insp.get_columns("targets")}
         if "enforce_budget" not in target_cols:
             with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE targets ADD COLUMN enforce_budget BOOLEAN DEFAULT 0"))
+                conn.execute(text("ALTER TABLE targets ADD COLUMN enforce_budget BOOLEAN DEFAULT false"))
         if "pr_urls" not in target_cols:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE targets ADD COLUMN pr_urls JSON DEFAULT '[]'"))
@@ -141,7 +149,7 @@ def _apply_inline_migrations() -> None:
         skill_cols = {c["name"] for c in insp.get_columns("custom_skills")}
         if "hidden" not in skill_cols:
             with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE custom_skills ADD COLUMN hidden BOOLEAN DEFAULT 0"))
+                conn.execute(text("ALTER TABLE custom_skills ADD COLUMN hidden BOOLEAN DEFAULT false"))
 
     # Stamp graph.concurrency on existing workflows where kind=='parallel' but
     # the graph doesn't already carry the field — keeps the new topology-from-
@@ -200,6 +208,10 @@ def _apply_inline_migrations() -> None:
         with engine.begin() as conn:
             _ensure_column(conn, "telegram_bots", "is_sysadmin",
                            "is_sysadmin BOOLEAN NOT NULL DEFAULT FALSE")
+    if "crispal_conversation_suggestions" in insp.get_table_names():
+        with engine.begin() as conn:
+            _ensure_column(conn, "crispal_conversation_suggestions", "history_message_ids",
+                           "history_message_ids JSON DEFAULT '[]'")
 
     # Backfill cli_sessions from existing runs.session_id values
     if "cli_sessions" in insp.get_table_names() and "runs" in insp.get_table_names():

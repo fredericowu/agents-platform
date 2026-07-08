@@ -37,6 +37,28 @@ UPDATE_CHECK_TIMEOUT = 30
 log = logging.getLogger("aw-remote-agent")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+# Set once in main() from --dir. None = unrestricted (legacy behavior,
+# back-compat with installs that don't pass --dir): every fs op and the
+# exec cwd are confined to this directory when set.
+SHARE_ROOT: str | None = None
+
+
+def _resolve_scoped(path: str) -> str:
+    """Resolve `path` against SHARE_ROOT and reject anything that escapes it.
+
+    Relative paths are joined onto SHARE_ROOT; absolute paths are only
+    accepted if they already fall inside it. Raises PermissionError
+    otherwise, which callers turn into a normal error response instead of
+    crashing the connection.
+    """
+    if not SHARE_ROOT:
+        return path
+    candidate = path if os.path.isabs(path) else os.path.join(SHARE_ROOT, path)
+    resolved = os.path.realpath(candidate)
+    if resolved != SHARE_ROOT and not resolved.startswith(SHARE_ROOT + os.sep):
+        raise PermissionError(f"path escapes shared directory {SHARE_ROOT}: {path}")
+    return resolved
+
 
 def _system_info() -> dict:
     try:
@@ -88,7 +110,7 @@ async def _handle_exec(ws, req_id: str, command: str, timeout: float = 900) -> N
             command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=os.environ.get("HOME", "/"),
+            cwd=SHARE_ROOT or os.environ.get("HOME", "/"),
         )
         try:
             await asyncio.wait_for(
@@ -114,6 +136,9 @@ async def _handle_fs(ws, req_id: str, op: str, path: str,
                      data: str = "", offset: int = 0,
                      size: int = 65536, dest: str = "") -> None:
     try:
+        path = _resolve_scoped(path)
+        if dest:
+            dest = _resolve_scoped(dest)
         if op == "read":
             with open(path, "rb") as f:
                 f.seek(offset)
@@ -179,6 +204,11 @@ async def _handle_write_chunk(ws, req_id: str, path: str, data: str, eof: bool,
     hasher for this request, so repeated calls with the same req_id
     append/update rather than overwrite. Cleaned up on eof/error.
     """
+    try:
+        path = _resolve_scoped(path)
+    except PermissionError as e:
+        await ws.send(json.dumps({"type": "fs_write_chunk_ack", "req_id": req_id, "error": str(e)}))
+        return
     tmp_path = path + ".part"
     try:
         raw = base64.b64decode(data) if data else b""
@@ -218,6 +248,7 @@ async def _handle_read_request(ws, req_id: str, path: str,
     backend's REST /download endpoint additionally verifies bytes on its own
     by re-hashing what it spools to disk, rather than trusting this blindly)."""
     try:
+        path = _resolve_scoped(path)
         if not os.path.isfile(path):
             await ws.send(json.dumps({
                 "type": "fs_read_chunk", "req_id": req_id,
@@ -423,15 +454,25 @@ async def _run(profile_id: str, ws_url: str, no_update: bool) -> None:
 
 
 def main():
+    global SHARE_ROOT
     parser = argparse.ArgumentParser(description="AW Remote Agent — Linux client")
     parser.add_argument("--id", required=True, help="Profile UUID from agents-platform")
     parser.add_argument("--url", default="ws://localhost:10005",
                         help="WebSocket base URL of agents-platform (default: ws://localhost:10005)")
     parser.add_argument("--no-update", action="store_true",
                         help="Disable the self-update background check")
+    parser.add_argument("--dir", default="",
+                        help="Confine all file ops and command execution to this directory "
+                             "(default: unrestricted, full filesystem access)")
     args = parser.parse_args()
 
+    if args.dir:
+        SHARE_ROOT = os.path.realpath(os.path.expanduser(args.dir))
+        os.makedirs(SHARE_ROOT, exist_ok=True)
+
     log.info("AW Remote Agent starting (v%s). Profile: %s -> %s", VERSION, args.id, args.url)
+    if SHARE_ROOT:
+        log.info("Scoped to shared directory: %s", SHARE_ROOT)
     try:
         asyncio.run(_run(args.id, args.url, args.no_update))
     except SystemExit:

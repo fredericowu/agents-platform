@@ -397,6 +397,12 @@ async def _list_tools() -> list[Tool]:
         Tool(name="run_agent_async",
              description=("Start an agent run in the background and return its run_id. "
                           "Poll with `run_status` / `run_events`, or block with `wait_run`.\n\n"
+                          "**Call-me-back (default ON):** when this run finishes, YOUR session "
+                          "is automatically re-invoked with a summary of its result, and that "
+                          "reply is delivered down whatever channel started your own "
+                          "conversation (Telegram, Watch, etc.) — no polling needed. Pass "
+                          "`call_me_back:false` to opt out and get pure fire-and-forget "
+                          "(the old behavior) instead.\n\n"
                           "**`target_slug` is REQUIRED.** Create a Target first with "
                           "`create_target` if none exists. Calls without `target_slug` "
                           "are rejected with a 400 error."),
@@ -409,10 +415,15 @@ async def _list_tools() -> list[Tool]:
                                          "session_id": {"type": ["string", "null"],
                                                         "description": "Resume a prior CLI session. Pass the session_id from a previous run's result to continue the conversation."},
                                          "notion_task_id": {"type": ["string", "null"],
-                                                            "description": "Notion page ID of the Kanban card that originated this run. When set, the agent receives NOTION_TASK_ID env var and awserv sends a Telegram notification on completion."}},
+                                                            "description": "Notion page ID of the Kanban card that originated this run. When set, the agent receives NOTION_TASK_ID env var and awserv sends a Telegram notification on completion."},
+                                         "call_me_back": {"type": "boolean", "default": True,
+                                                          "description": "Default true: when the dispatched run finishes, your own session gets woken up with its result and replies down your own channel automatically. Set false for pure fire-and-forget."}},
                           "required": ["slug", "input", "target_slug"]}),
         Tool(name="run_workflow_async",
              description=("Start a workflow run in the background and return its run_id.\n\n"
+                          "**Call-me-back (default ON):** same as `run_agent_async` — your "
+                          "session is woken with the workflow's result when it finishes and "
+                          "replies down your own channel, unless `call_me_back:false`.\n\n"
                           "**`target_slug` is REQUIRED.** Create a Target first with "
                           "`create_target` if none exists. Calls without `target_slug` "
                           "are rejected with a 400 error."),
@@ -421,7 +432,9 @@ async def _list_tools() -> list[Tool]:
                                          "input": {"type": "string"},
                                          "target_slug": {"type": "string",
                                                          "description": "Slug of the Target this run is delivering against. REQUIRED."},
-                                         "target_id": {"type": ["string", "null"]}},
+                                         "target_id": {"type": ["string", "null"]},
+                                         "call_me_back": {"type": "boolean", "default": True,
+                                                          "description": "Default true: when this workflow finishes, your own session gets woken up with its result and replies down your own channel automatically. Set false for pure fire-and-forget."}},
                           "required": ["slug", "input", "target_slug"]}),
         Tool(name="run_status",
              description=("Return the current Run row: status, output, error, tokens, "
@@ -592,6 +605,20 @@ async def _list_tools() -> list[Tool]:
                                          "events_limit": {"type": "integer",
                                                            "description": "Cap on returned events. Default 500."}},
                           "required": ["run_id"]}),
+        Tool(name="list_bots",
+             description=("Per-bot (per-agent) snapshot: for every agent/source_slug seen "
+                          "in recent runs, its currently active session_id (the session_id "
+                          "of its most recent kind=agent run), that session's user-renamed "
+                          "name if one was set (from `cli_sessions.name` — see `list_sessions`"
+                          "-equivalent lookup), and every run tied to that active session "
+                          "with its status. Shape: [{bot, session_id, renamed_name, "
+                          "runs: [{run_id, status}, ...]}, ...].\n\n"
+                          "Scans the `scan_limit` most recent agent runs to build the bot "
+                          "list — raise it if a bot you expect is missing."),
+             inputSchema={"type": "object",
+                          "properties": {"scan_limit": {"type": "integer",
+                              "description": "How many recent agent runs to scan when "
+                                             "grouping by bot. Default 500."}}}),
 
         # ----- Targets (overall delivery goals) -----
         Tool(name="list_targets",
@@ -1194,6 +1221,11 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
                 body["session_id"] = args["session_id"]
             if args.get("notion_task_id"):
                 body["notion_task_id"] = args["notion_task_id"]
+            # Chain-depth loop guard: tell the backend which run is dispatching this
+            # one, from our own AW_RUN_ID env var (set by core/models/cli.py when this
+            # docker CLI agent was launched) — not something the calling LLM sets.
+            if os.environ.get("AW_RUN_ID"):
+                body["caller_run_id"] = os.environ["AW_RUN_ID"]
             r = await c.post(f"{BASE}/api/agents/{args['slug']}/run", json=body)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "run_workflow_async":
@@ -1204,6 +1236,8 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
                 body["target_id"] = args["target_id"]
             if args.get("target_slug"):
                 body["target_slug"] = args["target_slug"]
+            if os.environ.get("AW_RUN_ID"):
+                body["caller_run_id"] = os.environ["AW_RUN_ID"]
             r = await c.post(f"{BASE}/api/workflows/{args['slug']}/run", json=body)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name in ("run_status", "get_run"):
@@ -1239,6 +1273,31 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
             er = await c.get(f"{BASE}/api/runs/{run_id}/events", params=ev_params)
             run["events"] = er.json() if er.status_code == 200 else []
             return _ok(run)
+        if name == "list_bots":
+            scan_limit = str(args.get("scan_limit") or 500)
+            r = await c.get(f"{BASE}/api/runs",
+                             params={"limit": scan_limit, "kind": "agent", "summary": "true"})
+            if r.status_code != 200:
+                return _err(r.status_code, r.text)
+            runs = r.json()  # already ordered most-recent-first
+            bots: dict[str, dict] = {}
+            for run in runs:
+                bot = run.get("source_slug")
+                if not bot or bot in bots:
+                    continue
+                sid = run.get("session_id")
+                if not sid:
+                    continue
+                bots[bot] = {"bot": bot, "session_id": sid, "renamed_name": None, "runs": []}
+            for bot, row in bots.items():
+                sr = await c.get(f"{BASE}/api/sessions/{row['session_id']}")
+                if sr.status_code == 200:
+                    row["renamed_name"] = sr.json().get("name") or None
+                rr = await c.get(f"{BASE}/api/runs",
+                                  params={"session_id": row["session_id"], "limit": "500", "summary": "true"})
+                if rr.status_code == 200:
+                    row["runs"] = [{"run_id": rn["id"], "status": rn["status"]} for rn in rr.json()]
+            return _ok(list(bots.values()))
         if name == "wait_run":
             # Use a separate client with a larger timeout — the server itself
             # waits up to timeout_s, and we need our HTTP read budget to cover it.

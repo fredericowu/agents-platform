@@ -66,6 +66,7 @@ export default function Settings() {
   // local editable mirrors (so users can type freely before save)
   const [timeoutStr, setTimeoutStr] = useState("");
   const [autoCompactStr, setAutoCompactStr] = useState("");
+  const [chainMaxHopsStr, setChainMaxHopsStr] = useState("");
   const [allow, setAllow] = useState("");
   const [deny, setDeny]   = useState("");
   const [ragJson, setRagJson] = useState("");
@@ -107,6 +108,7 @@ export default function Settings() {
       setS(res);
       setTimeoutStr(String(res.command_timeout_seconds));
       setAutoCompactStr(String(res.auto_compact_threshold_tokens ?? 500000));
+      setChainMaxHopsStr(String(res.agent_chain_max_hops ?? 8));
       setAllow((res.command_allowlist || []).join("\n"));
       setDeny((res.command_denylist || []).join("\n"));
       setRagJson(JSON.stringify(res.rag_provider || {}, null, 2));
@@ -198,6 +200,7 @@ export default function Settings() {
       setS(res);
       setTimeoutStr(String(res.command_timeout_seconds));
       setAutoCompactStr(String(res.auto_compact_threshold_tokens ?? 500000));
+      setChainMaxHopsStr(String(res.agent_chain_max_hops ?? 8));
       setAllow((res.command_allowlist || []).join("\n"));
       setDeny((res.command_denylist || []).join("\n"));
       setMsg("reset to defaults");
@@ -267,6 +270,37 @@ export default function Settings() {
             </button>
             {s.auto_compact_threshold_tokens !== s._defaults?.auto_compact_threshold_tokens && (
               <span className="text-xs text-muted">overrides default ({s._defaults?.auto_compact_threshold_tokens?.toLocaleString()})</span>
+            )}
+          </div>
+        </FormRow>
+      </div>
+
+      {/* ─────── Agent-to-agent chain limit ─────── */}
+      <div className="card mb-4">
+        <h2 className="text-base font-semibold mb-1">Agent-to-agent chain limit</h2>
+        <div className="text-xs text-muted mb-3">
+          Every run dispatched via <span className="kbd">run_agent_async</span> /{" "}
+          <span className="kbd">run_workflow_async</span> inherits its caller's hop count + 1.
+          Once a chain (e.g. A calls B, B calls A back, A calls B again…) exceeds this many
+          hops, the new run is rejected and the sysadmin bot's admins get an alert.
+        </div>
+
+        <FormRow label="max hops"
+                 hint={`Default: ${s._defaults?.agent_chain_max_hops}. Root (human-initiated) runs are hop 0.`}>
+          <div className="flex items-center gap-2">
+            <input type="number" min={1} max={50} className="w-24"
+                   value={chainMaxHopsStr}
+                   onChange={e => setChainMaxHopsStr(e.target.value)}
+                   data-testid="settings-agent-chain-max-hops" />
+            <button className="btn btn-primary"
+                    disabled={saving === "agent_chain_max_hops" ||
+                              chainMaxHopsStr === String(s.agent_chain_max_hops)}
+                    onClick={() => save("agent_chain_max_hops", parseInt(chainMaxHopsStr, 10) || 8)}
+                    data-testid="settings-agent-chain-max-hops-save">
+              {saving === "agent_chain_max_hops" ? "saving..." : "save"}
+            </button>
+            {s.agent_chain_max_hops !== s._defaults?.agent_chain_max_hops && (
+              <span className="text-xs text-muted">overrides default ({s._defaults?.agent_chain_max_hops})</span>
             )}
           </div>
         </FormRow>
