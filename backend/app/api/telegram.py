@@ -1769,6 +1769,63 @@ def _approval_call_lambda(secret_name: str, token: str) -> str:
     return value
 
 
+def _resolve_secret_value(secret_name: str, request_id: str, scope: str) -> str:
+    """Fetch a secret's plaintext value: vault-first, Lambda fallback, then
+    write-back the Lambda result into the vault so future requests for this
+    same secret are served from vault (see the write-through cache fix from
+    2026-07-08 — this used to only be inlined in the approval callback;
+    factored out here so the auto-approve path below can reuse it)."""
+    secret_value = None
+    vault_on = False
+    try:
+        from src.api.vault_client import is_configured as _vault_on, get_secret as _vault_get, upsert_secret as _vault_upsert
+        vault_on = _vault_on()
+        if vault_on:
+            try:
+                secret_value = _vault_get(secret_name)
+            except KeyError:
+                pass  # not in vault — fall through to Lambda
+            except Exception:
+                log.exception("approval: vault read failed for %s, falling back to Lambda", secret_name)
+    except Exception:
+        pass  # vault_client unavailable in this process — Lambda only
+    if secret_value is None:
+        cfg = _approval_cfg()
+        hmac_key = cfg.get("hmac_key") or ""
+        token = _approval_make_token(secret_name, request_id, scope, hmac_key)
+        secret_value = _approval_call_lambda(secret_name, token)
+        if vault_on:
+            try:
+                _vault_upsert(secret_name, secret_value)
+            except Exception:
+                log.exception("approval: vault cache write failed for %s (non-fatal)", secret_name)
+    return secret_value
+
+
+def _check_auto_approve(secret_name: str, caller_process: str) -> bool:
+    """Skip the Telegram tap when the caller's own process command line
+    matches an explicitly configured pattern for this exact secret.
+
+    Deliberately narrow and explicitly opt-in per Frederico (2026-07-08): the
+    PID always changes between invocations so it can't be the identity, but
+    the process's own command line (e.g. `.../aw ssh ...`, `.../aw_crispal.py`)
+    is stable — matched as a substring, scoped to ONE secret name at a time
+    via aw.json's approval.auto_approve map. This is a deliberate, acknowledged
+    trade-off, not a hardened control: anything able to write a script and
+    invoke it with a matching command line could also trigger this. The
+    point is only to remove day-to-day approval friction for a known,
+    trusted, non-interactive tool (e.g. the aw-crispal backup tools) — not to
+    replace the approval gate for anything actually sensitive/unexpected.
+    Every auto-approved fetch is still logged (see the call site) so it's
+    never silent, even though no Telegram message is sent for it.
+    """
+    if not caller_process:
+        return False
+    cfg = _approval_cfg()
+    patterns = (cfg.get("auto_approve") or {}).get(secret_name) or []
+    return any(p in caller_process for p in patterns if p)
+
+
 class ApprovalRequest(BaseModel):
     # For request_type="secret" this is the secret name; for "agent_run" it is
     # the resource being gated (agent/workflow slug). Kept as `secret_name` for
@@ -1777,6 +1834,11 @@ class ApprovalRequest(BaseModel):
     reason: str
     scope: str = "one_shot"
     request_type: str = "secret"   # "secret" | "agent_run"
+    # Best-effort caller identity (e.g. contents of /proc/self/cmdline) used
+    # ONLY to check against aw.json's approval.auto_approve allowlist — see
+    # _check_auto_approve. Empty/absent simply means auto-approve never
+    # matches, falling back to the normal Telegram-gated flow.
+    caller_process: str = ""
 
 
 class ApprovalStatus(BaseModel):
@@ -1791,7 +1853,29 @@ def create_approval_request(body: ApprovalRequest, s: Session = Depends(get_sess
 
     Finds the sysadmin bot, sends an inline keyboard to all its admin_user_ids,
     returns a request_id the caller can poll via GET /approval/status/{id}.
+
+    Exception: if request_type == "secret" and the caller's process matches
+    an aw.json `approval.auto_approve[secret_name]` pattern, the secret is
+    resolved and returned immediately with no Telegram message at all — see
+    _check_auto_approve for the rationale/trade-off.
     """
+    request_type = (body.request_type or "secret").strip() or "secret"
+    request_id = str(uuid4())
+    now = _time_mod.time()
+
+    if request_type == "secret" and _check_auto_approve(body.secret_name, body.caller_process):
+        try:
+            secret_value = _resolve_secret_value(body.secret_name, request_id, body.scope)
+        except Exception as exc:
+            log.exception("approval: auto-approve fetch failed for %s", body.secret_name)
+            raise HTTPException(502, f"auto-approve: could not resolve secret: {exc}")
+        log.warning(
+            "approval: AUTO-APPROVED (no Telegram tap) secret=%s request_id=%s "
+            "caller_process=%r reason=%r",
+            body.secret_name, request_id, body.caller_process[:200], body.reason,
+        )
+        return ApprovalStatus(request_id=request_id, status="approved", value=secret_value)
+
     bot = _sysadmin_bot(s)
     if not bot:
         raise HTTPException(503, "No sysadmin bot configured — set is_sysadmin on a bot")
@@ -1800,9 +1884,6 @@ def create_approval_request(body: ApprovalRequest, s: Session = Depends(get_sess
     if not admin_ids:
         raise HTTPException(503, "Sysadmin bot has no admin_user_ids configured")
 
-    request_type = (body.request_type or "secret").strip() or "secret"
-    request_id = str(uuid4())
-    now = _time_mod.time()
     _pending_approvals[request_id] = {
         "secret_name": body.secret_name,
         "reason":      body.reason,
@@ -1940,48 +2021,12 @@ def _handle_approval_callback(cq_id: str, cq_data: str, chat_id: str, bot_token:
                                f"✅ Execução <code>{entry['secret_name']}</code> aprovada.")
         return
 
-    # approve — retrieve the actual secret value (vault-first, Lambda fallback).
-    # This mirrors the legacy awserv flow: the local vault is the source of truth
-    # when populated; the Lambda is only the fallback when the key isn't in vault.
-    #
-    # The vault is meant to be a write-through CACHE of AWS Secrets Manager —
-    # its whole point is to avoid invoking the Lambda (and hitting real AWS
-    # Secrets Manager) on every single approval. That only works if a Lambda
-    # fetch backfills the vault afterwards, which this used to skip entirely:
-    # every approval for a secret not already in the vault re-invoked the
-    # Lambda forever, and the vault stayed permanently empty for it. Now the
-    # first successful Lambda fetch for a given secret populates the vault, so
-    # every subsequent approval for that name is served from vault instead.
+    # approve — retrieve the actual secret value (vault-first, Lambda fallback,
+    # then vault write-back — see _resolve_secret_value; shared with the
+    # auto-approve path in create_approval_request).
     try:
         scope = scope_override or entry.get("scope") or "one_shot"
-        secret_value = None
-        vault_on = False
-        try:
-            from src.api.vault_client import is_configured as _vault_on, get_secret as _vault_get, upsert_secret as _vault_upsert
-            vault_on = _vault_on()
-            if vault_on:
-                try:
-                    secret_value = _vault_get(entry["secret_name"])
-                except KeyError:
-                    pass  # not in vault — fall through to Lambda
-                except Exception:
-                    log.exception("approval: vault read failed for %s, falling back to Lambda",
-                                  entry["secret_name"])
-        except Exception:
-            pass  # vault_client unavailable in this process — Lambda only
-        if secret_value is None:
-            cfg = _approval_cfg()
-            hmac_key = cfg.get("hmac_key") or ""
-            token = _approval_make_token(entry["secret_name"], request_id, scope, hmac_key)
-            secret_value = _approval_call_lambda(entry["secret_name"], token)
-            if vault_on:
-                try:
-                    _vault_upsert(entry["secret_name"], secret_value)
-                except Exception:
-                    # Best-effort cache population — a vault write failure must
-                    # never block delivering the secret the human just approved.
-                    log.exception("approval: vault cache write failed for %s (non-fatal)",
-                                  entry["secret_name"])
+        secret_value = _resolve_secret_value(entry["secret_name"], request_id, scope)
         entry["status"] = "approved"
         entry["secret_value"] = secret_value
         entry["scope"] = scope
