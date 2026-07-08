@@ -166,6 +166,20 @@ def _edit_message_text(token: str, chat_id: str, message_id: int,
         pass
 
 
+def _delete_history_messages(token: str, chat_id: str, message_ids: list) -> None:
+    """Delete the context bubbles (_send_history) once a Crispal suggestion is
+    resolved (sent/edited/ignored/stale) — they're only useful while a
+    decision is pending; keeping them piles up duplicate clutter in the
+    CRISPAL group forever, since the approval message gets edited in place
+    but the history bubbles above it never did. Best-effort, one call per
+    message (no deleteMessages batch endpoint on the Bot API)."""
+    for mid in (message_ids or []):
+        try:
+            _tg(token, "deleteMessage", chat_id=chat_id, message_id=mid)
+        except Exception:
+            pass  # already deleted / too old — nothing else to do
+
+
 def _send_chat_action(token: str, chat_id: str, action: str = "typing") -> None:
     try:
         _tg(token, "sendChatAction", chat_id=chat_id, action=action)
@@ -300,6 +314,47 @@ class SuggestionEditSubmit(BaseModel):
     behavior_instruction: str | None = None
 
 
+_CRISPAL_KB_CORRECTIONS_PATH = "crispal/correcoes-humanas.md"
+
+
+def _awserv_api_key() -> str:
+    key_path = os.path.join(os.environ.get("AW_BASE_DIR", "/opt/agentic-workspace"),
+                             ".tmp", "awserv_api_key")
+    try:
+        with open(key_path) as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def _append_crispal_kb_correction(*, customer_name: str, instruction_text: str,
+                                   suggested_text: str, final_text: str) -> None:
+    """Best-effort: append a human correction to the Crispal KB file the agent
+    is instructed to read every turn (see the aw-crispal skill), so an edit
+    made now changes the agent's behavior on the next conversation instead of
+    only sitting in crispal_suggestion_feedback as an unused audit log."""
+    awserv = os.environ.get("AWSERV_BASE", "http://127.0.0.1:9123")
+    headers = {"X-Api-Key": _awserv_api_key()}
+    try:
+        with httpx.Client(timeout=10.0) as c:
+            resp = c.get(f"{awserv}/api/kb/file/{_CRISPAL_KB_CORRECTIONS_PATH}", headers=headers)
+            existing = resp.json().get("content", "") if resp.status_code == 200 else ""
+            if not existing:
+                return  # file missing/unreachable — don't clobber it with a partial doc
+
+            today = datetime.utcnow().strftime("%Y-%m-%d")
+            entry = (
+                f"\n### {today} — {customer_name} (via edit mini-app)\n\n"
+                f"- **Sugestão original (A):** {suggested_text}\n"
+                f"- **Correção do Frederico (B):** {final_text}\n"
+                f"- **Motivo (C):** {instruction_text}\n"
+            )
+            c.put(f"{awserv}/api/kb/file/{_CRISPAL_KB_CORRECTIONS_PATH}",
+                  headers=headers, json={"content": existing.rstrip() + "\n" + entry})
+    except Exception:
+        log.warning("failed to append crispal KB correction", exc_info=True)
+
+
 @router.post("/suggestion/{suggestion_id}/edit", include_in_schema=False)
 def suggestion_edit_submit(suggestion_id: str, body: SuggestionEditSubmit,
                            s: Session = Depends(get_session)) -> dict:
@@ -328,13 +383,23 @@ def suggestion_edit_submit(suggestion_id: str, body: SuggestionEditSubmit,
     instruction_text = (body.behavior_instruction or "").strip()
     if instruction_text:
         s.add(CrispalSuggestionFeedback(suggestion_id=suggestion_id, instruction_text=instruction_text))
+        # Capture plain values now — the ORM row must not be touched from the
+        # background thread after this request's session is gone.
+        threading.Thread(
+            target=_append_crispal_kb_correction,
+            kwargs=dict(customer_name=row.customer_name, instruction_text=instruction_text,
+                        suggested_text=row.suggested_text, final_text=final_text),
+            daemon=True,
+        ).start()
 
     s.commit()
 
     bot = s.query(TelegramBot).filter(TelegramBot.id == row.bot_id).first()
-    if bot and row.approval_message_id:
-        _edit_message_text(bot.token, row.chat_id, row.approval_message_id,
-                           f"✏️ Editado e enviado — {row.customer_name}\n\n{final_text}")
+    if bot:
+        _delete_history_messages(bot.token, row.chat_id, row.history_message_ids)
+        if row.approval_message_id:
+            _edit_message_text(bot.token, row.chat_id, row.approval_message_id,
+                               f"✏️ Editado e enviado — {row.customer_name}\n\n{final_text}")
 
     return {"ok": True}
 
@@ -606,8 +671,19 @@ def _transcribe_voice(token: str, file_id: str) -> tuple[str, str]:
 _TELEGRAM_MAX_UPLOAD = 20 * 1024 * 1024  # 20 MB Bot API limit
 
 
-def _save_telegram_upload(token: str, message: dict) -> str | None:
-    """Download document/photo/video/audio attached to a message. Returns local path or None."""
+def _save_telegram_upload(token: str, message: dict) -> tuple[str | None, str | None]:
+    """Download document/photo/video/audio attached to a message.
+
+    Returns (local_path, None) on success, (None, error_message) on any
+    failure — every failure path used to just `return None`, so a caption-only
+    message (or nothing at all) silently reached the user/agent with zero
+    signal that an attachment was dropped. Root-caused 2026-07-08: agents-
+    platform got restarted as root at least once (see process_utils.py's
+    `_pids_listening_on` docstring), which left `.tmp/telegram-uploads/<date>/`
+    owned by root for the rest of that day — every subsequent write from the
+    normal `ubuntu`-owned process failed with a silent PermissionError, and
+    Frederico had no way to tell his attachments (including two crash reports
+    he was trying to hand over for debugging) were being dropped."""
     file_id = filename = ""
     if "document" in message:
         doc = message["document"]
@@ -629,26 +705,27 @@ def _save_telegram_upload(token: str, message: dict) -> str | None:
         filename = aud.get("file_name") or f"{file_id}.mp3"
 
     if not file_id:
-        return None
+        return None, "Telegram didn't send a file_id for this attachment."
 
     try:
         r = httpx.get(TELEGRAM_API.format(token=token, method="getFile"),
                       params={"file_id": file_id}, timeout=10)
         meta = r.json()
         if not meta.get("ok"):
-            return None
+            return None, f"Telegram getFile failed: {meta.get('description', meta)}"
         result = meta.get("result") or {}
         if result.get("file_size", 0) > _TELEGRAM_MAX_UPLOAD:
             log.warning("upload too large: %s", file_id)
-            return None
+            size_mb = result.get("file_size", 0) / 1024 / 1024
+            return None, f"File too large ({size_mb:.1f} MB, limit is 20 MB)."
         remote_path = result.get("file_path") or ""
         if not remote_path:
-            return None
+            return None, "Telegram didn't return a file_path for this attachment."
         content = httpx.get(TELEGRAM_FILE_API.format(token=token, path=remote_path),
                             timeout=60).content
     except Exception as exc:
         log.warning("upload download failed: %s", exc)
-        return None
+        return None, f"Download from Telegram failed: {exc}"
 
     from datetime import datetime as _dt
     date_str = _dt.utcnow().strftime("%Y-%m-%d")
@@ -658,6 +735,14 @@ def _save_telegram_upload(token: str, message: dict) -> str | None:
     )
     upload_dir = os.path.normpath(upload_dir)
     os.makedirs(upload_dir, exist_ok=True)
+    # Best-effort: make today's dir writable by ANY local user, not just
+    # whoever happened to create it first. Without this, one root-owned
+    # restart (see docstring above) silently blocks every write for the rest
+    # of the day even after the process goes back to running as `ubuntu`.
+    try:
+        os.chmod(upload_dir, 0o777)
+    except OSError:
+        pass
     safe_name = os.path.basename(filename).replace("/", "_").replace("\\", "_") or "file"
     local_path = os.path.join(upload_dir, f"{file_id}_{safe_name}")
     try:
@@ -665,9 +750,9 @@ def _save_telegram_upload(token: str, message: dict) -> str | None:
             fh.write(content)
     except OSError as exc:
         log.warning("upload write failed: %s", exc)
-        return None
+        return None, f"Couldn't save the file on the server: {exc}"
     log.info("upload saved %d bytes → %s", len(content), local_path)
-    return local_path
+    return local_path, None
 
 
 # ---------------------------------------------------------------------------
@@ -1590,6 +1675,34 @@ def _sysadmin_bot(s: Session) -> TelegramBot | None:
     )
 
 
+def notify_sysadmins(text: str) -> None:
+    """Best-effort plain-text alert to every admin_user_id of the sysadmin bot.
+
+    Used for operational alerts that aren't tied to a specific run/chat (e.g.
+    the agent-chain loop guard in api/agents.py & api/workflows.py). Swallows
+    all errors — a notification failure must never break the caller's request.
+
+    Sent with no parse_mode (plain text): callers often interpolate free-form
+    exception messages that may contain `_`/`*`/`` ` `` — Telegram's legacy
+    Markdown parser 400s on unbalanced entities from that, silently dropping
+    the alert.
+    """
+    try:
+        with session_scope() as s:
+            bot = _sysadmin_bot(s)
+            if not bot:
+                log.warning("notify_sysadmins: no enabled sysadmin bot configured; dropped: %s", text)
+                return
+            token, admin_ids = bot.token, list(bot.admin_user_ids or [])
+        for chat_id in admin_ids:
+            try:
+                _tg(token, "sendMessage", chat_id=chat_id, text=text)
+            except Exception:
+                log.exception("notify_sysadmins: send failed chat_id=%s", chat_id)
+    except Exception:
+        log.exception("notify_sysadmins failed")
+
+
 def _approval_make_token(secret_name: str, request_id: str, scope: str, hmac_key: str) -> str:
     payload: dict = {
         "n": secret_name,
@@ -2044,6 +2157,7 @@ def _handle_crispal_suggestion_callback(cq_id: str, cq_data: str, chat_id: str,
         if action == "ignore":
             row.status = "ignored"
             row.decided_at = datetime.utcnow()
+            _delete_history_messages(bot_token, chat_id, row.history_message_ids)
             _edit(f"🚫 Ignorado — {customer_name}\n\n{orig_text}")
             return
 
@@ -2070,6 +2184,7 @@ def _handle_crispal_suggestion_callback(cq_id: str, cq_data: str, chat_id: str,
         row.status = "sent"
         row.final_text = orig_text
         row.decided_at = datetime.utcnow()
+        _delete_history_messages(bot_token, chat_id, row.history_message_ids)
         _edit(f"✅ Enviado — {customer_name}\n\n{orig_text}")
 
 
@@ -2609,13 +2724,22 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
                 pass
 
     # Handle user-uploaded file (document/photo/video/audio) — not voice notes
-    if not is_voice:
-        upload_path = _save_telegram_upload(bot.token, message)
+    has_attachment = any(k in message for k in ("document", "photo", "video", "audio"))
+    if not is_voice and has_attachment:
+        upload_path, upload_error = _save_telegram_upload(bot.token, message)
         if upload_path:
             caption = text_raw  # user caption, if any
             text_raw = f"[UPLOAD] File saved at: {upload_path}"
             if caption:
                 text_raw += f"\n\n{caption}"
+        else:
+            # Never fail silently — this used to just fall through to
+            # caption-only text (or nothing at all) with zero signal that
+            # the attachment was dropped (Frederico, 2026-07-08: two crash
+            # reports he was handing over for debugging vanished this way).
+            log.warning("upload failed for chat=%s: %s", chat_id, upload_error)
+            _send_message(bot.token, chat_id,
+                          f"⚠️ Couldn't save your attachment: {upload_error}")
 
     if not text_raw:
         return {"ok": True, "reason": "no text"}
