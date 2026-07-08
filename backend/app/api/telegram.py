@@ -1374,11 +1374,23 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
     lock = _chat_lock(bot.id, chat_id)
     with lock:
         t_session_start = _time.perf_counter()
-        # Ensure target
-        target_id = _ensure_target(bot.id, chat_id)
-
-        # Get last session_id for conversation continuity
-        session_id, _ = _get_or_create_session(bot.id, chat_id, target_id)
+        # Ensure target + session. Any exception here happened before the progress
+        # button's terminal-state finally block exists (below) — without this guard
+        # it silently escapes to the chat worker's outer try/except (which only
+        # logs), leaving the "Processing…"/"[waiting]" bubble stuck forever with no
+        # error ever surfaced to the user. Root cause of the 2026-07-08 stuck-in-
+        # [waiting] incident: a message queued during a setup-phase exception here
+        # never got a Run row and its button never flipped.
+        try:
+            target_id = _ensure_target(bot.id, chat_id)
+            session_id, _ = _get_or_create_session(bot.id, chat_id, target_id)
+        except Exception:
+            log.exception("dispatch setup failed (target/session) for bot=%s chat=%s",
+                          bot.id, chat_id)
+            _flip_pre_ack("error")
+            _send_message(token, chat_id,
+                          "⚠️ Falha interna ao preparar a sessão — tente reenviar a mensagem.")
+            return
         t_session_done = _time.perf_counter()
 
         # Build context header that the agent receives
@@ -1409,18 +1421,29 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
         t_button_start = _time.perf_counter()
         proc_msg_id = proc_web_app = None
         btn_state = "processing"
-        if ack_future is not None:
-            try:
-                proc_msg_id, proc_web_app, progress_url, btn_state = ack_future.result(timeout=15)
-            except Exception:
-                log.warning("pre-sent Processing ack failed for bot=%s chat=%s — resending",
-                            bot.id, chat_id)
-        if not proc_msg_id:
-            _send_chat_action(token, chat_id)
-            proc_msg_id, proc_web_app = _send_button_message(
-                token, chat_id, "⚡ Processing…",
-                "📊 View Progress [processing]", progress_url, web_app=True)
-            btn_state = "processing"
+        try:
+            if ack_future is not None:
+                try:
+                    proc_msg_id, proc_web_app, progress_url, btn_state = ack_future.result(timeout=15)
+                except Exception:
+                    log.warning("pre-sent Processing ack failed for bot=%s chat=%s — resending",
+                                bot.id, chat_id)
+            if not proc_msg_id:
+                _send_chat_action(token, chat_id)
+                proc_msg_id, proc_web_app = _send_button_message(
+                    token, chat_id, "⚡ Processing…",
+                    "📊 View Progress [processing]", progress_url, web_app=True)
+                btn_state = "processing"
+        except Exception:
+            # Same reasoning as the target/session guard above — this runs before
+            # the agent-run try/finally, so an unguarded exception here would also
+            # leave the bubble permanently stuck with no error ever shown.
+            log.exception("dispatch setup failed (progress button) for bot=%s chat=%s",
+                          bot.id, chat_id)
+            _flip_pre_ack("error")
+            _send_message(token, chat_id,
+                          "⚠️ Falha interna ao iniciar o processamento — tente reenviar a mensagem.")
+            return
         t_button_done = _time.perf_counter()
 
         # Live label updates while the run is queued/starting:
@@ -1920,12 +1943,23 @@ def _handle_approval_callback(cq_id: str, cq_data: str, chat_id: str, bot_token:
     # approve — retrieve the actual secret value (vault-first, Lambda fallback).
     # This mirrors the legacy awserv flow: the local vault is the source of truth
     # when populated; the Lambda is only the fallback when the key isn't in vault.
+    #
+    # The vault is meant to be a write-through CACHE of AWS Secrets Manager —
+    # its whole point is to avoid invoking the Lambda (and hitting real AWS
+    # Secrets Manager) on every single approval. That only works if a Lambda
+    # fetch backfills the vault afterwards, which this used to skip entirely:
+    # every approval for a secret not already in the vault re-invoked the
+    # Lambda forever, and the vault stayed permanently empty for it. Now the
+    # first successful Lambda fetch for a given secret populates the vault, so
+    # every subsequent approval for that name is served from vault instead.
     try:
         scope = scope_override or entry.get("scope") or "one_shot"
         secret_value = None
+        vault_on = False
         try:
-            from src.api.vault_client import is_configured as _vault_on, get_secret as _vault_get
-            if _vault_on():
+            from src.api.vault_client import is_configured as _vault_on, get_secret as _vault_get, upsert_secret as _vault_upsert
+            vault_on = _vault_on()
+            if vault_on:
                 try:
                     secret_value = _vault_get(entry["secret_name"])
                 except KeyError:
@@ -1940,6 +1974,14 @@ def _handle_approval_callback(cq_id: str, cq_data: str, chat_id: str, bot_token:
             hmac_key = cfg.get("hmac_key") or ""
             token = _approval_make_token(entry["secret_name"], request_id, scope, hmac_key)
             secret_value = _approval_call_lambda(entry["secret_name"], token)
+            if vault_on:
+                try:
+                    _vault_upsert(entry["secret_name"], secret_value)
+                except Exception:
+                    # Best-effort cache population — a vault write failure must
+                    # never block delivering the secret the human just approved.
+                    log.exception("approval: vault cache write failed for %s (non-fatal)",
+                                  entry["secret_name"])
         entry["status"] = "approved"
         entry["secret_value"] = secret_value
         entry["scope"] = scope
