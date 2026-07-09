@@ -112,6 +112,13 @@ CLI_SPECS: dict[str, dict] = {
 }
 
 
+def container_name_for_run(run_id: str) -> str:
+    """Deterministic docker container name for a run_id — lets /abort and
+    /runs/:id/cancel `docker kill` it by name without needing a live handle
+    to the subprocess that started it (works across an AP restart too)."""
+    return f"aw-run-{run_id}"
+
+
 def parse_mount(raw: str) -> tuple[str, str]:
     """Parse --mount value into (host_path, container_path).
     Accepts 'host_path' or 'host_path:container_path'.
@@ -166,6 +173,12 @@ def build_docker_argv(
     else:
         argv = ["docker", "run", "--rm", "-i",
                "--add-host=host.docker.internal:host-gateway"]
+
+    # Deterministic container name from run_id lets /runs/:id/cancel target it
+    # with `docker kill` even when it has no locally-tracked subprocess handle
+    # (e.g. a run recovered after an agents-platform restart — see cli.py kill_run).
+    if run_id:
+        argv.extend(["--name", container_name_for_run(run_id)])
 
     # ── Volume mounts ──────────────────────────────────────────────────────────
     seen_mounts: set[str] = set()

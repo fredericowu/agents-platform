@@ -29,7 +29,7 @@ import time
 import urllib.request
 import urllib.error
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 UPDATE_CHECK_INTERVAL = 300  # seconds, matches the Windows client's 5 min poll
 UPDATE_CHECK_TIMEOUT = 30
@@ -41,6 +41,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 # back-compat with installs that don't pass --dir): every fs op and the
 # exec cwd are confined to this directory when set.
 SHARE_ROOT: str | None = None
+
+# Set once in main() from --foreground. When true, every inbound message and
+# outbound reply is logged at INFO level (command text, fs ops, exec chunks) —
+# a live traffic dump for a human watching the terminal, not just connection
+# lifecycle events.
+LIVE_TRAFFIC = False
 
 
 def _resolve_scoped(path: str) -> str:
@@ -98,12 +104,19 @@ async def _handle_exec(ws, req_id: str, command: str, timeout: float = 900) -> N
             chunk = await stream.read(4096)
             if not chunk:
                 break
+            text = chunk.decode(errors="replace")
+            if LIVE_TRAFFIC:
+                for line in text.splitlines():
+                    log.info("   [%s/%s] %s", req_id, stream_name, line)
             await _send({
                 "type": "exec_chunk",
                 "req_id": req_id,
                 "stream": stream_name,
-                "data": chunk.decode(errors="replace"),
+                "data": text,
             })
+
+    if LIVE_TRAFFIC:
+        log.info(">> exec[%s]: %s", req_id, command)
 
     try:
         proc = await asyncio.create_subprocess_shell(
@@ -126,8 +139,12 @@ async def _handle_exec(ws, req_id: str, command: str, timeout: float = 900) -> N
                 "data": f"\nCommand timed out after {timeout:.0f}s\n",
             })
             returncode = -1
+        if LIVE_TRAFFIC:
+            log.info("<< exec[%s] done, returncode=%s", req_id, returncode)
         await _send({"type": "exec_done", "req_id": req_id, "returncode": returncode})
     except Exception as e:
+        if LIVE_TRAFFIC:
+            log.info("<< exec[%s] error: %s", req_id, e)
         await _send({"type": "exec_chunk", "req_id": req_id, "stream": "stderr", "data": str(e)})
         await _send({"type": "exec_done", "req_id": req_id, "returncode": -1})
 
@@ -135,6 +152,8 @@ async def _handle_exec(ws, req_id: str, command: str, timeout: float = 900) -> N
 async def _handle_fs(ws, req_id: str, op: str, path: str,
                      data: str = "", offset: int = 0,
                      size: int = 65536, dest: str = "") -> None:
+    if LIVE_TRAFFIC:
+        log.info(">> fs[%s]: %s %s%s", req_id, op, path, f" -> {dest}" if dest else "")
     try:
         path = _resolve_scoped(path)
         if dest:
@@ -285,6 +304,59 @@ async def _handle_read_request(ws, req_id: str, path: str,
         }))
 
 
+# ── Tunnel ───────────────────────────────────────────────────────────────────
+
+async def _handle_tunnel(ws_url: str, tunnel_id: str, target_port: int) -> None:
+    """Bridge one TCP connection: dial 127.0.0.1:target_port on THIS machine
+    and relay bytes to/from a dedicated websocket the server opened for this
+    tunnel_id. One WS per tunnel connection, not multiplexed on the control
+    channel — a stalled tunnel can't head-of-line-block exec/fs traffic or
+    any other concurrent tunnel. Always dials loopback only — target_port is
+    server-supplied but the host is hardcoded, so the server can never make
+    this agent reach out to an arbitrary network address.
+    """
+    import websockets
+
+    if LIVE_TRAFFIC:
+        log.info(">> tunnel[%s]: dialing 127.0.0.1:%s", tunnel_id, target_port)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", target_port)
+    except Exception as e:
+        log.warning("tunnel[%s]: local connect to port %s failed: %s", tunnel_id, target_port, e)
+        return
+
+    tunnel_url = f"{ws_url}/ws/tunnel/{tunnel_id}"
+    try:
+        async with websockets.connect(
+            tunnel_url, ping_interval=20, ping_timeout=30, open_timeout=10,
+        ) as tws:
+            async def _local_to_ws():
+                try:
+                    while True:
+                        chunk = await reader.read(65536)
+                        if not chunk:
+                            break
+                        await tws.send(chunk)
+                except Exception:
+                    pass
+
+            async def _ws_to_local():
+                try:
+                    async for chunk in tws:
+                        writer.write(chunk if isinstance(chunk, bytes) else chunk.encode())
+                        await writer.drain()
+                except Exception:
+                    pass
+
+            await asyncio.gather(_local_to_ws(), _ws_to_local(), return_exceptions=True)
+    except Exception as e:
+        log.warning("tunnel[%s]: error: %s", tunnel_id, e)
+    finally:
+        writer.close()
+        if LIVE_TRAFFIC:
+            log.info("<< tunnel[%s]: closed", tunnel_id)
+
+
 # ── Self-update ───────────────────────────────────────────────────────────────
 
 def _sha256_file(path: str) -> str:
@@ -403,6 +475,8 @@ async def connect_and_serve(profile_id: str, ws_url: str) -> None:
                         continue
 
                     kind = msg.get("type")
+                    if LIVE_TRAFFIC and kind != "ping":
+                        log.info(">> recv: %s", raw)
                     if kind == "exec":
                         asyncio.create_task(_handle_exec(
                             ws, msg["req_id"], msg["command"], msg.get("timeout", 900),
@@ -421,6 +495,10 @@ async def connect_and_serve(profile_id: str, ws_url: str) -> None:
                     elif kind == "fs_read_request":
                         asyncio.create_task(_handle_read_request(
                             ws, msg["req_id"], msg.get("path", ""),
+                        ))
+                    elif kind == "tunnel_request":
+                        asyncio.create_task(_handle_tunnel(
+                            ws_url, msg["tunnel_id"], msg["target_port"],
                         ))
                     elif kind == "ping":
                         await ws.send(json.dumps({"type": "pong"}))
@@ -454,7 +532,7 @@ async def _run(profile_id: str, ws_url: str, no_update: bool) -> None:
 
 
 def main():
-    global SHARE_ROOT
+    global SHARE_ROOT, LIVE_TRAFFIC
     parser = argparse.ArgumentParser(description="AW Remote Agent — Linux client")
     parser.add_argument("--id", required=True, help="Profile UUID from agents-platform")
     parser.add_argument("--url", default="ws://localhost:10005",
@@ -464,21 +542,32 @@ def main():
     parser.add_argument("--dir", default="",
                         help="Confine all file ops and command execution to this directory "
                              "(default: unrestricted, full filesystem access)")
+    parser.add_argument("--foreground", "--live-session", dest="foreground", action="store_true",
+                        help="Run attended in this terminal only: no service/daemon involved "
+                             "(that's install.sh's job, not this flag), every inbound command "
+                             "and outbound chunk is logged live, self-update is disabled, and "
+                             "Ctrl+C cleanly disconnects and exits.")
     args = parser.parse_args()
 
     if args.dir:
         SHARE_ROOT = os.path.realpath(os.path.expanduser(args.dir))
         os.makedirs(SHARE_ROOT, exist_ok=True)
 
+    LIVE_TRAFFIC = args.foreground
+    no_update = args.no_update or args.foreground
+
     log.info("AW Remote Agent starting (v%s). Profile: %s -> %s", VERSION, args.id, args.url)
     if SHARE_ROOT:
         log.info("Scoped to shared directory: %s", SHARE_ROOT)
+    if args.foreground:
+        log.info("Foreground/live session — press Ctrl+C to disconnect and exit.")
     try:
-        asyncio.run(_run(args.id, args.url, args.no_update))
+        asyncio.run(_run(args.id, args.url, no_update))
     except SystemExit:
         raise
     except KeyboardInterrupt:
-        pass
+        if args.foreground:
+            log.info("Ctrl+C received — disconnecting, session ended.")
 
 
 if __name__ == "__main__":

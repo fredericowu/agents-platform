@@ -47,17 +47,35 @@ async def _unregister(run_id: str, proc: asyncio.subprocess.Process) -> None:
 
 
 async def kill_run(run_id: str) -> int:
-    """Send SIGTERM to every live subprocess registered for run_id. Returns
-    the count of processes signalled."""
+    """Stop run_id's container immediately — `docker kill` with the default
+    signal (SIGKILL), not SIGTERM. A graceful SIGTERM first was tried and
+    dropped: if the claude-CLI process inside doesn't exit promptly (mid
+    tool-call, ignoring the signal, etc.) the `--rm` container never gets
+    torn down and keeps burning tokens/resources indefinitely even though the
+    run is marked 'cancelled' in the DB (see 2026-07-09 incident: a cancelled
+    run's container survived 16+ minutes until killed by hand). Cancel is a
+    deliberate user action — there's nothing worth flushing gracefully, so go
+    straight to SIGKILL. Always issues `docker kill` by container name, since
+    a run recovered after an AP restart (Redis-stream survival) has no local
+    subprocess handle but is still reachable by its deterministic name.
+    Returns the count of processes/containers signalled."""
     async with _PROCS_LOCK:
         procs = list(_PROCS.get(run_id, set()))
     n = 0
     for p in procs:
         try:
-            p.terminate()
+            p.kill()
             n += 1
         except ProcessLookupError:
             pass
+
+    from ..tools.docker_agent import container_name_for_run
+    proc = await asyncio.create_subprocess_exec(
+        "docker", "kill", container_name_for_run(run_id),
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    if await proc.wait() == 0:
+        n += 1
     return n
 
 
