@@ -16,6 +16,7 @@ No third-party libraries needed — uses raw RESP protocol over a TCP socket.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import socket
 import sys
@@ -98,21 +99,31 @@ async def run() -> None:
     proc = await asyncio.create_subprocess_exec(
         *cli_args,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
         limit=10 * 1024 * 1024,
     )
 
-    assert proc.stdout
-    while True:
-        raw = await proc.stdout.readline()
-        if not raw:
-            break
-        line = raw.decode("utf-8", errors="replace").rstrip("\n")
-        if line:
+    async def publish_stream(stream: asyncio.StreamReader | None, source: str) -> None:
+        if stream is None:
+            return
+        while True:
+            raw = await stream.readline()
+            if not raw:
+                break
+            line = raw.decode("utf-8", errors="replace").rstrip("\n")
+            if not line:
+                continue
+            if source == "stderr":
+                line = json.dumps({"type": "cli.stderr", "text": line[:20000]})
             try:
-                r.xadd(stream_key, {"type": "stdout", "line": line})
+                r.xadd(stream_key, {"type": source, "line": line})
             except Exception as e:
                 print(f"aw-connector-redis: XADD failed ({e})", file=sys.stderr)
+
+    await asyncio.gather(
+        publish_stream(proc.stdout, "stdout"),
+        publish_stream(proc.stderr, "stderr"),
+    )
 
     rc = await proc.wait()
     try:

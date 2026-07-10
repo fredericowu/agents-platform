@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import secrets
+from pathlib import Path
 from typing import Any, AsyncIterator
 
 log = logging.getLogger("ap.cli")
@@ -194,6 +195,20 @@ class CliLLM(BaseLLM):
         # clear_session/compact_session MCP tools without extra plumbing.
         if self.session_id:
             _extra_env["AW_SESSION_ID"] = self.session_id
+        # Codex's aw-gateway MCP server (defined in the shared $CODEX_HOME/
+        # config.toml, not the per-run mcp_codex.toml profile — codex's -p/
+        # --profile flag does not layer the mcp_servers table, only the base
+        # config.toml is honoured) authenticates via bearer_token_env_var =
+        # "MCP_BEARER_AW_GATEWAY". Nothing else forwards that var into the
+        # container, so codex agents silently got 0 MCP tools.
+        if cli == "codex":
+            try:
+                _aw_json = Path(os.environ.get("AW_BASE_DIR", "/opt/agentic-workspace")) / "src" / "config" / "aw.json"
+                _gw_token = json.loads(_aw_json.read_text()).get("mcp_gateway", {}).get("token") or ""
+                if _gw_token:
+                    _extra_env["MCP_BEARER_AW_GATEWAY"] = _gw_token
+            except Exception:
+                pass
         return build_docker_argv(
             cli=cli,
             prompt=prompt,
@@ -449,9 +464,25 @@ class CliLLM(BaseLLM):
                     if evt.get("subtype") != "success":
                         yield _meta_chunk("cli.error", {"subtype": evt.get("subtype"),
                                                         "is_error": evt.get("is_error")})
+                elif et == "cli.stderr":
+                    yield _meta_chunk("cli.error", {
+                        "subtype": "stderr",
+                        "message": str(evt.get("text") or "")[:20000],
+                    })
                 # ── codex --json event schema (thread.started/turn.started/
                 # item.started/item.completed/turn.completed) — distinct "type"
                 # values from claude's, so no collision with the branches above.
+                elif et == "thread.started":
+                    thread_id = evt.get("thread_id")
+                    if thread_id:
+                        yield _meta_chunk("system.init", {
+                            "session_id": thread_id,
+                            "model": self.model,
+                            "cwd": self.cwd,
+                            "tools": [],
+                            "permission_mode": None,
+                            "cli": "codex",
+                        })
                 elif et == "item.started":
                     item = evt.get("item") or {}
                     it = item.get("type")
