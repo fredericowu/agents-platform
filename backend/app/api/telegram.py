@@ -2362,11 +2362,42 @@ def _set_bot_display_name(token: str, session_name: str) -> None:
 
 
 def _current_target_name(bot_id: str, chat_id: str) -> str:
+    default_name = f"Telegram {bot_id} / chat {chat_id}"
     with session_scope() as ss:
         tgt = (ss.query(Target)
                .filter(Target.slug == f"tg-{bot_id}-{chat_id}")
                .first())
-        return (tgt.name if tgt else "") or ""
+        name = (tgt.name if tgt else "") or ""
+        return "" if name == default_name else name
+
+
+def _session_own_name(session_id: str) -> str:
+    """The name that actually belongs to this session_id's CliSession row —
+    the source of truth for display, independent of the chat-level Target
+    cache (which can otherwise leak a stale name from a session that was
+    active before a /agent switch)."""
+    with session_scope() as ss:
+        from ..models import CliSession as _CS
+        cli_sess = ss.query(_CS).filter(_CS.session_id == session_id).first()
+        return (cli_sess.name if cli_sess else "") or ""
+
+
+def _sync_target_name_to_session(bot_id: str, chat_id: str, session_id: str | None) -> None:
+    """Re-point this chat's Target.name cache at whichever session is now
+    active, so /status and _save_session_id don't keep showing/propagating a
+    name left over from a session that was active before a /agent switch.
+    ``session_id=None`` clears back to the default (pending "<new>" state)."""
+    with session_scope() as ss:
+        tgt = (ss.query(Target)
+               .filter(Target.slug == f"tg-{bot_id}-{chat_id}")
+               .first())
+        default_name = f"Telegram {bot_id} / chat {chat_id}"
+        new_name = _session_own_name(session_id) if session_id else ""
+        if tgt:
+            tgt.name = new_name or default_name
+        elif new_name:
+            ss.add(Target(slug=f"tg-{bot_id}-{chat_id}", name=new_name,
+                          source_kind="telegram", source_ref=f"{bot_id}:{chat_id}"))
 
 
 def _send_rename_prompt(token: str, chat_id: str, bot_id: str, current_name: str) -> None:
@@ -2534,6 +2565,10 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
             msg_id = cq_msg.get("message_id")
             if chosen_sid == "__new__":
                 _set_session_override(bot_id, cq_chat_id, None)
+                # No session_id exists yet (minted only on the first message
+                # after this) — clear the stale name cache and show <new>.
+                _reset_target_name(bot_id, cq_chat_id)
+                _set_bot_display_name(bot.token, "<new>")
                 if msg_id:
                     _edit_message_text(bot.token, cq_chat_id, msg_id,
                                        "➕ Starting a <b>new session</b> — previous context cleared.")
@@ -2541,6 +2576,12 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
                               "🟢 Ready! Send a message to start a new conversation.")
             else:
                 _set_session_override(bot_id, cq_chat_id, chosen_sid)
+                # Re-point the name cache at the session we just switched to —
+                # otherwise it keeps showing/propagating whatever session was
+                # active before this switch (the "Name:" staleness bug).
+                _sync_target_name_to_session(bot_id, cq_chat_id, chosen_sid)
+                sess_name = _session_own_name(chosen_sid)
+                _set_bot_display_name(bot.token, sess_name or chosen_sid)
                 short = chosen_sid[:8] + "…"
                 if msg_id:
                     _edit_message_text(bot.token, cq_chat_id, msg_id,
@@ -2625,14 +2666,16 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
                               else base_msg)
             else:
                 _reset_target_name(bot_id, chat_id)
-                _set_bot_display_name(bot.token, "")  # back to the bot's base name
+                # No session_id yet — it's only minted on the first message —
+                # so show the pending-session marker, not the bare base name.
+                _set_bot_display_name(bot.token, "<new>")
                 _send_message(bot.token, chat_id, base_msg)
             return {"ok": True, "reason": "slash /new"}
 
         if cmd == "start":
             _reset_session(bot_id, chat_id)
             _reset_target_name(bot_id, chat_id)
-            _set_bot_display_name(bot.token, "")  # back to the bot's base name
+            _set_bot_display_name(bot.token, "<new>")
             _send_message(bot.token, chat_id,
                           "👋 Hi! I'm your Agents Platform agent. "
                           "Send me a message to get started.")
@@ -2655,13 +2698,20 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
                     last_run_id = last_run.id if last_run else None
             effective_slug = slug_override or bot.agent_slug or "(none)"
             override_note = " (override)" if slug_override else ""
-            name = _current_target_name(bot_id, chat_id)
             if not sid:
+                # No session_id minted yet (only happens on the first
+                # message) — show any pending /new <name>, else <new>.
+                pending_name = _current_target_name(bot_id, chat_id) or "<new>"
                 _send_message(bot.token, chat_id,
                               "📭 No active session.\n"
+                              f"Name: <code>{_md_to_html(pending_name)}</code>\n"
                               f"Agent: <code>{effective_slug}</code>{override_note}\n"
                               "Send any message to start one.")
             else:
+                # Read the session's own name directly rather than the
+                # chat-level Target cache, which can otherwise show a name
+                # left over from a session that was active before a switch.
+                name = _session_own_name(sid)
                 name_line = f"Name: <code>{_md_to_html(name)}</code>\n" if name else ""
                 run_line = f"Run id: <code>{last_run_id}</code>\n" if last_run_id else ""
                 _send_message(bot.token, chat_id,
