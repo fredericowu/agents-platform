@@ -88,6 +88,14 @@ async def client_ws(ws: WebSocket, client_id: str):
             "connected_at": connected_clients[client_id]["connected_at"],
         })
 
+        # Bring up any tunnels declared on this profile now that the agent
+        # is reachable — no separate "sube a VPN aí" step needed.
+        with session_scope() as s:
+            row = s.get(RemoteAgentRow, client_id)
+            profile_tunnels = json.loads(row.tunnels) if row and row.tunnels else []
+        if profile_tunnels:
+            await _apply_tunnels_for(client_id, profile_tunnels)
+
         while True:
             try:
                 raw = await asyncio.wait_for(ws.receive_text(), timeout=40)
@@ -145,6 +153,7 @@ async def client_ws(ws: WebSocket, client_id: str):
         pass
     finally:
         connected_clients.pop(client_id, None)
+        await _apply_tunnels_for(client_id, [])  # free the ports — agent is unreachable
         await _broadcast_ui({"type": "agent_disconnected", "agent_id": client_id})
 
 
@@ -179,15 +188,25 @@ async def ui_ws(ws: WebSocket):
 
 def _agent_with_status(row: RemoteAgentRow) -> dict:
     conn_data = connected_clients.get(row.id)
+    try:
+        tunnels = json.loads(row.tunnels) if row.tunnels else []
+    except (TypeError, ValueError):
+        tunnels = []
     return {
         "id": row.id,
         "name": row.name,
         "description": row.description,
         "created_at": row.created_at,
+        "tunnels": tunnels,
         "connected": conn_data is not None,
         "info": conn_data["info"] if conn_data else None,
         "connected_at": conn_data["connected_at"] if conn_data else None,
     }
+
+
+async def _apply_tunnels_for(client_id: str, tunnels: list) -> None:
+    from .tunnels import apply_profile_tunnels
+    await apply_profile_tunnels(client_id, tunnels)
 
 
 # ── REST: Clients ─────────────────────────────────────────────────────────────
@@ -510,9 +529,16 @@ def update_linux_script():
 
 # ── REST: Remote Agents CRUD ──────────────────────────────────────────────────
 
+class TunnelSpec(BaseModel):
+    name: str = ""
+    target_port: int
+    public_port: int
+
+
 class RemoteAgentBody(BaseModel):
     name: str
     description: str = ""
+    tunnels: list[TunnelSpec] = []
 
 
 @router.get("/api/remote-agents")
@@ -523,13 +549,19 @@ def list_remote_agents():
 
 
 @router.post("/api/remote-agents", status_code=201)
-def create_remote_agent(body: RemoteAgentBody):
+async def create_remote_agent(body: RemoteAgentBody):
     with session_scope() as s:
         row = RemoteAgentRow(id=str(_uuid.uuid4()), name=body.name,
-                             description=body.description, created_at=now_epoch())
+                             description=body.description,
+                             tunnels=json.dumps([t.model_dump() for t in body.tunnels]),
+                             created_at=now_epoch())
         s.add(row)
         s.flush()
-        return _agent_with_status(row)
+        result = _agent_with_status(row)
+    # Immediate effect if this agent already happens to be connected under
+    # this id (unusual for a fresh profile, but keeps create/update symmetric).
+    await _apply_tunnels_for(result["id"], result["tunnels"])
+    return result
 
 
 @router.get("/api/remote-agents/{agent_id}")
@@ -542,15 +574,19 @@ def get_remote_agent(agent_id: str):
 
 
 @router.put("/api/remote-agents/{agent_id}")
-def update_remote_agent(agent_id: str, body: RemoteAgentBody):
+async def update_remote_agent(agent_id: str, body: RemoteAgentBody):
     with session_scope() as s:
         row = s.get(RemoteAgentRow, agent_id)
         if not row:
             raise HTTPException(404, "Agent not found")
         row.name = body.name
         row.description = body.description
+        row.tunnels = json.dumps([t.model_dump() for t in body.tunnels])
         s.flush()
-        return _agent_with_status(row)
+        result = _agent_with_status(row)
+    # Takes effect immediately — no need for the agent to reconnect.
+    await _apply_tunnels_for(agent_id, result["tunnels"])
+    return result
 
 
 @router.delete("/api/remote-agents/{agent_id}")

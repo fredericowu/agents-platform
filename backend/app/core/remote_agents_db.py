@@ -12,7 +12,7 @@ import time
 from contextlib import contextmanager
 from typing import Iterator
 
-from sqlalchemy import Integer, String, Text, create_engine
+from sqlalchemy import Integer, String, Text, create_engine, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from ..config import settings
@@ -28,6 +28,10 @@ class RemoteAgentRow(Base):
     name: Mapped[str] = mapped_column(String)
     description: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[int] = mapped_column(Integer)
+    # JSON-encoded list of {name, target_port, public_port} — ports this
+    # profile exposes via the WS tunnel (see api/tunnels.py). Applied
+    # immediately on save and on every agent (re)connect.
+    tunnels: Mapped[str] = mapped_column(Text, default="[]")
 
 
 class ConfigRow(Base):
@@ -55,6 +59,13 @@ def session_scope() -> Iterator[Session]:
 
 def init_db() -> None:
     Base.metadata.create_all(engine)
+    # create_all() only creates missing tables, not missing columns on
+    # existing ones — `tunnels` was added after remote_agents already
+    # existed in production, so add it explicitly, idempotently.
+    with engine.begin() as conn:
+        conn.execute(text(
+            "ALTER TABLE remote_agents ADD COLUMN IF NOT EXISTS tunnels TEXT DEFAULT '[]'"
+        ))
     with session_scope() as s:
         if not s.get(ConfigRow, "mcp_api_key"):
             s.add(ConfigRow(key="mcp_api_key", value=secrets.token_urlsafe(32)))

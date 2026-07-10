@@ -8,10 +8,17 @@ import {
 } from "lucide-react";
 // ── Types ────────────────────────────────────────────────────────────────────
 
+interface TunnelSpec {
+  name: string;
+  target_port: number;
+  public_port: number;
+}
+
 interface RemoteAgent {
   id: string;
   name: string;
   description: string;
+  tunnels: TunnelSpec[];
   connected: boolean;
   info: Record<string, unknown> | null;
   connected_at: number | null;
@@ -168,6 +175,83 @@ function InfoRow({ icon, label, value, mono }: { icon: React.ReactNode; label: s
   );
 }
 
+// ── Tunnels section ──────────────────────────────────────────────────────────
+//
+// Ports this profile exposes via the WS tunnel (see backend api/tunnels.py) —
+// no VPN, no second service. Saving PUTs the whole agent (name/description
+// kept as-is) so the change takes effect immediately: the backend opens/
+// closes the corresponding TCP listeners the moment this request lands, and
+// again automatically every time this agent (re)connects.
+
+function TunnelsSection({ agent, onUpdated }: {
+  agent: RemoteAgent;
+  onUpdated: (agent: RemoteAgent) => void;
+}) {
+  const [rows, setRows] = useState<TunnelSpec[]>(agent.tunnels);
+  const [saving, setSaving] = useState(false);
+  const dirty = JSON.stringify(rows) !== JSON.stringify(agent.tunnels);
+
+  function updateRow(i: number, field: keyof TunnelSpec, value: string) {
+    setRows(rs => rs.map((r, idx) => idx === i
+      ? { ...r, [field]: field === "name" ? value : (Number(value) || 0) }
+      : r));
+  }
+
+  function addRow() {
+    setRows(rs => [...rs, { name: "", target_port: 0, public_port: 0 }]);
+  }
+
+  function removeRow(i: number) {
+    setRows(rs => rs.filter((_, idx) => idx !== i));
+  }
+
+  async function save() {
+    setSaving(true);
+    try {
+      const res = await fetch(`/api/remote-agents/${agent.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: agent.name, description: agent.description, tunnels: rows }),
+      });
+      onUpdated(await res.json());
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="card" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <div className="section-label">Tunnels</div>
+      <div style={{ fontSize: 11, color: "var(--muted)" }}>
+        Expose a port on this agent's loopback (e.g. VNC on 5900) through a public port — no VPN, applied immediately on save.
+      </div>
+      {rows.map((r, i) => (
+        <div key={i} style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <input placeholder="name (e.g. vnc)" value={r.name}
+            onChange={e => updateRow(i, "name", e.target.value)}
+            style={{ flex: 1, minWidth: 0 }} />
+          <input placeholder="local port" type="number" value={r.target_port || ""}
+            onChange={e => updateRow(i, "target_port", e.target.value)}
+            style={{ width: 90 }} />
+          <span style={{ color: "var(--muted)", fontSize: 12 }}>→</span>
+          <input placeholder="public port" type="number" value={r.public_port || ""}
+            onChange={e => updateRow(i, "public_port", e.target.value)}
+            style={{ width: 90 }} />
+          <button className="btn-icon btn-danger" onClick={() => removeRow(i)} title="Remove"><Trash2 size={13} /></button>
+        </div>
+      ))}
+      <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+        <button type="button" className="btn btn-ghost" onClick={addRow}><Plus size={13} />Add tunnel</button>
+        {dirty && (
+          <button type="button" className="btn btn-primary" onClick={save} disabled={saving}>
+            {saving ? "Saving…" : "Save"}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── Agent Info panel ─────────────────────────────────────────────────────────
 
 function AgentInfo({ agent, serverBase, onDelete, onUpdated }: {
@@ -190,10 +274,12 @@ function AgentInfo({ agent, serverBase, onDelete, onUpdated }: {
   }
 
   async function saveEdit() {
+    // Full replace — must carry the current tunnels along or this save
+    // (name/description only) would wipe them out.
     const res = await fetch(`/api/remote-agents/${agent.id}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: editName, description: editDesc }),
+      body: JSON.stringify({ name: editName, description: editDesc, tunnels: agent.tunnels }),
     });
     onUpdated(await res.json());
     setEditing(false);
@@ -257,6 +343,8 @@ function AgentInfo({ agent, serverBase, onDelete, onUpdated }: {
         <div className="section-label">Profile UUID</div>
         <code className="mono" style={{ fontSize: 12, color: "var(--muted)" }}>{agent.id}</code>
       </div>
+
+      <TunnelsSection agent={agent} onUpdated={onUpdated} />
 
       {/* System info (connected only) */}
       {agent.connected && (
