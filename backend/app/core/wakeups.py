@@ -171,7 +171,7 @@ async def _rerun_and_deliver(log_id: str, *, agent_slug: str, prompt: str, sessi
             err = (result or {}).get("error") or "run did not succeed"
         elif out and fired_run_id:
             if channel == "watch":
-                await _deliver_watch(initiator_id, out)
+                await _deliver_watch(initiator_id, out, fired_run_id)
             else:
                 from ..api.telegram import deliver_recovered_run
                 await deliver_recovered_run(fired_run_id, out)
@@ -291,10 +291,20 @@ def rearm_pending_agent_callbacks() -> int:
     return len(ids)
 
 
-async def _deliver_watch(device_session_id: str, text: str) -> None:
+async def _deliver_watch(device_session_id: str, text: str, run_id: str = "") -> None:
     """Ship a wakeup reply to a glasses/watch/iOS session via awserv, which
     owns those devices: appends to the shared chat history, broadcasts over
-    the session WebSocket and speaks it (TTS) if a client is connected."""
+    the session WebSocket and speaks it (TTS) if a client is connected.
+
+    ``run_id`` (this wakeup's own fired run) MUST be forwarded — awserv's
+    agent_push() stamps it as `hist_msg_id=ap-<run_id>:out` on the live
+    broadcast (poll + instant silent push). Without it, awserv falls back to
+    a local `db-<row>` id for the live delivery, while a later history
+    refetch (_ap_history) reconstructs this same reply with the real
+    `ap-<run_id>:out` id — two different ids for one reply defeats the
+    Watch's seenMsgIds dedup and the reply gets spoken twice (duplicate
+    playback report, 2026-07-11).
+    """
     import os
 
     import httpx
@@ -314,7 +324,7 @@ async def _deliver_watch(device_session_id: str, text: str) -> None:
         pass
     async with httpx.AsyncClient(timeout=60.0) as c:
         r = await c.post(f"{awserv}/api/meta/agent_push",
-                         json={"session_id": device_session_id, "text": text},
+                         json={"session_id": device_session_id, "text": text, "run_id": run_id},
                          headers=headers)
         r.raise_for_status()
         log.info("watch wakeup delivered to session %s: %s", device_session_id, r.json())

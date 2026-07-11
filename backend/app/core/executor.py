@@ -809,6 +809,15 @@ async def _run_agent_impl(
                                 with _scope() as _cs:
                                     if not _cs.query(_CliSession).filter(_CliSession.session_id == _sid).first():
                                         _cs.add(_CliSession(session_id=_sid, name="", description=""))
+                                # Push the newly-known session_id live — otherwise a Runs
+                                # screen already open when the run started never sees it
+                                # (the only other run_update broadcasts are at start, before
+                                # session_id exists, and at terminal state).
+                                with session_scope() as _ss2:
+                                    _r2 = _ss2.query(Run).filter(Run.id == run_id).first()
+                                    if _r2:
+                                        from .events import _run_to_ws_dict, ws_broadcast
+                                        asyncio.create_task(ws_broadcast("run_update", _run_to_ws_dict(_r2)))
                     if chunk.delta:
                         if _t_first_token is None:
                             _t_first_token = _time.perf_counter()

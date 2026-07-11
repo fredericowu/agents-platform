@@ -1897,14 +1897,29 @@ def create_approval_request(body: ApprovalRequest, s: Session = Depends(get_sess
         "bot_token":   bot.token,
     }
 
+    # HTML, not legacy Markdown: `body.secret_name` (vault key names always
+    # look like `private_<user>_<host>`) and `body.reason` are arbitrary,
+    # caller-supplied strings that routinely contain underscores/asterisks —
+    # Telegram's legacy Markdown parser treats those as unescaped formatting
+    # delimiters and the whole sendMessage call 502s with "can't parse
+    # entities" the moment they don't happen to pair up evenly. That failure
+    # is silent to the caller (only logged server-side, see the except below)
+    # so a caller polling for approval just times out after 5 minutes with no
+    # visible reason — confirmed 2026-07-11 (3 consecutive real approval
+    # requests for a deploy_file vault key all 502'd this way, no message
+    # ever reached the admin's Telegram at all). HTML + html.escape on the
+    # dynamic parts sidesteps this entirely — only the fixed template text is
+    # ever un-escaped/tagged.
+    secret_html = html.escape(body.secret_name)
+    reason_html = html.escape(body.reason)
     if request_type == "agent_run":
         # Pure human-in-the-loop gate: no secret is fetched on approve, the
         # scope buttons (1 use / 10 / 60 min) don't apply — a run is approved
         # once. Two buttons keep callback_data well under Telegram's 64 bytes.
         text = (
-            f"▶️ *Aprovação de execução*\n\n"
-            f"Recurso: `{body.secret_name}`\n"
-            f"Motivo: {body.reason}\n\n"
+            f"▶️ <b>Aprovação de execução</b>\n\n"
+            f"Recurso: <code>{secret_html}</code>\n"
+            f"Motivo: {reason_html}\n\n"
             f"O agente está aguardando sua liberação para rodar."
         )
         keyboard = [[
@@ -1913,9 +1928,9 @@ def create_approval_request(body: ApprovalRequest, s: Session = Depends(get_sess
         ]]
     else:
         text = (
-            f"🔐 *Aprovação de segredo*\n\n"
-            f"Segredo: `{body.secret_name}`\n"
-            f"Motivo: {body.reason}\n"
+            f"🔐 <b>Aprovação de segredo</b>\n\n"
+            f"Segredo: <code>{secret_html}</code>\n"
+            f"Motivo: {reason_html}\n"
             f"Escolha o escopo da liberação:"
         )
         # The approver picks the scope at approval time (1 use / 10 min / 60 min),
@@ -1936,7 +1951,7 @@ def create_approval_request(body: ApprovalRequest, s: Session = Depends(get_sess
             result = _tg(bot.token, "sendMessage",
                          chat_id=chat_id,
                          text=text,
-                         parse_mode="Markdown",
+                         parse_mode="HTML",
                          reply_markup={"inline_keyboard": keyboard})
             msg_id = (result.get("result") or {}).get("message_id")
             if msg_id:
@@ -2211,9 +2226,11 @@ def _handle_crispal_suggestion_callback(cq_id: str, cq_data: str, chat_id: str,
     callback_data: crispal_suggest:{action}:{suggestion_id}
 
     Pure backend action — no LLM in the loop. "send" delivers the exact
-    suggested_text via the Crispal MCP directly; "ignore" just records the
-    outcome; "edit" opens a web view (not yet built) to change the text
-    before sending. Every decision (and the actual final_text, if edited) is
+    suggested_text via the Crispal MCP directly; "ignore" records the outcome
+    and deletes BOTH the history bubbles and the approval message itself (the
+    CRISPAL group is meant to show only pending suggestions — no lingering
+    "ignorado" trace); "edit" opens a web view to change the text before
+    sending. Every decision (and the actual final_text, if edited) is
     persisted on the CrispalConversationSuggestion row — that row is the
     traceability log for future prompt/skill tuning.
     """
@@ -2242,10 +2259,18 @@ def _handle_crispal_suggestion_callback(cq_id: str, cq_data: str, chat_id: str,
         orig_text = row.suggested_text
 
         if action == "ignore":
+            # Unlike send/edit, ignore does NOT leave an edited-in-place record —
+            # the whole point of this group is to show only pending suggestions,
+            # so the approval message itself gets deleted too, not just the
+            # history bubbles above it (Frederico, 2026-07-10).
             row.status = "ignored"
             row.decided_at = datetime.utcnow()
             _delete_history_messages(bot_token, chat_id, row.history_message_ids)
-            _edit(f"🚫 Ignorado — {customer_name}\n\n{orig_text}")
+            if msg_id is not None:
+                try:
+                    _tg(bot_token, "deleteMessage", chat_id=chat_id, message_id=msg_id)
+                except Exception:
+                    pass
             return
 
         if action == "edit":

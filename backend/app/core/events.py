@@ -58,6 +58,7 @@ def _run_to_ws_dict(r: Any) -> dict[str, Any]:
         "node_id": r.node_id,
         "model_slug": r.model_slug,
         "source_slug": r.source_slug,
+        "session_id": r.session_id,
         "github_issue_number": getattr(r, "github_issue_number", None),
         "github_issue_url": getattr(r, "github_issue_url", None),
     }

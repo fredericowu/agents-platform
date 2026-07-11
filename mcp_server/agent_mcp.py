@@ -619,6 +619,27 @@ async def _list_tools() -> list[Tool]:
                           "properties": {"scan_limit": {"type": "integer",
                               "description": "How many recent agent runs to scan when "
                                              "grouping by bot. Default 500."}}}),
+        Tool(name="list_sessions",
+             description=("List CLI sessions (claude --resume sessions), most recently "
+                          "updated first — unlike `list_bots` (which only shows each "
+                          "agent's SINGLE currently-active session), this returns the full "
+                          "session HISTORY for an agent. Each row: session_id, name "
+                          "(user-renamed label, if any), description, run_count, "
+                          "last_run_at, last_status.\n\n"
+                          "Pass `source_slug` to scope to one agent/workflow (e.g. "
+                          "'crispal-dev-sonnet') — only sessions with at least one run "
+                          "from that slug are returned. Pass `q` to search session_id/"
+                          "name/description. Omit both to list across every agent."),
+             inputSchema={"type": "object",
+                          "properties": {
+                              "source_slug": {"type": "string",
+                                  "description": "Only sessions with at least one run from "
+                                                 "this agent/workflow slug (e.g. 'crispal-dev-sonnet')."},
+                              "q": {"type": "string",
+                                  "description": "Free-text search over session_id/name/description."},
+                              "limit": {"type": "integer",
+                                  "description": "Max rows to return. Default 100, max 500."},
+                          }}),
 
         # ----- Targets (overall delivery goals) -----
         Tool(name="list_targets",
@@ -1298,6 +1319,14 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
                 if rr.status_code == 200:
                     row["runs"] = [{"run_id": rn["id"], "status": rn["status"]} for rn in rr.json()]
             return _ok(list(bots.values()))
+        if name == "list_sessions":
+            params = {"limit": str(args.get("limit") or 100)}
+            if args.get("source_slug"):
+                params["source_slug"] = args["source_slug"]
+            if args.get("q"):
+                params["q"] = args["q"]
+            r = await c.get(f"{BASE}/api/sessions", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "wait_run":
             # Use a separate client with a larger timeout — the server itself
             # waits up to timeout_s, and we need our HTTP read budget to cover it.

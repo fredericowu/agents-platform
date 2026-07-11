@@ -71,6 +71,7 @@ export type Run = {
   model_slug: string | null;
   target_id: string | null;
   source_slug: string | null;
+  session_id: string | null;
   retro_score_summary?: RetroScoreSummary | null;
 };
 
@@ -415,7 +416,7 @@ export const api = {
   providerInfo: () => call<Record<string, { label: string; fields: string[]; env?: string[] }>>(
     "/api/models/providers/info"),
 
-  listRuns: (limit = 50, kind?: string, opts: { rootsOnly?: boolean; q?: string; targetId?: string; targetSlug?: string; summary?: boolean } = {}) => {
+  listRuns: (limit = 50, kind?: string, opts: { rootsOnly?: boolean; q?: string; targetId?: string; targetSlug?: string; summary?: boolean; sessionId?: string } = {}) => {
     const params = new URLSearchParams({ limit: String(limit) });
     if (kind) params.set("kind", kind);
     if (opts.rootsOnly) params.set("roots_only", "true");
@@ -423,6 +424,7 @@ export const api = {
     if (opts.targetId) params.set("target_id", opts.targetId);
     if (opts.targetSlug) params.set("target_slug", opts.targetSlug);
     if (opts.summary) params.set("summary", "true");
+    if (opts.sessionId) params.set("session_id", opts.sessionId);
     return call<Run[]>(`/api/runs?${params}`);
   },
   getRun: (id: string) => call<Run>(`/api/runs/${id}`),

@@ -51,6 +51,7 @@ export default function RunDetail() {
   const [overrideRationale, setOverrideRationale] = useState("");
   const [overrideSaving, setOverrideSaving] = useState(false);
   const [expandedEvidence, setExpandedEvidence] = useState<Set<string>>(new Set());
+  const [resumedFrom, setResumedFrom] = useState<string | null>(null);
 
   // Initial load
   useEffect(() => {
@@ -71,6 +72,19 @@ export default function RunDetail() {
       api.listRunArtefacts(id).then(setArtefacts).catch(() => setArtefacts([]));
     }
   }, [id]);
+
+  // Was this run a `--resume` of an earlier one? Same session_id, earlier
+  // started_at, different run id — the CLI keeps one session_id across resumes
+  // (see executor.py), so a prior run with that id means this one continued it.
+  useEffect(() => {
+    if (!run?.session_id) { setResumedFrom(null); return; }
+    api.listRuns(50, undefined, { sessionId: run.session_id }).then(sessionRuns => {
+      const earlier = sessionRuns
+        .filter(r => r.id !== run.id && new Date(r.started_at).getTime() < new Date(run.started_at).getTime())
+        .sort((a, b) => new Date(a.started_at).getTime() - new Date(b.started_at).getTime())[0];
+      setResumedFrom(earlier ? earlier.id : null);
+    }).catch(() => setResumedFrom(null));
+  }, [run?.id, run?.session_id, run?.started_at]);
 
   useEffect(() => {
     if (!id) return;
@@ -209,6 +223,16 @@ export default function RunDetail() {
       {run.initiator_id && <> · <span className="kbd">{run.initiator_id}</span></>}
       {" · "}{run.kind}:{run.target_slug}
       {run.model_slug && <> · model <span className="kbd">{run.model_slug}</span></>}
+      {run.session_id && (
+        <> · session <span className="kbd" data-testid="run-session-id" title={run.session_id}>{run.session_id}</span>
+          {resumedFrom && (
+            <Link to={`/runs/${resumedFrom}`} className="badge badge-info ml-1" data-testid="run-resumed-badge"
+                  title="resumed from an earlier run's session">
+              resumed
+            </Link>
+          )}
+        </>
+      )}
     </span>
   );
 

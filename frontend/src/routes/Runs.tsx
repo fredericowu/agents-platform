@@ -18,6 +18,23 @@ function ScoreBadge({ summary }: { summary?: RetroScoreSummary | null }) {
   return <span className={`badge ${cls}`} title={`overall retro score: ${score}`}>{score}</span>;
 }
 
+// For each session_id in the current page of runs, find the earliest run (by
+// started_at) that used it — any later run sharing that session_id is a resume
+// of it (the CLI keeps the same session_id across `--resume`, see executor.py).
+function firstRunPerSession(runs: Run[]): Record<string, string> {
+  const first: Record<string, Run> = {};
+  for (const r of runs) {
+    if (!r.session_id) continue;
+    const cur = first[r.session_id];
+    if (!cur || new Date(r.started_at).getTime() < new Date(cur.started_at).getTime()) {
+      first[r.session_id] = r;
+    }
+  }
+  const out: Record<string, string> = {};
+  for (const sid in first) out[sid] = first[sid].id;
+  return out;
+}
+
 export default function Runs() {
   const [runs, setRuns] = useState<Run[]>([]);
   const [kind, setKind] = useState<string>("");
@@ -96,6 +113,7 @@ export default function Runs() {
               <th className="py-2 pr-2">Target</th>
               <th className="py-2 pr-2">initiator</th>
               <th className="py-2 pr-2">model</th>
+              <th className="py-2 pr-2">session</th>
               <th className="py-2 pr-2">status</th>
               <th className="py-2 pr-2">score</th>
               <th className="py-2 pr-2">tokens</th>
@@ -104,7 +122,7 @@ export default function Runs() {
             </tr>
           </thead>
           <tbody>
-            {runs.map(r => (
+            {(() => { const firstBySession = firstRunPerSession(runs); return runs.map(r => (
               <tr key={r.id} className="border-t border-line" data-testid={`runs-row-${r.id.slice(0,8)}`}>
                 <td className="py-2 pr-2">
                   <Link to={`/runs/${r.id}`} className="font-mono">{r.id.slice(0, 12)}</Link>
@@ -132,6 +150,18 @@ export default function Runs() {
                 <td className="py-2 pr-2 text-xs">
                   <ModelBadge slug={r.model_slug} />
                 </td>
+                <td className="py-2 pr-2 text-xs">
+                  {r.session_id ? (
+                    <>
+                      <span className="kbd" title={r.session_id}>{r.session_id.slice(0, 8)}</span>
+                      {firstBySession[r.session_id] && firstBySession[r.session_id] !== r.id && (
+                        <span className="badge badge-info ml-1" title="resumed from an earlier run's session">resumed</span>
+                      )}
+                    </>
+                  ) : (
+                    <span className="text-muted">—</span>
+                  )}
+                </td>
                 <td className="py-2 pr-2"><StatusBadge status={r.status} /></td>
                 <td className="py-2 pr-2"><ScoreBadge summary={r.retro_score_summary} /></td>
                 <td className="py-2 pr-2 text-muted">{r.tokens_in}/{r.tokens_out}</td>
@@ -148,7 +178,7 @@ export default function Runs() {
                   )}
                 </td>
               </tr>
-            ))}
+            )); })()}
           </tbody>
         </table>
       </div>
