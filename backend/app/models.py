@@ -551,6 +551,27 @@ class CrispalConversationSuggestion(Base):
     decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
+class CrispalWhatsappMessage(Base):
+    """One WhatsApp Cloud API message for the Crispal store, in or out.
+
+    Unlike Facebook/Instagram (Graph API supports pulling full conversation
+    history on demand), WhatsApp Cloud API only pushes messages via webhook —
+    there is no "list conversations" endpoint. This table is therefore the
+    only source of conversation history, populated by the webhook receiver
+    (backend/app/api/whatsapp.py) for inbound messages and by the
+    whatsapp_send_message MCP tool for outbound ones."""
+    __tablename__ = "crispal_whatsapp_messages"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    wa_message_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    direction: Mapped[str] = mapped_column(String)          # in | out
+    from_number: Mapped[str] = mapped_column(String, index=True)  # customer's E.164 number either way
+    contact_name: Mapped[str] = mapped_column(String, default="")
+    text: Mapped[str] = mapped_column(Text, default="")
+    media_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    raw: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
 class CrispalSuggestionFeedback(Base):
     """Human explanation of *why* a suggested reply was edited and what the
     correct behavior would have been — captured alongside the edit itself

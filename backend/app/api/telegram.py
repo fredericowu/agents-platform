@@ -26,8 +26,10 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from ..core.security import get_setting
 from ..db import get_session, session_scope
-from ..models import (Agent, CrispalConversationSuggestion, CrispalSuggestionFeedback, Run, RunEvent,
+from ..models import (Agent, CrispalConversationSuggestion, CrispalSuggestionFeedback,
+                      CrispalWhatsappMessage, Run, RunEvent,
                       Target, TelegramBot, TelegramInboundMessage, TelegramSession)
 
 log = logging.getLogger("ap.telegram")
@@ -1547,38 +1549,74 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
                     _save_session_id(bot.id, chat_id, run_row.session_id, token=token)
 
             # If the run succeeded (docker exited 0) but produced no tokens/text
-            # while trying to resume a session, the session is stale. Reset and
-            # retry once with a fresh session so the user gets a response.
+            # while trying to resume a session, either the session is genuinely
+            # stale/corrupt, or this was a transient docker-launch failure racing
+            # a just-finished run's teardown (e.g. rc=125 right after an /abort
+            # kill — see kb memory fix-abort-context-loss-2026-07-12.md). Retry
+            # resuming the SAME session a few times with backoff before giving up
+            # on it, so a transient hiccup doesn't silently discard conversation
+            # history.
             tokens_in = result.get("tokens_in", 0) or 0
             if (not output_text and tokens_in == 0 and session_id
                     and status in ("success", "completed")):
-                log.warning("dispatch: stale session %s for bot=%s chat=%s — resetting and retrying",
-                            session_id, bot.id, chat_id)
-                _reset_session(bot.id, chat_id)
-                retry_run_id = str(uuid4())
-                _coro2 = run_agent(
-                    agent_slug,
-                    full_input,
-                    run_id=retry_run_id,
-                    target_id=target_id,
-                    session_id=None,  # fresh session
-                    initiator_kind="telegram",
-                    initiator_id=f"{bot.id}:{chat_id}",
-                    proc_msg_id=str(proc_msg_id) if proc_msg_id else None,
-                )
-                if _MAIN_LOOP is not None:
-                    result = asyncio.run_coroutine_threadsafe(_coro2, _MAIN_LOOP).result(timeout=1860)
-                else:
-                    result = asyncio.run(_coro2)
-                run_id = retry_run_id
-                output_text = result.get("reply") or result.get("text", "")
-                status = result.get("status", "unknown")
+                RESUME_BACKOFF_S = (1, 2, 4)
+                for attempt, delay in enumerate(RESUME_BACKOFF_S, start=1):
+                    _time.sleep(delay)
+                    log.warning("dispatch: empty resume of session %s for bot=%s chat=%s — "
+                                "retry %d/%d before falling back to a fresh session",
+                                session_id, bot.id, chat_id, attempt, len(RESUME_BACKOFF_S))
+                    retry_run_id = str(uuid4())
+                    _coro_resume = run_agent(
+                        agent_slug,
+                        full_input,
+                        run_id=retry_run_id,
+                        target_id=target_id,
+                        session_id=session_id,  # retry the SAME session first
+                        initiator_kind="telegram",
+                        initiator_id=f"{bot.id}:{chat_id}",
+                        proc_msg_id=str(proc_msg_id) if proc_msg_id else None,
+                    )
+                    if _MAIN_LOOP is not None:
+                        result = asyncio.run_coroutine_threadsafe(_coro_resume, _MAIN_LOOP).result(timeout=1860)
+                    else:
+                        result = asyncio.run(_coro_resume)
+                    run_id = retry_run_id
+                    output_text = result.get("reply") or result.get("text", "")
+                    status = result.get("status", "unknown")
+                    tokens_in = result.get("tokens_in", 0) or 0
+                    if output_text or tokens_in or status not in ("success", "completed"):
+                        break  # session responded — stop retrying, it wasn't actually stale
+
+                if not output_text and tokens_in == 0 and status in ("success", "completed"):
+                    log.warning("dispatch: session %s stayed empty after %d resume retries "
+                                "for bot=%s chat=%s — resetting and starting fresh",
+                                session_id, len(RESUME_BACKOFF_S), bot.id, chat_id)
+                    _reset_session(bot.id, chat_id)
+                    retry_run_id = str(uuid4())
+                    _coro2 = run_agent(
+                        agent_slug,
+                        full_input,
+                        run_id=retry_run_id,
+                        target_id=target_id,
+                        session_id=None,  # fresh session
+                        initiator_kind="telegram",
+                        initiator_id=f"{bot.id}:{chat_id}",
+                        proc_msg_id=str(proc_msg_id) if proc_msg_id else None,
+                    )
+                    if _MAIN_LOOP is not None:
+                        result = asyncio.run_coroutine_threadsafe(_coro2, _MAIN_LOOP).result(timeout=1860)
+                    else:
+                        result = asyncio.run(_coro2)
+                    run_id = retry_run_id
+                    output_text = result.get("reply") or result.get("text", "")
+                    status = result.get("status", "unknown")
+
                 if status in ("success", "completed"):
                     final_state = "done"
-                # Save the new session from the retry run
+                # Save whichever session ended up producing output (resumed or fresh)
                 with session_scope() as ss:
                     from ..models import Run as _Run
-                    retry_row = ss.query(_Run).filter(_Run.id == retry_run_id).first()
+                    retry_row = ss.query(_Run).filter(_Run.id == run_id).first()
                     if retry_row and retry_row.session_id:
                         _save_session_id(bot.id, chat_id, retry_row.session_id, token=token)
 
@@ -2198,10 +2236,42 @@ def _crispal_upstream() -> dict:
     return cfg["mcpServers"]["crispal"]
 
 
+def _crispal_send_whatsapp_message(to: str, message: str) -> None:
+    """WhatsApp Cloud API has no MCP-side upstream like Facebook/Instagram
+    (that's the WordPress plugin's own tool) — send directly via Graph API
+    using the token stored in the settings table (see aw_crispal.py's
+    whatsapp_send_message tool, which shares this same table)."""
+    token = get_setting("crispal_whatsapp_token", "")
+    if not token:
+        raise RuntimeError(
+            "WhatsApp not configured yet — set the 'crispal_whatsapp_token' setting "
+            "(System User token from Meta Business Settings)."
+        )
+    phone_number_id = get_setting("crispal_whatsapp_phone_number_id", "969014729625911")
+    r = httpx.post(
+        f"https://graph.facebook.com/v23.0/{phone_number_id}/messages",
+        json={"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": message}},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    body = r.json()
+    if "error" in body:
+        raise RuntimeError(f"WhatsApp send failed: {body['error'].get('message', body['error'])}")
+    with session_scope() as s:
+        s.add(CrispalWhatsappMessage(
+            wa_message_id=(body.get("messages") or [{}])[0].get("id"),
+            direction="out", from_number=to, contact_name="Sapataria Crispal",
+            text=message, raw=body,
+        ))
+
+
 def _crispal_send_message(platform: str, recipient_id: str, message: str, message_type: str) -> None:
     """Call the Crispal store's social_send_message tool directly (HTTP JSON-RPC).
     This is the ONLY place a real customer-facing message actually goes out —
     triggered by a human button tap, never by an LLM's own decision."""
+    if platform == "whatsapp":
+        _crispal_send_whatsapp_message(recipient_id, message)
+        return
     upstream = _crispal_upstream()
     payload = {
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
