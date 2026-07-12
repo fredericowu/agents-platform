@@ -2213,10 +2213,22 @@ def _handle_kanban_callback(cq_id: str, cq_data: str, chat_id: str,
                 _edit(f"❌ Target <code>{target_slug}</code> não existe no Agents Platform.")
                 return
             target_id = t.id
-        run_id = start_agent_run_bg(
-            agent_slug, input_text, target_id=target_id,
-            session_id=None, notion_task_id=page_id,
-        )
+
+        # start_agent_run_bg calls asyncio.create_task() internally, which needs
+        # a running loop *in the current thread*. This handler runs in a plain
+        # threading.Thread (see the aw_kanban: dispatch above), so schedule it on
+        # the app's main loop instead of calling it directly — same pattern used
+        # for _MAIN_LOOP elsewhere in this file (cross-thread asyncio calls).
+        async def _start_run():
+            return start_agent_run_bg(
+                agent_slug, input_text, target_id=target_id,
+                session_id=None, notion_task_id=page_id,
+            )
+
+        if _MAIN_LOOP is not None:
+            run_id = asyncio.run_coroutine_threadsafe(_start_run(), _MAIN_LOOP).result(timeout=30)
+        else:
+            run_id = asyncio.run(_start_run())
         _edit(f"▶ Executando <b>{_md_to_html(card_title)}</b>\n<code>run_id: {run_id}</code>")
     except Exception as exc:
         log.exception("kanban callback: error for page_id=%s", page_id)
