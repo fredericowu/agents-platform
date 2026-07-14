@@ -2158,13 +2158,177 @@ def _kanban_text_prop(page: dict, prop: str) -> str:
     return ""
 
 
+_KANBAN_BLOCK_TEXT_TYPES = ("paragraph", "heading_1", "heading_2", "heading_3",
+                             "bulleted_list_item", "numbered_list_item", "quote",
+                             "callout", "to_do")
+
+
+def _kanban_get_page_body_text(page_id: str) -> str:
+    """Flatten the card's page body into plain text — same block types and
+    pagination as awserv's `_get_page_body_text` (notion_kanban.py), kept in
+    sync so the Telegram-button dispatch path (this file) and the
+    Notion-webhook dispatch path (awserv) build the same prompt."""
+    try:
+        lines: list[str] = []
+        cursor = None
+        while True:
+            params = {"page_size": 100}
+            if cursor:
+                params["start_cursor"] = cursor
+            r = httpx.get(f"{_NOTION_API}/blocks/{page_id}/children",
+                          headers=_notion_headers(), params=params, timeout=10)
+            if not r.is_success:
+                log.warning("kanban callback: page body fetch failed for page=%s: %s %s",
+                            page_id, r.status_code, r.text[:200])
+                return ""
+            data = r.json()
+            for block in data.get("results", []):
+                btype = block.get("type", "")
+                if btype not in _KANBAN_BLOCK_TEXT_TYPES:
+                    continue
+                block_data = block.get(btype, {})
+                rich_text = block_data.get("rich_text", [])
+                text = "".join(t.get("plain_text", "") for t in rich_text)
+                if text.strip():
+                    lines.append(text.strip())
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+            if not cursor:
+                break
+        return "\n\n".join(lines)
+    except Exception:
+        log.exception("kanban callback: failed to fetch page body for page %s", page_id)
+        return ""
+
+
+def _kanban_get_all_comments_text(page_id: str) -> str:
+    """Fetch all comments on the page, oldest → newest, flattened to plain text."""
+    try:
+        texts: list[str] = []
+        cursor = None
+        while True:
+            params = {"block_id": page_id, "page_size": 100}
+            if cursor:
+                params["start_cursor"] = cursor
+            r = httpx.get(f"{_NOTION_API}/comments", headers=_notion_headers(),
+                          params=params, timeout=10)
+            if not r.is_success:
+                return "\n\n---\n\n".join(texts)
+            data = r.json()
+            for c in data.get("results", []):
+                text = "".join(t.get("plain_text", "") for t in c.get("rich_text", []))
+                if text.strip():
+                    texts.append(text.strip())
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+            if not cursor:
+                break
+        return "\n\n---\n\n".join(texts)
+    except Exception:
+        log.exception("kanban callback: failed to fetch comments for page %s", page_id)
+        return ""
+
+
+def _kanban_build_run_input(page_id: str, card_title: str) -> str:
+    """Same prompt shape as awserv's `_build_run_input` (notion_kanban.py) —
+    kept in sync so a Telegram-button approval and a Notion-webhook Ready
+    transition dispatch the identical prompt."""
+    body_text = _kanban_get_page_body_text(page_id)
+    comments_text = _kanban_get_all_comments_text(page_id)
+    parts = [
+        f'Kanban card: "{card_title}"',
+        f"page_id={page_id}",
+        "(same value as your $NOTION_TASK_ID env var — use either)",
+        f"Task content:\n\n{body_text or f'Execute task: {card_title}'}",
+    ]
+    if comments_text:
+        parts.append(f"Comment history (oldest → newest):\n\n{comments_text}")
+    return "\n\n".join(parts)
+
+
+def execute_kanban_card(page_id: str, agent_slug: str | None = None) -> dict:
+    """Move a Kanban card to In Progress and fire its agent run.
+
+    Idempotency guard: if the card is already "In Progress" (or any
+    further-along status — Ready to Test/Done/etc.), this is a no-op — it
+    returns without dispatching a second run. This lets both the Telegram
+    [▶ Executar] callback and awserv's `start_now` create-task path call the
+    same function without ever double-firing a run for the same card
+    (button tap racing a start_now call, or a duplicate call of either).
+
+    Returns {"ok": True, "run_id", "card_title", "agent_slug"} on dispatch,
+    or {"ok": False, "reason": ...} if skipped/invalid.
+    """
+    page = _kanban_get_page(page_id)
+    card_title = _kanban_text_prop(page, "Name")
+
+    status_prop = page.get("properties", {}).get("Status", {})
+    current_status = (status_prop.get("select") or {}).get("name", "")
+    statuses = _kanban_cfg().get("statuses", {})
+    in_progress = statuses.get("running", "In Progress")
+    backlog = statuses.get("backlog", "Backlog")
+    if current_status and current_status not in (backlog, statuses.get("ready", "Ready")):
+        log.info("execute_kanban_card: page=%s already status=%s — skipping duplicate dispatch",
+                  page_id, current_status)
+        return {"ok": False, "reason": "already dispatched", "status": current_status}
+
+    target_slug = _kanban_text_prop(page, "TargetSlug") or "kanban-tasks"
+    input_text = _kanban_build_run_input(page_id, card_title)
+    if not agent_slug:
+        agent_slug = _kanban_text_prop(page, "AgentSlug")
+    if not agent_slug:
+        return {"ok": False, "reason": f"card '{card_title}' has no AgentSlug set"}
+
+    # Move card to In Progress before firing the run
+    _kanban_update_status(page_id, in_progress)
+    log.info("execute_kanban_card: %s → %s, firing %s", page_id, in_progress, agent_slug)
+
+    # Resolve the target and fire the run through AP's own executor.
+    from ..core.executor import start_agent_run_bg
+    with session_scope() as s:
+        agent = s.query(Agent).filter(Agent.slug == agent_slug).first()
+        if not agent:
+            return {"ok": False, "reason": f"agent '{agent_slug}' does not exist in Agents Platform"}
+        t = s.query(Target).filter(Target.slug == target_slug).first()
+        if t is None:
+            return {"ok": False, "reason": f"target '{target_slug}' does not exist in Agents Platform"}
+        target_id = t.id
+
+    # start_agent_run_bg calls asyncio.create_task() internally, which needs
+    # a running loop *in the current thread*. Callers of this function may run
+    # in a plain threading.Thread (the Telegram callback dispatch) or a request
+    # handler with its own loop, so always schedule on the app's main loop —
+    # same cross-thread pattern used for _MAIN_LOOP elsewhere in this file.
+    async def _start_run():
+        return start_agent_run_bg(
+            agent_slug, input_text, target_id=target_id,
+            session_id=None, notion_task_id=page_id,
+        )
+
+    if _MAIN_LOOP is not None:
+        run_id = asyncio.run_coroutine_threadsafe(_start_run(), _MAIN_LOOP).result(timeout=30)
+    else:
+        run_id = asyncio.run(_start_run())
+
+    return {"ok": True, "run_id": run_id, "card_title": card_title, "agent_slug": agent_slug}
+
+
 def _handle_kanban_callback(cq_id: str, cq_data: str, chat_id: str,
                             msg_id: int | None, bot_token: str) -> None:
     """Process an aw_kanban:execute/skip callback_query button tap.
 
     callback_data:
-      aw_kanban:execute:{page_id}:{agent_slug}
+      aw_kanban:execute:{page_id}
       aw_kanban:skip:{page_id}
+
+    agent_slug is intentionally NOT embedded in callback_data — Telegram caps
+    callback_data at 64 bytes and "aw_kanban:execute:{uuid}:{agent_slug}"
+    overflows that for longer slugs (e.g. "coder-sonnet"), which Telegram
+    rejects wholesale with BUTTON_DATA_INVALID (no button ever gets sent).
+    agent_slug is looked up from the card's "AgentSlug" Notion property
+    instead (see below).
     """
     # Always clear the Telegram spinner first
     _answer_callback_query(bot_token, cq_id)
@@ -2186,50 +2350,12 @@ def _handle_kanban_callback(cq_id: str, cq_data: str, chat_id: str,
         return
 
     try:
-        page = _kanban_get_page(page_id)
-        card_title = _kanban_text_prop(page, "Name")
-        target_slug = _kanban_text_prop(page, "TargetSlug") or "kanban-tasks"
-        input_text = _kanban_text_prop(page, "Input") or f"Execute task: {card_title}"
-        if not agent_slug:
-            agent_slug = _kanban_text_prop(page, "AgentSlug")
-        if not agent_slug:
-            _edit(f"❌ Card <b>{_md_to_html(card_title)}</b> não tem AgentSlug definido.")
+        result = execute_kanban_card(page_id, agent_slug)
+        if not result.get("ok"):
+            _edit(f"❌ {result.get('reason', 'falha ao disparar run')}")
             return
-
-        # Move card to In Progress before firing the run
-        in_progress = _kanban_cfg().get("statuses", {}).get("running", "In Progress")
-        _kanban_update_status(page_id, in_progress)
-        log.info("kanban callback: approved %s → In Progress, firing %s", page_id, agent_slug)
-
-        # Resolve the target and fire the run through AP's own executor.
-        from ..core.executor import start_agent_run_bg
-        with session_scope() as s:
-            agent = s.query(Agent).filter(Agent.slug == agent_slug).first()
-            if not agent:
-                _edit(f"❌ Agente <code>{agent_slug}</code> não existe no Agents Platform.")
-                return
-            t = s.query(Target).filter(Target.slug == target_slug).first()
-            if t is None:
-                _edit(f"❌ Target <code>{target_slug}</code> não existe no Agents Platform.")
-                return
-            target_id = t.id
-
-        # start_agent_run_bg calls asyncio.create_task() internally, which needs
-        # a running loop *in the current thread*. This handler runs in a plain
-        # threading.Thread (see the aw_kanban: dispatch above), so schedule it on
-        # the app's main loop instead of calling it directly — same pattern used
-        # for _MAIN_LOOP elsewhere in this file (cross-thread asyncio calls).
-        async def _start_run():
-            return start_agent_run_bg(
-                agent_slug, input_text, target_id=target_id,
-                session_id=None, notion_task_id=page_id,
-            )
-
-        if _MAIN_LOOP is not None:
-            run_id = asyncio.run_coroutine_threadsafe(_start_run(), _MAIN_LOOP).result(timeout=30)
-        else:
-            run_id = asyncio.run(_start_run())
-        _edit(f"▶ Executando <b>{_md_to_html(card_title)}</b>\n<code>run_id: {run_id}</code>")
+        card_title = result.get("card_title", "")
+        _edit(f"▶ Executando <b>{_md_to_html(card_title)}</b>\n<code>run_id: {result.get('run_id')}</code>")
     except Exception as exc:
         log.exception("kanban callback: error for page_id=%s", page_id)
         try:
@@ -3196,6 +3322,26 @@ class KanbanFinding(BaseModel):
     summary: str = ""
 
 
+class KanbanExecuteCard(BaseModel):
+    page_id: str
+    agent_slug: str | None = None
+
+
+@router.post("/kanban/execute-card")
+def kanban_execute_card(body: KanbanExecuteCard):
+    """Fire a Kanban card's agent run directly, bypassing the Telegram button.
+
+    Called by awserv when a card is created with `start_now=true` (see
+    `create_task_endpoint` in notion_kanban.py) — same idempotency-guarded
+    `execute_kanban_card` used by the [▶ Executar] callback, so calling this
+    twice for the same page_id (or racing a Telegram approval) never fires a
+    second run.
+    """
+    if not body.page_id:
+        raise HTTPException(400, "page_id is required")
+    return execute_kanban_card(body.page_id, body.agent_slug)
+
+
 class KanbanNotify(BaseModel):
     findings: list[KanbanFinding] = []
 
@@ -3240,7 +3386,7 @@ def kanban_notify(body: KanbanNotify, s: Session = Depends(get_session)):
         text = "\n".join(lines)
         keyboard = {"inline_keyboard": [[
             {"text": "▶ Executar",
-             "callback_data": f"aw_kanban:execute:{f.page_id}:{f.agent_slug}"},
+             "callback_data": f"aw_kanban:execute:{f.page_id}"},
             {"text": "⏭ Pular",
              "callback_data": f"aw_kanban:skip:{f.page_id}"},
         ]]}
@@ -3251,6 +3397,43 @@ def kanban_notify(body: KanbanNotify, s: Session = Depends(get_session)):
             sent += 1
         except Exception:
             log.exception("kanban notify: send failed for page %s", f.page_id)
+
+    return {"ok": True, "sent": sent}
+
+
+class ReportNotify(BaseModel):
+    title: str = "Análise"
+    text: str = ""
+
+
+@router.post("/report")
+def report_notify(body: ReportNotify, s: Session = Depends(get_session)):
+    """Send a plain-text analysis report (header + chunked body) via the sysadmin bot.
+
+    Called by awserv (src/api/kanban_manager.send_report) — analista agents
+    (system-analyst, kb-curator) POST their end-of-run report here instead of
+    going through awserv's own (now dead, pre-migration) Telegram bot token.
+    Returns {ok, sent}.
+    """
+    bot = _sysadmin_bot(s)
+    if not bot:
+        raise HTTPException(503, "No sysadmin bot configured — set is_sysadmin on a bot")
+    admin_ids = bot.admin_user_ids or []
+    if not admin_ids:
+        raise HTTPException(503, "Sysadmin bot has no admin_user_ids configured")
+    chat_id = admin_ids[0]
+
+    sent = 0
+    try:
+        _tg(bot.token, "sendMessage", chat_id=chat_id, parse_mode="Markdown",
+            text=f"📊 *{body.title}*")
+        sent += 1
+        for chunk in _chunk_text(body.text):
+            _tg(bot.token, "sendMessage", chat_id=chat_id, parse_mode="Markdown", text=chunk)
+            sent += 1
+    except Exception:
+        log.exception("report notify: send failed")
+        raise HTTPException(502, "failed to deliver report to Telegram")
 
     return {"ok": True, "sent": sent}
 

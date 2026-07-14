@@ -51,6 +51,42 @@ init_db()
 router = APIRouter()
 
 
+def _resolve_row_id(client_id: str) -> str:
+    """Resolve `client_id` — which callers may pass as either a
+    RemoteAgentRow's stable `id` (UUID) or its human-readable `name`
+    (e.g. "macbook-fred") — to the row's canonical `id`.
+
+    CANONICAL IDENTIFIER RULE: `connected_clients` is always keyed by the
+    row's UUID `id`, never by name. `client_ws()` normalizes the WS
+    connection key through this same function on connect, so no matter
+    which string the client process was launched with (`--id <uuid>` or a
+    stale `--id <name>`), it always lands in `connected_clients` under the
+    same key. REST handlers below re-resolve on every call for the same
+    reason, since name -> id is a DB lookup, not a fixed mapping.
+
+    Falls back to the input unchanged when no row matches (e.g. an ad-hoc,
+    unregistered client_id) so that behavior is unaffected.
+
+    This exists because of a real incident (2026-07-12): a client connected
+    for months as client_id="macbook-fred" (its original `--id` arg, a
+    name). After a reinstall using the profile's DB UUID per (correct, but
+    previously unenforced) docs, it connected as client_id="<uuid>"
+    instead — a different dict key for the same physical machine.
+    `/api/clients/macbook-fred/exec` then 404'd with "Client not
+    connected" even though the machine was live the whole time, which
+    looked exactly like the machine being offline and wasted real
+    debugging time. See docs/knowledge_base/memory/remote-agents-external-install-page.md.
+    """
+    with session_scope() as s:
+        row = s.get(RemoteAgentRow, client_id)
+        if row:
+            return row.id
+        row = s.query(RemoteAgentRow).filter(RemoteAgentRow.name == client_id).first()
+        if row:
+            return row.id
+    return client_id
+
+
 async def _broadcast_ui(event: dict):
     """Send an event JSON to all connected UI WebSocket clients."""
     dead = set()
@@ -69,6 +105,13 @@ async def _broadcast_ui(event: dict):
 @router.websocket("/ws/client/{client_id}")
 async def client_ws(ws: WebSocket, client_id: str):
     await ws.accept()
+    # Normalize whatever identifier the client actually connected with (its
+    # registered name OR its DB UUID — clients SHOULD always use the UUID
+    # going forward, but this resolves either way) to the RemoteAgentRow's
+    # canonical id, so `connected_clients` is always keyed consistently
+    # regardless of which one the client process was launched with. See
+    # `_resolve_row_id` for why this matters.
+    client_id = _resolve_row_id(client_id)
     connected_clients[client_id] = {
         "ws": ws,
         "info": {},
@@ -96,11 +139,26 @@ async def client_ws(ws: WebSocket, client_id: str):
         if profile_tunnels:
             await _apply_tunnels_for(client_id, profile_tunnels)
 
+        # Consecutive 40s windows with zero inbound traffic (including no
+        # pong reply to our own ping below). Two in a row (~80s of total
+        # silence) means the client is unreachable even though the TCP
+        # connection hasn't errored out yet (e.g. a silent network black
+        # hole) — stop treating it as "connected" instead of lingering in
+        # `connected_clients` forever as a phantom live entry.
+        missed_pings = 0
         while True:
             try:
                 raw = await asyncio.wait_for(ws.receive_text(), timeout=40)
                 msg = json.loads(raw)
+                missed_pings = 0
             except asyncio.TimeoutError:
+                missed_pings += 1
+                if missed_pings >= 2:
+                    try:
+                        await ws.close(code=1000, reason="ping timeout")
+                    except Exception:
+                        pass
+                    break
                 await ws.send_text(json.dumps({"type": "ping"}))
                 continue
 
@@ -234,6 +292,7 @@ async def exec_on_client(client_id: str, req: ExecRequest):
     read line-by-line and print as they arrive instead of waiting for the
     whole command to finish.
     """
+    client_id = _resolve_row_id(client_id)
     client = connected_clients.get(client_id)
     if not client:
         raise HTTPException(404, "Client not connected")
@@ -283,6 +342,7 @@ class FsRequest(BaseModel):
 
 @router.post("/api/clients/{client_id}/fs")
 async def fs_op(client_id: str, req: FsRequest):
+    client_id = _resolve_row_id(client_id)
     client = connected_clients.get(client_id)
     if not client:
         raise HTTPException(404, "Client not connected")
@@ -338,6 +398,7 @@ async def upload_to_client(client_id: str, request: Request, path: str):
     request with 500 rather than silently returning a bad checksum. On
     success, the verified sha256 is included in the JSON response.
     """
+    client_id = _resolve_row_id(client_id)
     client = connected_clients.get(client_id)
     if not client:
         raise HTTPException(404, "Client not connected")
@@ -404,6 +465,7 @@ async def download_from_client(client_id: str, path: str):
     computed but the backend never checked). The spooled file is then served
     via a background-cleanup generator and removed once fully sent.
     """
+    client_id = _resolve_row_id(client_id)
     client = connected_clients.get(client_id)
     if not client:
         raise HTTPException(404, "Client not connected")

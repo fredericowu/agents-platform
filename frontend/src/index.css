@@ -114,6 +114,8 @@ input[type="checkbox"], input[type="radio"] {
 .react-flow__node.running { border-color: theme('colors.accent') !important; box-shadow: 0 0 0 3px rgba(88,166,255,0.25); }
 .react-flow__node.done    { border-color: theme('colors.ok') !important; }
 .react-flow__node.error   { border-color: theme('colors.err') !important; }
+.react-flow__node.source  { border-color: theme('colors.warn') !important; border-style: dashed !important; }
+.react-flow__node.group   { border-color: theme('colors.accent') !important; border-width: 2px !important; }
 .react-flow__node .react-flow__handle { background: theme('colors.line'); border: none; }
 .react-flow__edge-path { stroke: theme('colors.line') !important; stroke-width: 1.5 !important; }
 .react-flow__background { background: theme('colors.bg.DEFAULT') !important; }

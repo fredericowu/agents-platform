@@ -48,6 +48,7 @@ class Agent(Base):
     permissions: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)  # {"docker": true, "github": true, "share_network": false}  — share_network defaults True unless explicitly false
     inherit_from: Mapped[str | None] = mapped_column(String, nullable=True)  # slug of parent agent to inherit system_prompt from
     agent_config_slug: Mapped[str | None] = mapped_column(String, nullable=True)  # slug of an AgentConfig — when set, its permissions/extra_volumes/mcp_config win over the columns above
+    group_slug: Mapped[str | None] = mapped_column(String, nullable=True)  # slug of an AgentGroup — when set, AgentGroup.instructions is prepended to this agent's system_prompt at run time
     builtin: Mapped[bool] = mapped_column(Boolean, default=False)
     icon: Mapped[str] = mapped_column(String, default="bot")
     color: Mapped[str] = mapped_column(String, default="#58a6ff")
@@ -67,6 +68,27 @@ class AgentConfig(Base):
     mcp_config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     extra_volumes: Mapped[list[str]] = mapped_column(JSON, default=list)
     permissions: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # Per-agent override of the global "Auto-compact threshold (tokens)" setting
+    # (api/settings.py DEFAULT_AUTO_COMPACT_THRESHOLD_TOKENS). NULL inherits the
+    # global value; 0 disables auto-compact for agents using this config.
+    auto_compact_threshold_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class AgentGroup(Base):
+    """A named cluster of agents (e.g. "Coders") sharing a common set of
+    instructions. At run time, ``AgentGroup.instructions`` is prepended to
+    the system_prompt of any Agent with a matching ``group_slug`` — lets
+    several models (fable/haiku/opus/sonnet/...) share one prompt without
+    duplicating it per agent."""
+    __tablename__ = "agent_groups"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    slug: Mapped[str] = mapped_column(String, unique=True, index=True)
+    name: Mapped[str] = mapped_column(String)
+    description: Mapped[str] = mapped_column(Text, default="")
+    instructions: Mapped[str] = mapped_column(Text, default="")
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
@@ -82,6 +104,25 @@ class Workflow(Base):
     kind: Mapped[str] = mapped_column(String)  # sequential|parallel|orchestrator_worker|pipeline|group_chat
     graph: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)   # nodes/edges in react-flow form
     builtin: Mapped[bool] = mapped_column(Boolean, default=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class AgentFlow(Base):
+    """A capability/topology graph: which agents may hand off to which other
+    agents to complete a task, starting from a "source" node (the inbound
+    channel — watch, glasses, iOS app, Notion kanban, Telegram, ...).
+
+    Unlike Workflow.graph (an *execution* DAG the executor runs), this graph
+    is descriptive only — agents read it (via their instructions) to decide
+    who to call next. Not tied to Notion; may be used alongside it."""
+    __tablename__ = "agent_flows"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    slug: Mapped[str] = mapped_column(String, unique=True, index=True)
+    name: Mapped[str] = mapped_column(String)
+    description: Mapped[str] = mapped_column(Text, default="")
+    graph: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)   # {nodes:[{id,type:"source"|"agent",agent_slug?,label,position}], edges:[{id,source,target}]}
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
@@ -133,6 +174,12 @@ class Run(Base):
     call_me_back: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     callback_done: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     callback_origin_run_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+
+    # Notion Kanban card this run was dispatched for (set at creation time so it
+    # survives a restart-recovery reattach — _notify_kanban_run_done reads it
+    # back from this row instead of relying on the in-flight kwarg, which dies
+    # with the process that made the original dispatch call).
+    notion_task_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
 
     # Agent-to-agent chain depth (loop guard): 0 for a human/root-initiated run,
     # else caller's hop_count + 1. Set at dispatch time in api/agents.py and

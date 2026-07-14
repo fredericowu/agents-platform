@@ -96,6 +96,9 @@ def _apply_inline_migrations() -> None:
         ("callback_origin_run_id", "VARCHAR"),
         # Agent-to-agent chain depth loop guard (see Run.hop_count).
         ("hop_count", "INTEGER DEFAULT 0"),
+        # Notion Kanban card linkage — persisted (not just an in-flight kwarg)
+        # so a restart-recovery reattach can still fire _notify_kanban_run_done.
+        ("notion_task_id", "VARCHAR"),
     ]
     with engine.begin() as conn:
         for col, ddl in additions:
@@ -212,6 +215,14 @@ def _apply_inline_migrations() -> None:
         with engine.begin() as conn:
             _ensure_column(conn, "crispal_conversation_suggestions", "history_message_ids",
                            "history_message_ids JSON DEFAULT '[]'")
+    if "agents" in insp.get_table_names():
+        with engine.begin() as conn:
+            _ensure_column(conn, "agents", "group_slug", "group_slug VARCHAR")
+
+    if "agent_configs" in insp.get_table_names():
+        with engine.begin() as conn:
+            _ensure_column(conn, "agent_configs", "auto_compact_threshold_tokens",
+                           "auto_compact_threshold_tokens INTEGER")
 
     # Backfill cli_sessions from existing runs.session_id values
     if "cli_sessions" in insp.get_table_names() and "runs" in insp.get_table_names():

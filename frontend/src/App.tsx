@@ -7,8 +7,12 @@ import Agents from "./routes/Agents";
 import AgentEdit from "./routes/AgentEdit";
 import AgentConfigs from "./routes/AgentConfigs";
 import AgentConfigEdit from "./routes/AgentConfigEdit";
+import AgentGroups from "./routes/AgentGroups";
+import AgentGroupEdit from "./routes/AgentGroupEdit";
 import Workflows from "./routes/Workflows";
 import WorkflowEdit from "./routes/WorkflowEdit";
+import AgentsFlows from "./routes/AgentsFlows";
+import AgentFlowEdit from "./routes/AgentFlowEdit";
 import Playground from "./routes/Playground";
 import Runs from "./routes/Runs";
 import RunDetail from "./routes/RunDetail";
@@ -25,7 +29,7 @@ import Sessions from "./routes/Sessions";
 import {
   LayoutDashboard, Bot, Workflow as WfIcon, MessageCircle,
   Activity, Cpu, Plug, Sparkles, GaugeCircle, Settings as SettingsIcon,
-  Crosshair, BookOpen, Monitor, TerminalSquare, Settings2,
+  Crosshair, BookOpen, Monitor, TerminalSquare, Settings2, Share2, Users,
 } from "lucide-react";
 
 const NAV = [
@@ -33,6 +37,8 @@ const NAV = [
   { path: "/targets", label: "Targets", icon: Crosshair },
   { path: "/lessons", label: "Lessons", icon: BookOpen },
   { path: "/agents", label: "Agents", icon: Bot },
+  { path: "/agent-groups", label: "Agent Group", icon: Users },
+  { path: "/agents-flow", label: "Agents Flow", icon: Share2 },
   { path: "/agent-configs", label: "Agents Config", icon: Settings2 },
   { path: "/workflows", label: "Workflows", icon: WfIcon },
   { path: "/playground", label: "Playground", icon: MessageCircle },
@@ -129,6 +135,10 @@ export default function App() {
           <Route path="/" element={<Dashboard />} />
           <Route path="/agents" element={<Agents />} />
           <Route path="/agents/:slug" element={<AgentEdit />} />
+          <Route path="/agent-groups" element={<AgentGroups />} />
+          <Route path="/agent-groups/:slug" element={<AgentGroupEdit />} />
+          <Route path="/agents-flow" element={<AgentsFlows />} />
+          <Route path="/agents-flow/:slug" element={<AgentFlowEdit />} />
           <Route path="/agent-configs" element={<AgentConfigs />} />
           <Route path="/agent-configs/:slug" element={<AgentConfigEdit />} />
           <Route path="/workflows" element={<Workflows />} />

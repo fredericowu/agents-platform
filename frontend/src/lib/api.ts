@@ -14,6 +14,7 @@ export type Agent = {
   system_prompt: string;
   inherit_from: string | null;
   agent_config_slug: string | null;
+  group_slug: string | null;
   model_slug: string | null;
   tool_specs: string[];
   skill_slugs: string[];
@@ -32,6 +33,14 @@ export type AgentConfig = {
   mcp_config: { servers?: Record<string, AgentMcpServer> };
   extra_volumes: string[];
   permissions: Record<string, boolean>;
+  auto_compact_threshold_tokens?: number | null;
+};
+
+export type AgentGroup = {
+  slug: string;
+  name: string;
+  description: string;
+  instructions: string;
 };
 
 export type Workflow = {
@@ -40,6 +49,24 @@ export type Workflow = {
   description: string;
   kind: string;
   graph: Record<string, any>;
+};
+
+export type AgentFlowNode = {
+  id: string;
+  type: "source" | "agent" | "group";
+  agent_slug?: string;
+  group_slug?: string;
+  label: string;
+  position: { x: number; y: number };
+};
+
+export type AgentFlowEdge = { id: string; source: string; target: string };
+
+export type AgentFlow = {
+  slug: string;
+  name: string;
+  description: string;
+  graph: { nodes: AgentFlowNode[]; edges: AgentFlowEdge[] };
 };
 
 export type Model = {
@@ -387,6 +414,36 @@ export const api = {
     call<AgentConfig>(`/api/agent-configs/${slug}`, { method: "PUT", body: JSON.stringify(patch) }),
   deleteAgentConfig: (slug: string) =>
     call<{ deleted: string }>(`/api/agent-configs/${slug}`, { method: "DELETE" }),
+
+  listAgentGroups: () => call<AgentGroup[]>("/api/agent-groups"),
+  getAgentGroup: (slug: string) => call<AgentGroup>(`/api/agent-groups/${slug}`),
+  getAgentGroupMembers: (slug: string) =>
+    call<{ slug: string; name: string; model_slug: string | null }[]>(`/api/agent-groups/${slug}/members`),
+  createAgentGroup: (g: any) =>
+    call<AgentGroup>("/api/agent-groups", { method: "POST", body: JSON.stringify(g) }),
+  saveAgentGroup: (slug: string, patch: Partial<AgentGroup>) =>
+    call<AgentGroup>(`/api/agent-groups/${slug}`, { method: "PUT", body: JSON.stringify(patch) }),
+  deleteAgentGroup: (slug: string) =>
+    call<{ deleted: string }>(`/api/agent-groups/${slug}`, { method: "DELETE" }),
+  renameAgentGroup: (slug: string, newSlug: string) =>
+    call<AgentGroup>(`/api/agent-groups/${slug}/rename`, { method: "POST", body: JSON.stringify({ new_slug: newSlug }) }),
+  addAgentGroupMember: (slug: string, agentSlug: string) =>
+    call<any>(`/api/agent-groups/${slug}/members/${agentSlug}`, { method: "POST" }),
+  removeAgentGroupMember: (slug: string, agentSlug: string) =>
+    call<any>(`/api/agent-groups/${slug}/members/${agentSlug}`, { method: "DELETE" }),
+
+  listAgentFlows: () => call<AgentFlow[]>("/api/agent-flows"),
+  getAgentFlow: (slug: string) => call<AgentFlow>(`/api/agent-flows/${slug}`),
+  createAgentFlow: (f: any) =>
+    call<AgentFlow>("/api/agent-flows", { method: "POST", body: JSON.stringify(f) }),
+  saveAgentFlow: (slug: string, patch: Partial<AgentFlow>) =>
+    call<AgentFlow>(`/api/agent-flows/${slug}`, { method: "PUT", body: JSON.stringify(patch) }),
+  deleteAgentFlow: (slug: string) =>
+    call<{ deleted: string }>(`/api/agent-flows/${slug}`, { method: "DELETE" }),
+  renameAgentFlow: (slug: string, newSlug: string) =>
+    call<AgentFlow>(`/api/agent-flows/${slug}/rename`, { method: "POST", body: JSON.stringify({ new_slug: newSlug }) }),
+  cloneAgentFlow: (slug: string) =>
+    call<AgentFlow>(`/api/agent-flows/${slug}/clone`, { method: "POST" }),
 
   listWorkflows: () => call<Workflow[]>("/api/workflows"),
   getWorkflow: (slug: string) => call<Workflow>(`/api/workflows/${slug}`),

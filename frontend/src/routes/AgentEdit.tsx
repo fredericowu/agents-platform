@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import Page from "../components/Page";
-import { api, type Agent, type AgentConfig, type Model, type ToolItem, type Skill } from "../lib/api";
+import { api, type Agent, type AgentConfig, type AgentGroup, type Model, type ToolItem, type Skill } from "../lib/api";
 
 const BLANK: Agent = {
   slug: "", name: "", description: "", system_prompt: "",
-  inherit_from: null, agent_config_slug: null, model_slug: "claude-cli-sonnet", tool_specs: [], skill_slugs: [],
+  inherit_from: null, agent_config_slug: null, group_slug: null, model_slug: "claude-cli-sonnet", tool_specs: [], skill_slugs: [],
   params: {}, mcp_config: {}, extra_volumes: [], permissions: {}, icon: "bot", color: "#58a6ff",
 };
 
@@ -15,6 +15,7 @@ export default function AgentEdit() {
   const nav = useNavigate();
   const [a, setA] = useState<Agent | null>(null);
   const [agentConfigs, setAgentConfigs] = useState<AgentConfig[]>([]);
+  const [agentGroups, setAgentGroups] = useState<AgentGroup[]>([]);
   const [models, setModels] = useState<Model[]>([]);
   const [tools, setTools] = useState<ToolItem[]>([]);
   const [skills, setSkills] = useState<Skill[]>([]);
@@ -35,6 +36,7 @@ export default function AgentEdit() {
     api.listTools().then(setTools);
     api.listSkills().then(setSkills);
     api.listAgentConfigs().then(setAgentConfigs).catch(() => {});
+    api.listAgentGroups().then(setAgentGroups).catch(() => {});
     api.listAgents().then(setAllAgents).catch(() => {});
     api.listResettableAgents().then(r => setResettableSet(new Set(r))).catch(() => {});
     if (!slug) return;
@@ -102,7 +104,7 @@ export default function AgentEdit() {
         const created = await api.createAgent({
           slug: a.slug, name: a.name || a.slug, description: a.description,
           system_prompt: a.system_prompt, inherit_from: a.inherit_from || null,
-          agent_config_slug: a.agent_config_slug || null,
+          agent_config_slug: a.agent_config_slug || null, group_slug: a.group_slug || null,
           model_slug: a.model_slug, tool_specs: a.tool_specs, skill_slugs: a.skill_slugs,
           params: a.params, mcp_config: a.mcp_config, extra_volumes: a.extra_volumes,
           permissions: a.permissions || {},
@@ -118,6 +120,7 @@ export default function AgentEdit() {
         await api.saveAgent(targetSlug, {
           name: a.name, description: a.description, system_prompt: a.system_prompt,
           inherit_from: a.inherit_from || null, agent_config_slug: a.agent_config_slug || null,
+          group_slug: a.group_slug || null,
           model_slug: a.model_slug,
           tool_specs: a.tool_specs, skill_slugs: a.skill_slugs,
           params: a.params, mcp_config: a.mcp_config, extra_volumes: a.extra_volumes,
@@ -425,6 +428,32 @@ export default function AgentEdit() {
                 </Link>
               )}
               <Link to="/agent-configs/new" className="btn text-xs py-1 px-2">+ new config</Link>
+            </div>
+          </div>
+
+          {/* ───── Agent Group ───── */}
+          <div className="card">
+            <h2 className="text-base font-semibold mb-1">Agent group</h2>
+            <p className="text-xs text-muted mb-3">
+              When set, the group's shared{" "}
+              <Link to="/agent-groups" className="text-accent hover:underline">instructions</Link>{" "}
+              are prepended to this agent's own system prompt at run time.
+            </p>
+            <select value={a.group_slug ?? ""}
+                    onChange={e => setA({ ...a, group_slug: e.target.value || null })}
+                    data-testid="agent-group-select">
+              <option value="">(none)</option>
+              {agentGroups.map(ag => (
+                <option key={ag.slug} value={ag.slug}>{ag.name} ({ag.slug})</option>
+              ))}
+            </select>
+            <div className="mt-2 flex gap-2">
+              {a.group_slug && (
+                <Link to={`/agent-groups/${a.group_slug}`} className="btn text-xs py-1 px-2">
+                  edit "{a.group_slug}"
+                </Link>
+              )}
+              <Link to="/agent-groups/new" className="btn text-xs py-1 px-2">+ new group</Link>
             </div>
           </div>
 

@@ -57,7 +57,8 @@ def create_agent_config(body: AgentConfigIn, s: Session = Depends(get_session)):
         raise HTTPException(409, "slug already exists")
     c = AgentConfig(slug=slug, name=body.name, description=body.description,
                      mcp_config=body.mcp_config, extra_volumes=body.extra_volumes,
-                     permissions=body.permissions)
+                     permissions=body.permissions,
+                     auto_compact_threshold_tokens=body.auto_compact_threshold_tokens)
     s.add(c); s.commit(); s.refresh(c)
     return c
 

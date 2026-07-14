@@ -37,6 +37,7 @@ class AgentIn(BaseModel):
     system_prompt: str = ""
     inherit_from: str | None = None  # slug of parent agent to inherit system_prompt from
     agent_config_slug: str | None = None  # slug of an AgentConfig bundling permissions/volumes/mcp
+    group_slug: str | None = None  # slug of an AgentGroup — its instructions are prepended to system_prompt at run time
     use_cases: list[str] = []
     model_slug: str | None = None
     tool_specs: list[Any] = []
@@ -55,6 +56,7 @@ class AgentUpdate(BaseModel):
     system_prompt: str | None = None
     inherit_from: str | None = None
     agent_config_slug: str | None = None
+    group_slug: str | None = None
     use_cases: list[str] | None = None
     model_slug: str | None = None
     tool_specs: list[Any] | None = None
@@ -74,6 +76,7 @@ class AgentOut(_Base):
     system_prompt: str
     inherit_from: str | None = None
     agent_config_slug: str | None = None
+    group_slug: str | None = None
     use_cases: list[str] = []
     model_slug: str | None
     tool_specs: list[Any]
@@ -97,6 +100,7 @@ class AgentConfigIn(BaseModel):
     mcp_config: dict[str, Any] = {}
     extra_volumes: list[str] = []
     permissions: dict[str, Any] = {}
+    auto_compact_threshold_tokens: int | None = None  # None = inherit global setting
 
 
 class AgentConfigUpdate(BaseModel):
@@ -105,6 +109,7 @@ class AgentConfigUpdate(BaseModel):
     mcp_config: dict[str, Any] | None = None
     extra_volumes: list[str] | None = None
     permissions: dict[str, Any] | None = None
+    auto_compact_threshold_tokens: int | None = None
 
 
 class AgentConfigOut(_Base):
@@ -114,6 +119,31 @@ class AgentConfigOut(_Base):
     mcp_config: dict[str, Any] = {}
     extra_volumes: list[str] = []
     permissions: dict[str, Any] = {}
+    auto_compact_threshold_tokens: int | None = None
+    deleted_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+# ----- agent groups -----
+class AgentGroupIn(BaseModel):
+    slug: str | None = None  # auto-generated from name if omitted
+    name: str
+    description: str = ""
+    instructions: str = ""
+
+
+class AgentGroupUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    instructions: str | None = None
+
+
+class AgentGroupOut(_Base):
+    slug: str
+    name: str
+    description: str
+    instructions: str
     deleted_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
@@ -143,6 +173,30 @@ class WorkflowOut(_Base):
     description: str
     use_cases: list[str] = []
     kind: str
+    graph: dict[str, Any]
+    deleted_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+# ----- agent flows -----
+class AgentFlowIn(BaseModel):
+    slug: str | None = None  # auto-generated from name if omitted
+    name: str
+    description: str = ""
+    graph: dict[str, Any] = {}
+
+
+class AgentFlowUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    graph: dict[str, Any] | None = None
+
+
+class AgentFlowOut(_Base):
+    slug: str
+    name: str
+    description: str
     graph: dict[str, Any]
     deleted_at: datetime | None = None
     created_at: datetime
@@ -204,6 +258,7 @@ class RunOut(_Base):
     github_issue_number: int | None = None
     github_issue_url: str | None = None
     session_id: str | None = None
+    notion_task_id: str | None = None
 
 
 class RunEventOut(_Base):

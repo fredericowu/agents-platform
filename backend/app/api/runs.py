@@ -51,6 +51,7 @@ def list_runs(limit: int = Query(50, ge=1, le=5000),
               target_id: str | None = Query(None, description="Filter by Target id"),
               target_slug: str | None = Query(None, description="Filter by Target slug (resolved server-side)"),
               session_id: str | None = Query(None, description="Filter by the CLI session id runs were resumed under"),
+              notion_task_id: str | None = Query(None, description="Filter by the linked Notion Kanban page id"),
               q: str | None = None,
               summary: bool = Query(False, description="Truncate large `input` fields to ~200 chars"),
               s: Session = Depends(get_session)):
@@ -63,6 +64,8 @@ def list_runs(limit: int = Query(50, ge=1, le=5000),
         qry = qry.filter(Run.parent_run_id.is_(None))
     if session_id:
         qry = qry.filter(Run.session_id == session_id)
+    if notion_task_id:
+        qry = qry.filter(Run.notion_task_id == notion_task_id)
     if target_id:
         qry = qry.filter(Run.target_id == target_id)
     if target_slug:

@@ -6,6 +6,7 @@ import { PERMISSION_DEFS } from "../lib/permissionDefs";
 
 const BLANK: AgentConfig = {
   slug: "", name: "", description: "", mcp_config: {}, extra_volumes: [], permissions: {},
+  auto_compact_threshold_tokens: null,
 };
 
 export default function AgentConfigEdit() {
@@ -36,12 +37,14 @@ export default function AgentConfigEdit() {
         const created = await api.createAgentConfig({
           slug: c.slug || undefined, name: c.name || c.slug, description: c.description,
           mcp_config: c.mcp_config, extra_volumes: c.extra_volumes, permissions: c.permissions || {},
+          auto_compact_threshold_tokens: c.auto_compact_threshold_tokens ?? null,
         });
         nav(`/agent-configs/${created.slug}`);
       } else if (slug) {
         await api.saveAgentConfig(slug, {
           name: c.name, description: c.description,
           mcp_config: c.mcp_config, extra_volumes: c.extra_volumes, permissions: c.permissions || {},
+          auto_compact_threshold_tokens: c.auto_compact_threshold_tokens ?? null,
         });
         if (editedSlug.trim() && editedSlug !== slug) {
           // slug rename isn't supported server-side yet — surface that instead of silently ignoring
@@ -193,6 +196,24 @@ export default function AgentConfigEdit() {
               const next = { servers: { ...(c.mcp_config?.servers ?? {}), [newName]: { type: "streamable-http", url: "http://host.docker.internal:9123/mcp", headers: {} } } };
               setC({ ...c, mcp_config: next });
             }}>+ add server</button>
+        </div>
+
+        {/* ───── Auto-compact ───── */}
+        <div className="card">
+          <h2 className="text-base font-semibold mb-1">Auto-compact</h2>
+          <p className="text-xs text-muted mb-3">
+            Overrides the platform-wide "Auto-compact threshold (tokens)" (Settings → General)
+            for agents using this config. Leave blank to inherit the global default; set to 0
+            to disable auto-compact for these agents.
+          </p>
+          <label className="block text-xs text-muted mb-1">threshold (tokens)</label>
+          <input type="number" min={0} max={5000000} step={10000} className="w-40"
+                 placeholder="(inherit global default)"
+                 value={c.auto_compact_threshold_tokens ?? ""}
+                 onChange={e => {
+                   const v = e.target.value;
+                   setC({ ...c, auto_compact_threshold_tokens: v === "" ? null : (parseInt(v, 10) || 0) });
+                 }} />
         </div>
       </div>
     </Page>

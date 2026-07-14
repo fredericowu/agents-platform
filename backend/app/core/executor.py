@@ -187,6 +187,18 @@ def _resolve_agent_config(s: Session, agent: Agent) -> tuple[dict[str, Any], lis
     return dict(agent.permissions or {}), list(agent.extra_volumes or []), dict(agent.mcp_config or {})
 
 
+def _resolve_auto_compact_threshold(s: Session, agent: Agent) -> int | None:
+    """Return *agent*'s own auto-compact threshold override (via its
+    AgentConfig), or None to inherit the platform-wide setting."""
+    if agent.agent_config_slug:
+        from ..models import AgentConfig
+        cfg = s.query(AgentConfig).filter(AgentConfig.slug == agent.agent_config_slug,
+                                          AgentConfig.deleted_at.is_(None)).first()
+        if cfg is not None:
+            return cfg.auto_compact_threshold_tokens
+    return None
+
+
 def _agent_to_runtime(s: Session, agent: Agent) -> dict[str, Any]:
     from ..models import Model
     provider = "echo"
@@ -225,6 +237,15 @@ def _agent_to_runtime(s: Session, agent: Agent) -> dict[str, Any]:
                 container = pv.split(":", 1)[-1]
                 if container not in seen_container:
                     extra_volumes.insert(0, pv)
+    # If the agent belongs to an AgentGroup, prepend the group's shared
+    # instructions to this agent's own system_prompt (append semantics:
+    # group instructions first, then whatever is agent-specific).
+    if agent.group_slug:
+        from ..models import AgentGroup
+        group = s.query(AgentGroup).filter(AgentGroup.slug == agent.group_slug,
+                                           AgentGroup.deleted_at.is_(None)).first()
+        if group and group.instructions:
+            system_prompt = f"{group.instructions}\n\n{system_prompt}" if system_prompt else group.instructions
     # Resolve agent permissions into additional volume mounts.
     # Values are either a single "host:container[:opts]" string or a list of them.
     import os as _os
@@ -309,7 +330,11 @@ def _agent_to_runtime(s: Session, agent: Agent) -> dict[str, Any]:
 
 
 async def _notify_kanban_run_done(*, run_id: str, agent_slug: str,
-                                   notion_task_id: str, status: str, text: str) -> None:
+                                   notion_task_id: str, status: str, text: str,
+                                   started_at: datetime | None = None,
+                                   ended_at: datetime | None = None,
+                                   hop_count: int = 0,
+                                   tokens_total: int = 0) -> None:
     """Fire-and-forget: tell awserv that a Notion-linked run finished."""
     import os as _os
     try:
@@ -332,6 +357,11 @@ async def _notify_kanban_run_done(*, run_id: str, agent_slug: str,
                              "notion_task_id": notion_task_id,
                              "status": status,
                              "summary": text,
+                             "started_at": started_at.isoformat() if started_at else None,
+                             "ended_at": ended_at.isoformat() if ended_at else None,
+                             "run_url": f"https://agents-platform.app.aw.tekflox.com/runs/{run_id}",
+                             "hop_count": hop_count,
+                             "tokens_total": tokens_total,
                          },
                          headers=headers)
     except Exception:
@@ -530,7 +560,8 @@ async def _run_agent_impl(
                     target_id=target_id,
                     model_slug=runtime["model_slug"],
                     source_slug=agent_slug,
-                    proc_msg_id=proc_msg_id)
+                    proc_msg_id=proc_msg_id,
+                    notion_task_id=notion_task_id)
             s.add(r); s.flush()
             run_id = r.id
         else:
@@ -545,10 +576,14 @@ async def _run_agent_impl(
                         target_id=target_id,
                         model_slug=runtime["model_slug"],
                         source_slug=agent_slug,
-                        proc_msg_id=proc_msg_id)
+                        proc_msg_id=proc_msg_id,
+                        notion_task_id=notion_task_id)
                 s.add(r)
-            elif proc_msg_id and not r.proc_msg_id:
-                r.proc_msg_id = proc_msg_id
+            else:
+                if proc_msg_id and not r.proc_msg_id:
+                    r.proc_msg_id = proc_msg_id
+                if notion_task_id and not r.notion_task_id:
+                    r.notion_task_id = notion_task_id
 
     ev_ids = {run_id}
     if event_run_id and event_run_id != run_id:
@@ -603,14 +638,22 @@ async def _run_agent_impl(
     # Auto-compact: a resumed session that's grown past the configured
     # threshold gets a "/compact" turn first — same session_id, its own Run
     # row (initiator_kind="auto_compact") — before this turn's real message
-    # is processed. Settings → General → "Auto-compact threshold (tokens)";
+    # is processed. Per-agent override lives on the agent's AgentConfig
+    # (auto_compact_threshold_tokens); falls back to Settings → General →
+    # "Auto-compact threshold (tokens)" when the agent has no override.
     # 0 disables. Guarded by skip_auto_compact so the compact call itself
     # doesn't try to compact itself.
     auto_compacted = False
     if session_id and not skip_auto_compact and user_input.strip() != "/compact":
         from .security import get_setting
+        threshold_override = None
+        with session_scope() as _cfg_s:
+            _agent_row = _cfg_s.query(Agent).filter(Agent.slug == agent_slug).first()
+            if _agent_row is not None:
+                threshold_override = _resolve_auto_compact_threshold(_cfg_s, _agent_row)
         try:
-            threshold = int(get_setting("auto_compact_threshold_tokens", 500_000) or 0)
+            threshold = int(threshold_override if threshold_override is not None
+                             else get_setting("auto_compact_threshold_tokens", 500_000) or 0)
         except (TypeError, ValueError):
             threshold = 500_000
         cooldown_until = _AUTO_COMPACT_COOLDOWN.get(session_id, 0.0)
@@ -864,6 +907,8 @@ async def _run_agent_impl(
     _gh_issue_number = None
     _run_ws_data: dict | None = None
     _wu_ctx: tuple | None = None
+    _started_at: datetime | None = None
+    _hop_count = 0
     _ended_at = datetime.utcnow()
     with session_scope() as s:
         r = s.query(Run).filter(Run.id == run_id).first()
@@ -889,6 +934,14 @@ async def _run_agent_impl(
             r.ended_at = _ended_at
             _gh_issue_number = getattr(r, "github_issue_number", None)
             _wu_ctx = (r.session_id, r.target_id, r.initiator_kind, r.initiator_id)
+            _started_at = r.started_at
+            # Fall back to the persisted column when the in-flight kwarg is
+            # empty — happens after a restart-recovery reattach, since
+            # _reattach_run doesn't (and can't) thread the original caller's
+            # notion_task_id kwarg back through. The DB row set it at creation
+            # time, so this survives the process restart that killed the kwarg.
+            notion_task_id = notion_task_id or getattr(r, "notion_task_id", None)
+            _hop_count = getattr(r, "hop_count", 0) or 0
             from .events import _run_to_ws_dict
             _run_ws_data = _run_to_ws_dict(r)
     # Honour a ScheduleWakeup the model issued during this run: persist + arm a
@@ -935,6 +988,10 @@ async def _run_agent_impl(
                 notion_task_id=notion_task_id,
                 status=status,
                 text=text[:10000] if text else "",
+                started_at=_started_at,
+                ended_at=_ended_at,
+                hop_count=_hop_count,
+                tokens_total=tin + tout,
             ))
     except Exception:
         pass
@@ -1461,7 +1518,8 @@ def start_agent_run_bg(agent_slug: str, user_input: str, *,
                 node_id=node_id,
                 target_id=target_id,
                 model_slug=model_slug,
-                source_slug=agent_slug)
+                source_slug=agent_slug,
+                notion_task_id=notion_task_id)
         s.add(r); s.flush()
         rid = r.id
         from .events import _run_to_ws_dict
