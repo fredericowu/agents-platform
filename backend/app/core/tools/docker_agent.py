@@ -320,16 +320,6 @@ def build_docker_argv(
         for key, val in extra_docker_env.items():
             argv.extend(["-e", f"{key}={val}"])
 
-    # ── Connector mount (must be registered BEFORE the image — it's a -v flag) ───
-    # redis_mode: aw-connector-redis isn't baked into the image (unlike the WS
-    # aw-connector), so we bind-mount it from the repo. add_mount appends a `-v`
-    # flag to argv, which docker requires to come before the image name.
-    if redis_mode:
-        connector_host = str(
-            BASE_DIR / "repos" / "agents-platform" / "agent-images" / "shared" / "aw-connector-redis"
-        )
-        add_mount(connector_host, "/usr/local/bin/aw-connector-redis", readonly=True)
-
     # ── Image ──────────────────────────────────────────────────────────────────
     argv.append(image)
 

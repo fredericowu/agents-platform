@@ -18,6 +18,18 @@ function ScoreBadge({ summary }: { summary?: RetroScoreSummary | null }) {
   return <span className={`badge ${cls}`} title={`overall retro score: ${score}`}>{score}</span>;
 }
 
+// Fixed 10-color palette for grouping same-flow rows in the table — purely
+// visual (a stable hash of flow_run_id picks the index), no backend meaning.
+const FLOW_COLORS = [
+  "#5b8cff", "#f97316", "#22c55e", "#a855f7", "#ec4899",
+  "#eab308", "#06b6d4", "#ef4444", "#84cc16", "#94a3b8",
+];
+function flowColor(flowRunId: string): string {
+  let h = 0;
+  for (let i = 0; i < flowRunId.length; i++) h = (h * 31 + flowRunId.charCodeAt(i)) >>> 0;
+  return FLOW_COLORS[h % FLOW_COLORS.length];
+}
+
 // For each session_id in the current page of runs, find the earliest run (by
 // started_at) that used it — any later run sharing that session_id is a resume
 // of it (the CLI keeps the same session_id across `--resume`, see executor.py).
@@ -111,6 +123,7 @@ export default function Runs() {
               <th className="py-2 pr-2">kind</th>
               <th className="py-2 pr-2">name</th>
               <th className="py-2 pr-2">Target</th>
+              <th className="py-2 pr-2">Flow</th>
               <th className="py-2 pr-2">initiator</th>
               <th className="py-2 pr-2">model</th>
               <th className="py-2 pr-2">session</th>
@@ -122,8 +135,14 @@ export default function Runs() {
             </tr>
           </thead>
           <tbody>
-            {(() => { const firstBySession = firstRunPerSession(runs); return runs.map(r => (
-              <tr key={r.id} className="border-t border-line" data-testid={`runs-row-${r.id.slice(0,8)}`}>
+            {(() => { const firstBySession = firstRunPerSession(runs); return runs.map(r => {
+              const flowColorHex = r.flow_run_id ? flowColor(r.flow_run_id) : null;
+              return (
+              <tr key={r.id} className="border-t border-line" data-testid={`runs-row-${r.id.slice(0,8)}`}
+                  style={flowColorHex ? {
+                    background: `${flowColorHex}14`,
+                    borderLeft: `3px solid ${flowColorHex}`,
+                  } : undefined}>
                 <td className="py-2 pr-2">
                   <Link to={`/runs/${r.id}`} className="font-mono">{r.id.slice(0, 12)}</Link>
                   {r.parent_run_id && (
@@ -141,6 +160,22 @@ export default function Runs() {
                   )}
                 </td>
                 <td className="py-2 pr-2"><TargetBadge id={r.target_id} slug={r.target_slug} /></td>
+                <td className="py-2 pr-2 text-xs">
+                  {r.flow_run_id && flowColorHex ? (
+                    <span className="badge cursor-pointer"
+                          title={r.flow_needs_human ? "this flow escalated to a human at some point" : "click to filter this flow"}
+                          style={{
+                            background: `${flowColorHex}22`, color: flowColorHex,
+                            border: r.flow_needs_human ? "1px solid #eab308" : `1px solid ${flowColorHex}55`,
+                            boxShadow: r.flow_needs_human ? "0 0 0 1px #eab308" : undefined,
+                          }}
+                          onClick={() => setQ(r.flow_run_id!)}>
+                      {r.flow_slug}: {r.flow_run_id.slice(0, 8)}
+                    </span>
+                  ) : (
+                    <span className="text-muted">—</span>
+                  )}
+                </td>
                 <td className="py-2 pr-2 text-xs">
                   <span className="badge">{r.initiator_kind}</span>
                   {r.initiator_id && r.initiator_id !== r.target_slug && (
@@ -178,7 +213,7 @@ export default function Runs() {
                   )}
                 </td>
               </tr>
-            )); })()}
+            ); }); })()}
           </tbody>
         </table>
       </div>

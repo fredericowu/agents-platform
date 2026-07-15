@@ -202,6 +202,67 @@ async def consume_stream_into_queue(run_id: str, queue: asyncio.Queue,
         await queue.put(None)
 
 
+def _finished_channel(run_id: str) -> str:
+    return f"run:{run_id}:finished"
+
+
+async def notify_run_finished(run_id: str) -> None:
+    """Publish a fire-and-forget signal that ``run_id`` reached a terminal status.
+
+    Best-effort wake-up for anyone blocked in ``wait_run_finished`` on this run
+    (e.g. the ``call_me_back`` watcher in wakeups.py). The DB row remains the
+    source of truth — this is only a low-latency nudge, never load-bearing:
+    a missed publish (no subscriber yet, Redis blip) just means the caller's
+    own fallback poll picks up the terminal status on its next cycle instead.
+    """
+    r = await get_client()
+    if r is None:
+        return
+    try:
+        await r.publish(_finished_channel(run_id), "1")
+    except Exception as e:
+        log.warning("notify_run_finished failed run=%s: %s", run_id, e)
+        await reset_client()
+
+
+async def wait_run_finished(run_id: str, timeout_s: float) -> bool:
+    """Block up to ``timeout_s`` for a ``notify_run_finished(run_id)`` signal.
+
+    Returns True if a signal arrived, False on timeout/no-Redis/error — callers
+    must treat False as "check the DB yourself", not as "still running".
+    """
+    r = await get_client()
+    if r is None:
+        return False
+    pubsub = r.pubsub()
+    try:
+        await pubsub.subscribe(_finished_channel(run_id))
+        # The first get_message() call after subscribe() typically just consumes
+        # the subscribe-confirmation message itself — with ignore_subscribe_messages
+        # that call returns None immediately WITHOUT waiting out `timeout`, it does
+        # not keep blocking for a real publish. Must loop our own calls against a
+        # wall-clock deadline so a stray subscribe ack doesn't short-circuit the wait.
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout_s
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=remaining)
+            if msg is not None:
+                return True
+    except Exception as e:
+        log.warning("wait_run_finished failed run=%s: %s", run_id, e)
+        await reset_client()
+        return False
+    finally:
+        try:
+            await pubsub.unsubscribe(_finished_channel(run_id))
+            await pubsub.aclose()
+        except Exception:
+            pass
+
+
 def _delivered_key(run_id: str) -> str:
     return f"run:{run_id}:delivered"
 

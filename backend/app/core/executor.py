@@ -22,7 +22,7 @@ _exec_log = logging.getLogger("ap.executor")
 from sqlalchemy.orm import Session
 
 from ..db import session_scope
-from ..models import Agent, Run, Workflow
+from ..models import Agent, AgentGroup, Run, Workflow
 from .retro_scorer import score_run_terminal
 from .agent_loop import _provider_supports_langchain, run_langchain_agent
 from .cancel import Cancelled, is_cancelled
@@ -368,6 +368,557 @@ async def _notify_kanban_run_done(*, run_id: str, agent_slug: str,
         pass
 
 
+def _resolve_kanban_target_status(s: Session, agent: Agent) -> str | None:
+    """Effective Kanban status this agent should set its card to on dispatch —
+    ``Agent.kanban_target_status`` wins; falls back to the agent's
+    ``AgentGroup.kanban_target_status`` when the agent itself has none set."""
+    if agent.kanban_target_status:
+        return agent.kanban_target_status
+    if agent.group_slug:
+        group = s.query(AgentGroup).filter(AgentGroup.slug == agent.group_slug,
+                                           AgentGroup.deleted_at.is_(None)).first()
+        if group and group.kanban_target_status:
+            return group.kanban_target_status
+    return None
+
+
+def _kanban_awserv_headers() -> tuple[str, dict[str, str]]:
+    """(awserv base URL, X-Api-Key header) shared by the fire-and-forget
+    auto-set-on-Kanban-card helpers below."""
+    import os as _os
+    awserv = _os.environ.get("AWSERV_BASE", "http://127.0.0.1:9123")
+    api_key = ""
+    try:
+        key_path = _os.path.join(_os.environ.get("AW_BASE_DIR", "/opt/agentic-workspace"), ".tmp", "awserv_api_key")
+        with open(key_path) as _f:
+            api_key = _f.read().strip()
+    except Exception:
+        pass
+    return awserv, ({"X-Api-Key": api_key} if api_key else {})
+
+
+async def _auto_set_kanban_status(*, notion_task_id: str, status_key: str, run_id: str) -> None:
+    """Fire-and-forget: move a Kanban card's Status before its agent's run
+    actually starts executing, driven by Agent/AgentGroup.kanban_target_status.
+    Best-effort — a rejected move (e.g. the done/ready_to_deploy/need_human
+    hard-lock during an active QA cycle) must never block the run itself."""
+    try:
+        import httpx as _httpx
+        awserv, headers = _kanban_awserv_headers()
+        async with _httpx.AsyncClient(timeout=10.0) as c:
+            await c.post(f"{awserv}/api/notion/kanban/move",
+                         json={"page_id": notion_task_id, "status": status_key, "run_id": run_id},
+                         headers=headers)
+    except Exception:
+        _exec_log.warning("auto-set-kanban-status failed: page=%s status=%s run=%s",
+                          notion_task_id, status_key, run_id, exc_info=True)
+
+
+async def _auto_set_kanban_agent_slug(*, notion_task_id: str, agent_slug: str, run_id: str) -> None:
+    """Fire-and-forget: stamp the card's `AgentSlug` property with whichever
+    agent is dispatched against it now, on every run tied to a card — not
+    just the ones with a configured kanban_target_status.
+
+    Without this, `AgentSlug` is only ever written once, at card creation
+    (see `create-task` in notion_kanban.py), and silently goes stale the
+    moment a different agent picks the card up (e.g. a handoff via
+    `run_agent_async`, or the QA/next-hop agent in a flow) — nothing forces
+    the dispatching agent to call `set_kanban_property` itself, so the card
+    would misreport who's actually working it unless the backend does this
+    systemically instead of relying on the LLM to remember."""
+    try:
+        import httpx as _httpx
+        awserv, headers = _kanban_awserv_headers()
+        async with _httpx.AsyncClient(timeout=10.0) as c:
+            await c.post(f"{awserv}/api/notion/kanban/set-property",
+                         json={"page_id": notion_task_id, "property": "AgentSlug", "value": agent_slug},
+                         headers=headers)
+    except Exception:
+        _exec_log.warning("auto-set-kanban-agent-slug failed: page=%s agent=%s run=%s",
+                          notion_task_id, agent_slug, run_id, exc_info=True)
+
+
+def _agents_flow_context(s: Session, agent_slug: str, own_call_me_back: bool,
+                         own_parent_run_id: str | None = None) -> str | None:
+    """If ``agent_slug`` is a node in any ENABLED AgentFlow — either directly
+    (an ``agent`` node) or as a member of a ``group`` node — return a text
+    block (agents directly connected to it in that flow, union across every
+    matching flow, plus whether this run's own call_me_back is set — and if
+    so, WHICH agent called it, so it has context on the call) to inject
+    right after the aw-agents-flow skill. Returns None if the agent isn't
+    reachable via any enabled flow — such an agent gets no flow-mode context
+    at all, same as before this feature existed.
+
+    This is the *only* thing that decides injection — evaluated fresh at
+    invocation time for every run, independent of Kanban/notion_task_id or
+    anything else about how the run was triggered.
+
+    Loose by design (see skills/aw-agents-flow/SKILL.md): this list is
+    guidance, never enforced — nothing stops the agent calling someone not
+    on it.
+    """
+    from ..models import AgentFlow, AgentGroup
+
+    me = s.query(Agent).filter(Agent.slug == agent_slug).first()
+    my_group_slug = me.group_slug if me else None
+
+    flows = (s.query(AgentFlow)
+             .filter(AgentFlow.enabled.is_(True), AgentFlow.deleted_at.is_(None)).all())
+    connected: dict[str, str] = {}  # agent_slug -> how it's connected (informational)
+    matched_any = False
+    for flow in flows:
+        graph = flow.graph or {}
+        nodes = {n.get("id"): n for n in (graph.get("nodes") or [])}
+        my_node_ids = {nid for nid, n in nodes.items()
+                       if n.get("type") == "agent" and n.get("agent_slug") == agent_slug}
+        if my_group_slug:
+            my_node_ids |= {nid for nid, n in nodes.items()
+                            if n.get("type") == "group" and n.get("group_slug") == my_group_slug}
+        if not my_node_ids:
+            continue
+        matched_any = True
+        for edge in (graph.get("edges") or []):
+            src, tgt = edge.get("source"), edge.get("target")
+            if src in my_node_ids:
+                other = nodes.get(tgt)
+            elif tgt in my_node_ids:
+                other = nodes.get(src)
+            else:
+                continue
+            if not other:
+                continue
+            if other.get("type") == "agent" and other.get("agent_slug"):
+                connected.setdefault(other["agent_slug"], "directly connected")
+            elif other.get("type") == "group" and other.get("group_slug"):
+                group = s.query(AgentGroup).filter(AgentGroup.slug == other["group_slug"]).first()
+                members = s.query(Agent).filter(Agent.group_slug == other["group_slug"],
+                                                Agent.deleted_at.is_(None)).all()
+                for m in members:
+                    if m.slug != agent_slug:
+                        connected.setdefault(m.slug, f"via group '{group.name if group else other['group_slug']}'")
+            # a "source" neighbor is the origin channel — nothing to call, skip
+
+    if not matched_any:
+        return None
+
+    # Drop agents flagged hidden_from_flow — never suggested here, but still
+    # fully callable by slug (not enforced, see skills/aw-agents-flow).
+    agent_rows = s.query(Agent).filter(Agent.slug.in_(connected.keys()),
+                                       Agent.deleted_at.is_(None),
+                                       Agent.hidden_from_flow.is_(False)).all()
+    by_slug = {a.slug: a for a in agent_rows}
+    connected = {k: v for k, v in connected.items() if k in by_slug}
+
+    lines = ["## Your Agents Flow context (this run only)"]
+    if connected:
+        lines.append("Agents directly connected to you in this flow — a starting point, "
+                     "not a restriction (use list_agents for anyone else):")
+        for aslug in sorted(connected.keys()):
+            a = by_slug[aslug]
+            cap = (a.capabilities or "").strip()
+            lines.append(f"- `{aslug}` ({a.name}){': ' + cap if cap else ''}")
+    else:
+        lines.append("No other agents are directly connected to you in this flow yet — "
+                     "use list_agents to find who to call.")
+
+    if own_call_me_back:
+        caller_desc = "the agent that called you"
+        if own_parent_run_id:
+            parent = s.query(Run).filter(Run.id == own_parent_run_id).first()
+            if parent and parent.source_slug:
+                caller_agent = s.query(Agent).filter(Agent.slug == parent.source_slug).first()
+                caller_desc = f"`{parent.source_slug}`" + (f" ({caller_agent.name})" if caller_agent else "")
+        lines.append(f"\n{caller_desc} called you and is waiting for your result — this run was "
+                     "dispatched with call_me_back=true, so that agent's session will be resumed "
+                     "automatically with your output when you finish. You don't need to call "
+                     "return_to_caller_agent yourself (safe no-op if you do anyway).")
+    else:
+        lines.append("\nNo one is automatically waiting for your result. To report back to "
+                     "whoever called you, call return_to_caller_agent explicitly.")
+    return "\n".join(lines)
+
+
+def _matched_enabled_flow_slug(s: Session, agent_slug: str) -> str | None:
+    """First ENABLED AgentFlow (by created_at) where ``agent_slug`` appears as
+    an agent node, or a member of a group node. Used only to pick which flow
+    a run STARTS — inheritance from a parent run's own flow_run_id (see
+    _record_flow_hop) always takes precedence, so a downstream agent doesn't
+    need to be a node in the same graph to stay counted as part of the flow.
+    """
+    from ..models import AgentFlow
+
+    me = s.query(Agent).filter(Agent.slug == agent_slug).first()
+    my_group_slug = me.group_slug if me else None
+    flows = (s.query(AgentFlow)
+             .filter(AgentFlow.enabled.is_(True), AgentFlow.deleted_at.is_(None))
+             .order_by(AgentFlow.created_at.asc()).all())
+    for flow in flows:
+        nodes = (flow.graph or {}).get("nodes") or []
+        for n in nodes:
+            if n.get("type") == "agent" and n.get("agent_slug") == agent_slug:
+                return flow.slug
+            if my_group_slug and n.get("type") == "group" and n.get("group_slug") == my_group_slug:
+                return flow.slug
+    return None
+
+
+def _record_flow_hop(s: Session, run: "Run", agent_slug: str, parent_run_id: str | None,
+                     session_id: str | None = None) -> None:
+    """Assign ``run.flow_run_id``/``run.flow_slug`` and append a row to
+    ``agent_flow_runs`` (the round-by-round history) — either inheriting the
+    parent run's live flow (any child of a flow run counts as part of that
+    flow by default, regardless of whether it's itself a node in the graph),
+    or, for a root run with no flow-carrying parent, checking for a live flow
+    on the same Kanban card or the same CLI session (see the fallbacks
+    below), or finally starting a brand new flow if this agent is a node in
+    an ENABLED AgentFlow. No-ops (leaves both fields null) for a plain run
+    outside any flow.
+
+    MUST be called before the run's own turn starts executing (i.e. before
+    any tool call it might make, like ``run_agent_async``) — every call site
+    in this module satisfies that (see core/executor.py::_run_agent_impl).
+    2026-07-15: idempotent/never-overwrite by design (see the guard below) —
+    a run's flow_run_id, once resolved, is locked in for good. This matters
+    because a run that already dispatched a child using its (correct) flow
+    assignment must never have that assignment silently changed afterward —
+    the child already inherited the old value and can't be un-forked. Before
+    this guard, ``_inherit_flow_from_session``'s post-hoc correction (fired
+    after a reprompted/resumed turn finished executing) could overwrite a
+    flow_run_id that a mid-turn ``run_agent_async`` call had already used to
+    fork a child, leaving parent and child on two different flow instances
+    for the same logical conversation. Resolving eagerly here — including
+    the session_id fallback that used to live only in the post-hoc path —
+    closes that race: every code path that creates OR re-enters a Run row
+    before executing it calls this first, so by the time any tool call can
+    fire, the flow assignment is already final."""
+    if run.flow_run_id is not None:
+        return  # already resolved — never re-mint/overwrite (see docstring)
+    from ..models import AgentFlowRun
+
+    flow_run_id: str | None = None
+    flow_slug: str | None = None
+    flow_needs_human = False
+    hop_index = 0
+    if parent_run_id:
+        parent = s.query(Run).filter(Run.id == parent_run_id).first()
+        if parent and parent.flow_run_id:
+            flow_run_id = parent.flow_run_id
+            flow_slug = parent.flow_slug
+            flow_needs_human = parent.flow_needs_human
+    if flow_run_id is None and run.notion_task_id:
+        # No flow-carrying parent (e.g. dispatched via the Kanban webhook/poll,
+        # invoke_kanban_agent, or create_kanban_task(start_now=true) — none of
+        # those thread a parent_run_id). Rather than mint a brand-new
+        # flow_run_id and silently fork the card's flow history in two, reuse
+        # the most recent OTHER run against the same card that's still
+        # carrying a live flow. 2026-07-15: fixes flow_run_id fragmenting
+        # across dispatch mechanisms for the same card (see
+        # docs: UX-Proto investigation, same-day).
+        sibling = (s.query(Run)
+                   .filter(Run.notion_task_id == run.notion_task_id,
+                           Run.flow_run_id.is_not(None),
+                           Run.id != run.id)
+                   .order_by(Run.started_at.desc()).first())
+        if sibling:
+            flow_run_id = sibling.flow_run_id
+            flow_slug = sibling.flow_slug
+            flow_needs_human = sibling.flow_needs_human
+    if flow_run_id is None and session_id:
+        # Session-resume dispatch (timer wakeup, agent-callback auto-resume,
+        # the "lost agent" reprompt) has no parent_run_id either — it's just
+        # the same CLI session continuing. Reuse whatever flow the session's
+        # own prior turn belonged to. This used to only run post-hoc via
+        # _inherit_flow_from_session (after the turn already executed); doing
+        # it here means it's resolved before this run's own turn — and any
+        # child it dispatches — can even start.
+        sibling = (s.query(Run)
+                   .filter(Run.session_id == session_id, Run.flow_run_id.is_not(None),
+                           Run.id != run.id)
+                   .order_by(Run.started_at.desc()).first())
+        if sibling:
+            flow_run_id = sibling.flow_run_id
+            flow_slug = sibling.flow_slug
+            flow_needs_human = sibling.flow_needs_human
+    if flow_run_id:
+        last_hop = (s.query(AgentFlowRun)
+                    .filter(AgentFlowRun.flow_run_id == flow_run_id)
+                    .order_by(AgentFlowRun.hop_index.desc()).first())
+        hop_index = (last_hop.hop_index + 1) if last_hop else 1
+    if flow_run_id is None:
+        flow_slug = _matched_enabled_flow_slug(s, agent_slug)
+        if flow_slug is None:
+            return
+        import uuid as _uuid_mod
+        flow_run_id = _uuid_mod.uuid4().hex
+
+    s.add(AgentFlowRun(flow_run_id=flow_run_id, flow_slug=flow_slug, run_id=run.id,
+                       agent_slug=agent_slug, hop_index=hop_index))
+    run.flow_run_id = flow_run_id
+    run.flow_slug = flow_slug
+    run.flow_needs_human = flow_needs_human
+
+
+def _inherit_flow_from_session(run_id: str, session_id: str | None) -> None:
+    """Post-hoc: tag ``run_id`` with the same flow_run_id/flow_slug as the
+    most recent OTHER run on ``session_id``, if that run belongs to a flow.
+
+    Wakeup-triggered resumes (core.wakeups — timer wakeups, agent-callback
+    auto-resume, return_to_caller_agent, and the "lost agent" reprompt) all
+    fire via ``run_agent(agent_slug, prompt, session_id=...)`` with no
+    ``parent_run_id`` — there's no dispatch "caller" in that sense, just a
+    session being resumed. _record_flow_hop's parent_run_id-based
+    inheritance therefore never fires for them, and the row would only get
+    tagged if the agent itself happens to be a fresh flow root. This fills
+    that gap: whatever flow the session's own prior turn belonged to, this
+    new turn belongs to too. No-ops if there's no flow to inherit, or the
+    run already carries the right tag.
+
+    2026-07-15: superseded as the primary mechanism by the session_id
+    fallback now built into `_record_flow_hop` itself (resolved BEFORE a
+    run's turn executes, not after — see its docstring). Kept as a harmless
+    defensive fallback for any path not yet covered; **never overwrites an
+    already-resolved flow_run_id** — doing so used to be the actual bug
+    (a mid-turn `run_agent_async` child could already have forked off the
+    pre-correction value, orphaning it once this function rewrote the
+    parent's assignment afterward)."""
+    if not session_id:
+        return
+    from ..models import AgentFlowRun
+    with session_scope() as s:
+        run = s.query(Run).filter(Run.id == run_id).first()
+        if run is None or run.flow_run_id is not None:
+            return  # already resolved elsewhere — do not overwrite
+        prev = (s.query(Run)
+                .filter(Run.session_id == session_id, Run.id != run_id,
+                       Run.flow_run_id.isnot(None))
+                .order_by(Run.started_at.desc()).first())
+        if prev is None:
+            return
+        last_hop = (s.query(AgentFlowRun)
+                    .filter(AgentFlowRun.flow_run_id == prev.flow_run_id)
+                    .order_by(AgentFlowRun.hop_index.desc()).first())
+        hop_index = (last_hop.hop_index + 1) if last_hop else 1
+        s.add(AgentFlowRun(flow_run_id=prev.flow_run_id, flow_slug=prev.flow_slug,
+                           run_id=run.id, agent_slug=run.source_slug or "", hop_index=hop_index))
+        run.flow_run_id = prev.flow_run_id
+        run.flow_slug = prev.flow_slug
+        run.flow_needs_human = prev.flow_needs_human
+
+
+_MAX_FLOW_REPROMPTS = 1
+
+
+def _took_flow_action(s: Session, run_id: str) -> bool:
+    """Did this run take one of the 3 Agents Flow terminal actions during its
+    turn — (a) dispatched a child agent/workflow run (handoff), (b) called
+    return_to_caller_agent, or (c) called mark_flow_done? Used by the "lost
+    agent" safety net (_check_flow_completion): if none of these happened,
+    the run gets reprompted once on the same session."""
+    if s.query(Run.id).filter(Run.parent_run_id == run_id).first():
+        return True
+    own = s.query(Run).filter(Run.id == run_id).first()
+    if own is None:
+        return False
+    return bool(own.return_to_caller_done or own.marked_flow_done)
+
+
+def _notify_need_human_sysadmins(*, run_id: str, agent_slug: str, reason: str,
+                                 extra: str = "") -> None:
+    try:
+        from ..api.telegram import notify_sysadmins
+        notify_sysadmins(f"🆘 Agents Flow needs a human — run {run_id} (agent {agent_slug}).\n"
+                         f"{reason}{extra}\n"
+                         f"https://agents-platform.app.aw.tekflox.com/runs/{run_id}")
+        _exec_log.info("agents-flow need-human sysadmin notify sent: run=%s", run_id)
+    except Exception:
+        _exec_log.warning("escalate-need-human sysadmin notify failed run=%s", run_id, exc_info=True)
+
+
+async def _escalate_need_human(*, run_id: str, agent_slug: str,
+                               notion_task_id: str | None, reason: str) -> None:
+    """Force this run's flow chain to a human. With a Kanban card, move it to
+    need_human (comment required — AW's hard rule). Without one, there's no
+    card to point at: ping sysadmins on Telegram with the run id and reason
+    instead (Frederico's "mande a mensagem pelo agente principal, com o
+    run_id e detalhes da intervenção" — same notify path as the existing
+    hop-count-loop-guard alert).
+
+    If a card IS linked but the move is rejected (e.g. the hard lock in
+    /api/notion/kanban/move that blocks done/ready_to_deploy/need_human while
+    QAStatus=In Progress — see notion_kanban.py), the escalation must not be
+    silently dropped: fall back to the same sysadmin Telegram alert as the
+    no-card case, so a human is notified either way."""
+    import os as _os
+    _exec_log.info("agents-flow escalating to Need Human: run=%s agent=%s notion_task_id=%s reason=%s",
+                   run_id, agent_slug, notion_task_id, reason)
+    # Mark every run sharing this flow instance (not just this one hop) —
+    # drives the yellow border on the Flow chip in the Runs UI (Frederico,
+    # 2026-07-15): "at a glance, did this flow ever need a human?" New hops
+    # appended later (see _record_flow_hop / _inherit_flow_from_session)
+    # inherit the flag too, so a human resuming the flow still sees it.
+    with session_scope() as _nh_s:
+        own = _nh_s.query(Run).filter(Run.id == run_id).first()
+        if own and own.flow_run_id:
+            _nh_s.query(Run).filter(Run.flow_run_id == own.flow_run_id).update(
+                {"flow_needs_human": True})
+    if notion_task_id:
+        try:
+            import httpx as _httpx
+            awserv = _os.environ.get("AWSERV_BASE", "http://127.0.0.1:9123")
+            api_key = ""
+            try:
+                key_path = _os.path.join(_os.environ.get("AW_BASE_DIR", "/opt/agentic-workspace"), ".tmp", "awserv_api_key")
+                with open(key_path) as _f:
+                    api_key = _f.read().strip()
+            except Exception:
+                pass
+            headers = {"X-Api-Key": api_key} if api_key else {}
+            async with _httpx.AsyncClient(timeout=10.0) as c:
+                resp = await c.post(f"{awserv}/api/notion/kanban/move",
+                                    json={"page_id": notion_task_id, "status": "need_human",
+                                          "comment": f"🆘 Agents Flow escalation — run {run_id} "
+                                                    f"(agent {agent_slug}): {reason}",
+                                          "run_id": run_id},
+                                    headers=headers)
+            _exec_log.info("agents-flow need-human kanban move: run=%s status_code=%s body=%s",
+                          run_id, resp.status_code, resp.text[:300])
+            if resp.status_code != 200:
+                _notify_need_human_sysadmins(
+                    run_id=run_id, agent_slug=agent_slug, reason=reason,
+                    extra=f"\n(Kanban card {notion_task_id} move to need_human was rejected — "
+                          f"{resp.status_code}: {resp.text[:200]} — likely mid-QA-cycle hard lock. "
+                          f"Card status was NOT updated, check it manually.)")
+        except Exception:
+            _exec_log.warning("escalate-need-human kanban move failed run=%s", run_id, exc_info=True)
+            _notify_need_human_sysadmins(
+                run_id=run_id, agent_slug=agent_slug, reason=reason,
+                extra=f"\n(Kanban card {notion_task_id} move to need_human failed — see logs. "
+                      f"Card status was NOT updated, check it manually.)")
+    else:
+        _notify_need_human_sysadmins(run_id=run_id, agent_slug=agent_slug, reason=reason,
+                                     extra="\n(no Kanban card)")
+
+
+async def _fire_flow_reprompt(*, run_id: str, agent_slug: str, session_id: str,
+                              target_id: str | None) -> None:
+    """Resume the SAME session that just finished without taking a terminal
+    Agents Flow action, nudging it to decide.
+
+    Pre-creates the reprompted run's row with is_flow_reprompt=True set
+    BEFORE it executes (rather than patching the flag after run_agent()
+    returns) — the reprompted run's own turn triggers its own
+    _check_flow_completion as a fire-and-forget task the instant it
+    finishes, which can start before a post-hoc patch would've committed;
+    pre-creating avoids that race so the reprompt count is never
+    undercounted (confirmed live: without this, 3 reprompts fired before
+    _MAX_FLOW_REPROMPTS=2 kicked in instead of 2 — 2026-07-14)."""
+    prompt = ("You finished this turn without calling another agent, using "
+             "return_to_caller_agent, or concluding the task (e.g. moving the "
+             "Kanban card). This is an Agents Flow — pick one now: call "
+             "another agent, return to your caller, or conclude the task.")
+    import uuid as _uuid_mod
+    new_run_id = _uuid_mod.uuid4().hex
+    with session_scope() as s:
+        _target_slug = agent_slug
+        if target_id:
+            from ..models import Target as _Target
+            _t = s.query(_Target).filter(_Target.id == target_id).first()
+            if _t:
+                _target_slug = _t.slug
+        s.add(Run(id=new_run_id, kind="agent", target_slug=_target_slug, status="pending",
+                  input={"input": prompt}, target_id=target_id, source_slug=agent_slug,
+                  initiator_kind="wakeup", is_flow_reprompt=True))
+    try:
+        await run_agent(agent_slug, prompt, run_id=new_run_id, session_id=session_id,
+                        target_id=target_id, initiator_kind="wakeup")
+        _inherit_flow_from_session(new_run_id, session_id)
+    except Exception:
+        _exec_log.warning("flow-reprompt failed to fire for run=%s", run_id, exc_info=True)
+
+
+async def _check_flow_completion(*, run_id: str, agent_slug: str, session_id: str | None,
+                                 target_id: str | None, notion_task_id: str | None,
+                                 hop_count: int, own_call_me_back: bool) -> None:
+    """Agents Flow safety net (plan steps 4+5) — called after a flow-mode run
+    finishes successfully. Order matters: hop-count is checked FIRST and
+    unconditionally (already at the limit → straight to Need Human, even if
+    call_me_back is set — that's a global loop guard, not a per-hop nudge).
+    Then: if call_me_back is true, skip the "did it act" check entirely —
+    the caller already asked to be woken up automatically, so the flow has a
+    defined continuation regardless of what this agent did; nudging it would
+    be redundant. Otherwise, reprompt ONCE if no terminal action was taken,
+    then escalate."""
+    from .security import get_setting
+    from ..models import AgentFlow
+
+    with session_scope() as s:
+        own = s.query(Run).filter(Run.id == run_id).first()
+        flow_run_id = own.flow_run_id if own else None
+        flow_slug = own.flow_slug if own else None
+        flow = (s.query(AgentFlow)
+                .filter(AgentFlow.slug == flow_slug, AgentFlow.deleted_at.is_(None)).first()
+                if flow_slug else None)
+        flow_max_hops = flow.max_hops if flow else None
+        flow_budget_tokens = flow.budget_tokens if flow else None
+        flow_budget_usd = flow.budget_usd if flow else None
+
+    max_hops = flow_max_hops if flow_max_hops is not None else get_setting("agent_chain_max_hops", 8)
+    if hop_count >= max_hops:
+        await _escalate_need_human(
+            run_id=run_id, agent_slug=agent_slug, notion_task_id=notion_task_id,
+            reason=f"hop count {hop_count} reached the "
+                  f"{'flow' if flow_max_hops is not None else 'agent_chain_max_hops'} "
+                  f"limit ({max_hops}) without the task concluding.")
+        return
+
+    if flow_run_id and (flow_budget_tokens is not None or flow_budget_usd is not None):
+        with session_scope() as s:
+            runs = s.query(Run.tokens_in, Run.tokens_out, Run.cost_usd).filter(
+                Run.flow_run_id == flow_run_id).all()
+            tot_tok = sum((r.tokens_in or 0) + (r.tokens_out or 0) for r in runs)
+            tot_usd = sum(r.cost_usd or 0.0 for r in runs)
+        if flow_budget_tokens is not None and tot_tok >= flow_budget_tokens:
+            await _escalate_need_human(
+                run_id=run_id, agent_slug=agent_slug, notion_task_id=notion_task_id,
+                reason=f"flow '{flow_slug}' token budget reached: {tot_tok:,} >= "
+                      f"cap {flow_budget_tokens:,}.")
+            return
+        if flow_budget_usd is not None and tot_usd >= flow_budget_usd:
+            await _escalate_need_human(
+                run_id=run_id, agent_slug=agent_slug, notion_task_id=notion_task_id,
+                reason=f"flow '{flow_slug}' cost budget reached: ${tot_usd:.2f} >= "
+                      f"cap ${flow_budget_usd:.2f}.")
+            return
+
+    if own_call_me_back:
+        _exec_log.info("agents-flow: run=%s has call_me_back=true — flow continuation is "
+                       "already defined, skipping the reprompt check", run_id)
+        return
+
+    if not session_id:
+        return  # can't reprompt without a resumable session — nothing more to do
+
+    with session_scope() as s:
+        if _took_flow_action(s, run_id):
+            _exec_log.info("agents-flow: run=%s took a flow action — no reprompt needed", run_id)
+            return
+        reprompt_count = (s.query(Run)
+                          .filter(Run.session_id == session_id, Run.is_flow_reprompt.is_(True))
+                          .count())
+
+    if reprompt_count >= _MAX_FLOW_REPROMPTS:
+        await _escalate_need_human(
+            run_id=run_id, agent_slug=agent_slug, notion_task_id=notion_task_id,
+            reason=f"reprompted {reprompt_count} time(s) without deciding to call another "
+                  "agent, return to caller, or conclude the task.")
+        return
+
+    _exec_log.info("agents-flow: run=%s took no action, reprompt_count=%d — firing reprompt",
+                   run_id, reprompt_count)
+    await _fire_flow_reprompt(run_id=run_id, agent_slug=agent_slug,
+                              session_id=session_id, target_id=target_id)
+
+
 async def _acquire_session_lock(session_id: str) -> bool:
     """Wait for exclusive rights to resume ``session_id``. Returns True when
     the lock was actually acquired (caller must release), False when this task
@@ -537,6 +1088,7 @@ async def _run_agent_impl(
             raise ValueError(f"agent soft-deleted: {agent_slug} — restore it first")
         runtime = _agent_to_runtime(s, agent)
         agent_name = agent.name
+        _kanban_target_status = _resolve_kanban_target_status(s, agent) if notion_task_id else None
         # Resolve target_slug: prefer the actual Target's slug; fall back to
         # agent slug only if no target_id is available (legacy / child run paths).
         _run_target_slug = agent_slug
@@ -563,6 +1115,7 @@ async def _run_agent_impl(
                     proc_msg_id=proc_msg_id,
                     notion_task_id=notion_task_id)
             s.add(r); s.flush()
+            _record_flow_hop(s, r, agent_slug, parent_run_id, session_id=session_id)
             run_id = r.id
         else:
             r = s.query(Run).filter(Run.id == run_id).first()
@@ -578,12 +1131,53 @@ async def _run_agent_impl(
                         source_slug=agent_slug,
                         proc_msg_id=proc_msg_id,
                         notion_task_id=notion_task_id)
-                s.add(r)
+                s.add(r); s.flush()
+                _record_flow_hop(s, r, agent_slug, parent_run_id, session_id=session_id)
             else:
                 if proc_msg_id and not r.proc_msg_id:
                     r.proc_msg_id = proc_msg_id
                 if notion_task_id and not r.notion_task_id:
                     r.notion_task_id = notion_task_id
+                # Pre-created row (Agents Flow reprompt, pending-wakeup-run
+                # executor, ask_human resume) that never went through
+                # _record_flow_hop at creation — resolve it now, still
+                # before this run's own turn (and any tool call it might
+                # make) starts executing. See _record_flow_hop's docstring
+                # for why this must happen before, not after.
+                if r.flow_run_id is None:
+                    _record_flow_hop(s, r, agent_slug, parent_run_id, session_id=session_id)
+
+    if notion_task_id and _kanban_target_status:
+        asyncio.create_task(_auto_set_kanban_status(
+            notion_task_id=notion_task_id, status_key=_kanban_target_status, run_id=run_id))
+    if notion_task_id:
+        asyncio.create_task(_auto_set_kanban_agent_slug(
+            notion_task_id=notion_task_id, agent_slug=agent_slug, run_id=run_id))
+
+    # Per-run MCP config: same servers as the agent's static config, plus an
+    # X-Aw-Caller-Run-Id header the gateway reads to identify this run to
+    # agents-platform's own tools (run_agent_async's caller_run_id,
+    # return_to_caller_agent) — see api/agents.py::write_run_mcp_config and
+    # core/wakeups.py. Written per-run (not the shared per-agent dir) so
+    # concurrent runs of the same agent never race on the header value.
+    try:
+        from ..api.agents import write_run_mcp_config
+        with session_scope() as _mcp_s:
+            # Re-query by slug (a plain str param, not an ORM attribute) — the
+            # `agent` object is detached from the outer `with session_scope()
+            # as s:` block above (session already closed), and its attributes
+            # are expired-by-default on commit, so even `agent.id` would try
+            # (and fail) to lazy-load against a closed session.
+            _fresh_agent = _mcp_s.query(Agent).filter(Agent.slug == agent_slug).first()
+            _run_context = {"NOTION_TASK_ID": notion_task_id} if notion_task_id else None
+            _run_mcp_dir = (write_run_mcp_config(_fresh_agent, run_id, _mcp_s, extra_context=_run_context)
+                             if _fresh_agent else None)
+        if _run_mcp_dir:
+            runtime["params"]["docker_mcp_config_dir"] = _run_mcp_dir
+    except Exception:
+        _exec_log.warning("per-run mcp config write failed for run %s — falling back "
+                          "to the static per-agent config (no caller-run-id header)",
+                          run_id, exc_info=True)
 
     ev_ids = {run_id}
     if event_run_id and event_run_id != run_id:
@@ -698,6 +1292,11 @@ async def _run_agent_impl(
     # the trailing message survives; `text` keeps the full transcript for the
     # run history / View Progress.
     reply_text = ""
+    # Set below when composing sys_blocks — True iff this agent is a node in
+    # an ENABLED AgentFlow, i.e. it got the aw-agents-flow skill + context
+    # injected. Read again at finalization to decide whether the "lost
+    # agent" safety net (_check_flow_completion) applies to this run.
+    _is_flow_agent = False
     # Last ScheduleWakeup tool_call seen in the stream — the one-shot CLI
     # process can't hold the timer, so we honour it ourselves (core.wakeups).
     _wakeup_req: dict | None = None
@@ -722,6 +1321,27 @@ async def _run_agent_impl(
             content = load_skill(sslug)
             if content:
                 sys_blocks.append(f"[skill:{sslug}]\n{content}")
+        # Agents Flow: if this agent is a node in an ENABLED flow, inject the
+        # aw-agents-flow skill (right after the instructions/other skills)
+        # followed immediately by this run's specific context — connected
+        # agents in that flow, and whether this run's own call_me_back means
+        # someone is already waiting for the result. See
+        # skills/aw-agents-flow/SKILL.md and _agents_flow_context above.
+        try:
+            with session_scope() as _flow_s:
+                _own_row = _flow_s.query(Run).filter(Run.id == run_id).first()
+                _own_cmb = bool(_own_row.call_me_back) if _own_row else False
+                _own_parent = _own_row.parent_run_id if _own_row else None
+                _flow_ctx = _agents_flow_context(_flow_s, agent_slug, _own_cmb, _own_parent)
+            if _flow_ctx is not None:
+                _is_flow_agent = True
+                if "aw-agents-flow" not in runtime["skill_slugs"]:
+                    _flow_skill = load_skill("aw-agents-flow")
+                    if _flow_skill:
+                        sys_blocks.append(f"[skill:aw-agents-flow]\n{_flow_skill}")
+                sys_blocks.append(_flow_ctx)
+        except Exception:
+            _exec_log.warning("agents-flow context injection failed for run %s", run_id, exc_info=True)
         if raw_cli_prompt:
             # CLI slash-command turn ("/compact"): the prompt must reach the CLI
             # verbatim — no system prompt, no skills, no framing, and no
@@ -732,7 +1352,15 @@ async def _run_agent_impl(
             runtime["params"]["append_system_prompt"] = None
         messages: list[dict] = []
         if sys_blocks:
-            messages.append({"role": "system", "content": "\n\n".join(sys_blocks)})
+            _effective_system_prompt = "\n\n".join(sys_blocks)
+            messages.append({"role": "system", "content": _effective_system_prompt})
+            try:
+                with session_scope() as _sp_s:
+                    _sp_row = _sp_s.query(Run).filter(Run.id == run_id).first()
+                    if _sp_row:
+                        _sp_row.system_prompt = _effective_system_prompt
+            except Exception:
+                _exec_log.warning("failed to persist system_prompt for run %s", run_id, exc_info=True)
         if extra_messages:
             messages.extend(extra_messages)
         messages.append({"role": "user", "content": user_input})
@@ -909,6 +1537,7 @@ async def _run_agent_impl(
     _wu_ctx: tuple | None = None
     _started_at: datetime | None = None
     _hop_count = 0
+    _own_call_me_back = False
     _ended_at = datetime.utcnow()
     with session_scope() as s:
         r = s.query(Run).filter(Run.id == run_id).first()
@@ -942,8 +1571,17 @@ async def _run_agent_impl(
             # time, so this survives the process restart that killed the kwarg.
             notion_task_id = notion_task_id or getattr(r, "notion_task_id", None)
             _hop_count = getattr(r, "hop_count", 0) or 0
+            _own_call_me_back = bool(getattr(r, "call_me_back", False))
             from .events import _run_to_ws_dict
             _run_ws_data = _run_to_ws_dict(r)
+    # Wake up any call_me_back watcher (wakeups._watch_and_callback) blocked on
+    # THIS run's completion — event-driven nudge, DB row above is still the
+    # source of truth if the publish is missed (see redis_streams.notify_run_finished).
+    try:
+        from .redis_streams import notify_run_finished
+        await notify_run_finished(run_id)
+    except Exception:
+        _exec_log.warning("notify_run_finished failed run=%s", run_id, exc_info=True)
     # Honour a ScheduleWakeup the model issued during this run: persist + arm a
     # follow-up run on the same session (see core.wakeups for why AP must do
     # this instead of the CLI harness).
@@ -970,6 +1608,18 @@ async def _run_agent_impl(
             except Exception as _ce:
                 _exec_log.warning("agent-callback registration failed run=%s watch=%s: %s",
                                   run_id, _watch_id, _ce)
+    # Agents Flow safety net (plan steps 4+5) — only for agents dispatched as
+    # a node in an ENABLED flow (see _is_flow_agent, set when sys_blocks was
+    # composed). Fire-and-forget: never block finalisation on this.
+    if status == "success" and _is_flow_agent and _wu_ctx:
+        try:
+            asyncio.create_task(_check_flow_completion(
+                run_id=run_id, agent_slug=agent_slug, session_id=_wu_ctx[0],
+                target_id=_wu_ctx[1], notion_task_id=notion_task_id, hop_count=_hop_count,
+                own_call_me_back=_own_call_me_back,
+            ))
+        except Exception:
+            _exec_log.warning("agents-flow completion check failed to start run=%s", run_id, exc_info=True)
     score_run_terminal(run_id)
     # WS broadcast — push terminal state to all connected clients
     try:
@@ -1521,6 +2171,7 @@ def start_agent_run_bg(agent_slug: str, user_input: str, *,
                 source_slug=agent_slug,
                 notion_task_id=notion_task_id)
         s.add(r); s.flush()
+        _record_flow_hop(s, r, agent_slug, parent_run_id, session_id=session_id)
         rid = r.id
         from .events import _run_to_ws_dict
         _start_ws_data = _run_to_ws_dict(r)

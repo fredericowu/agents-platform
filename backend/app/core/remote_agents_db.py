@@ -1,9 +1,14 @@
 """SQLAlchemy engine + ORM models for the Remote Agents feature.
 
 Lives in its own tables (``remote_agents`` / ``remote_agents_config``) in the
-main agents-platform Postgres database, via their own ``Base``/engine so a
-bug in the main app's migrations (``db.py``) can't cross-touch this feature's
-schema and vice versa. All access goes through the ORM below — no raw SQL.
+main agents-platform Postgres database, via their own ``Base`` so a bug in
+the main app's migrations (``db.py``) can't cross-touch this feature's schema
+and vice versa. All access goes through the ORM below — no raw SQL.
+
+Shares ``db.py``'s engine/connection pool (not a separate ``create_engine``)
+— two independent pools against the same Postgres instance just halved the
+headroom available under ``max_connections`` for no isolation benefit; the
+schema/migration isolation above doesn't require a separate pool too.
 """
 from __future__ import annotations
 
@@ -12,10 +17,10 @@ import time
 from contextlib import contextmanager
 from typing import Iterator
 
-from sqlalchemy import Integer, String, Text, create_engine, text
+from sqlalchemy import Integer, String, Text, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
-from ..config import settings
+from ..db import engine
 
 
 class Base(DeclarativeBase):
@@ -40,7 +45,6 @@ class ConfigRow(Base):
     value: Mapped[str] = mapped_column(Text)
 
 
-engine = create_engine(settings.database_url, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 
@@ -61,11 +65,19 @@ def init_db() -> None:
     Base.metadata.create_all(engine)
     # create_all() only creates missing tables, not missing columns on
     # existing ones — `tunnels` was added after remote_agents already
-    # existed in production, so add it explicitly, idempotently.
+    # existed in production, so add it explicitly, idempotently. SQLite (used
+    # by the test suite) has no "IF NOT EXISTS" clause for ADD COLUMN, so
+    # check via PRAGMA instead; production Postgres keeps the single
+    # idempotent statement.
     with engine.begin() as conn:
-        conn.execute(text(
-            "ALTER TABLE remote_agents ADD COLUMN IF NOT EXISTS tunnels TEXT DEFAULT '[]'"
-        ))
+        if engine.dialect.name == "sqlite":
+            cols = [row[1] for row in conn.execute(text("PRAGMA table_info(remote_agents)")).fetchall()]
+            if "tunnels" not in cols:
+                conn.execute(text("ALTER TABLE remote_agents ADD COLUMN tunnels TEXT DEFAULT '[]'"))
+        else:
+            conn.execute(text(
+                "ALTER TABLE remote_agents ADD COLUMN IF NOT EXISTS tunnels TEXT DEFAULT '[]'"
+            ))
     with session_scope() as s:
         if not s.get(ConfigRow, "mcp_api_key"):
             s.add(ConfigRow(key="mcp_api_key", value=secrets.token_urlsafe(32)))

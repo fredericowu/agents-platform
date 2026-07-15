@@ -30,19 +30,22 @@ export default function AgentsFlows() {
               + new flow
             </button>
           }>
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         {list.map(f => (
-          <div key={f.slug} className="card hover:border-accent transition-colors relative"
+          <div key={f.slug} className="card hover:border-accent transition-colors"
                data-testid={`agents-flow-card-${f.slug}`}>
             <Link to={`/agents-flow/${f.slug}`} className="block">
-              <div className="flex items-center justify-between mb-2 pr-44">
+              <div className="flex items-center justify-between gap-2 mb-2 flex-wrap">
                 <div className="text-base font-semibold">{f.name}</div>
-                <span className="badge badge-info">{(f.graph?.nodes || []).length} nodes</span>
+                <div className="flex gap-1 flex-wrap">
+                  {f.enabled && <span className="badge badge-success">● enabled</span>}
+                  <span className="badge badge-info">{(f.graph?.nodes || []).length} nodes</span>
+                </div>
               </div>
-              <div className="text-xs font-mono text-muted mb-1 pr-44">{f.slug}</div>
-              <div className="text-xs text-muted pr-44">{f.description}</div>
+              <div className="text-xs font-mono text-muted mb-1">{f.slug}</div>
+              <div className="text-xs text-muted">{f.description}</div>
             </Link>
-            <div className="absolute top-3 right-3 flex gap-1 items-center">
+            <div className="flex gap-1 items-center justify-end mt-3">
               <button className="btn text-xs py-1"
                       onClick={(e) => { e.preventDefault(); e.stopPropagation(); clone(f.slug); }}
                       data-testid={`agents-flows-clone-${f.slug}`}>clone</button>

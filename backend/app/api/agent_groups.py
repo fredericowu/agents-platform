@@ -55,7 +55,8 @@ def create_agent_group(body: AgentGroupIn, s: Session = Depends(get_session)):
     slug = (body.slug or "").strip() or _generate_slug(s, body.name)
     if _slug_taken(slug, s):
         raise HTTPException(409, "slug already exists")
-    g = AgentGroup(slug=slug, name=body.name, description=body.description, instructions=body.instructions)
+    g = AgentGroup(slug=slug, name=body.name, description=body.description, instructions=body.instructions,
+                   kanban_target_status=body.kanban_target_status, capabilities=body.capabilities)
     s.add(g)
     s.commit()
     s.refresh(g)

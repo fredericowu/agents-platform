@@ -299,6 +299,15 @@ export default function RunDetail() {
         </div>
       </div>
 
+      {run.system_prompt && (
+        <details className="card mb-4">
+          <summary className="text-base font-semibold cursor-pointer">
+            System prompt (effective — instructions + skills + Agents Flow context actually sent)
+          </summary>
+          <pre className="codebox max-h-96 overflow-auto mt-2 whitespace-pre-wrap">{run.system_prompt}</pre>
+        </details>
+      )}
+
       {artefacts.length > 0 && (
         <div className="card mb-4" data-testid="run-artefacts">
           <h2 className="text-base font-semibold mb-3">Artefacts <span className="text-muted text-xs">({artefacts.length})</span></h2>

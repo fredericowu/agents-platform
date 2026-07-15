@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import Page from "../components/Page";
-import { api, type Agent, type AgentConfig, type AgentGroup, type Model, type ToolItem, type Skill } from "../lib/api";
+import { api, KANBAN_STATUS_KEYS, type Agent, type AgentConfig, type AgentGroup, type Model, type ToolItem, type Skill } from "../lib/api";
 
 const BLANK: Agent = {
   slug: "", name: "", description: "", system_prompt: "",
-  inherit_from: null, agent_config_slug: null, group_slug: null, model_slug: "claude-cli-sonnet", tool_specs: [], skill_slugs: [],
+  inherit_from: null, agent_config_slug: null, group_slug: null, kanban_target_status: null, capabilities: "",
+  hidden_from_flow: false,
+  model_slug: "claude-cli-sonnet", tool_specs: [], skill_slugs: [],
   params: {}, mcp_config: {}, extra_volumes: [], permissions: {}, icon: "bot", color: "#58a6ff",
 };
 
@@ -105,6 +107,7 @@ export default function AgentEdit() {
           slug: a.slug, name: a.name || a.slug, description: a.description,
           system_prompt: a.system_prompt, inherit_from: a.inherit_from || null,
           agent_config_slug: a.agent_config_slug || null, group_slug: a.group_slug || null,
+          kanban_target_status: a.kanban_target_status || null, capabilities: a.capabilities || "",
           model_slug: a.model_slug, tool_specs: a.tool_specs, skill_slugs: a.skill_slugs,
           params: a.params, mcp_config: a.mcp_config, extra_volumes: a.extra_volumes,
           permissions: a.permissions || {},
@@ -120,7 +123,8 @@ export default function AgentEdit() {
         await api.saveAgent(targetSlug, {
           name: a.name, description: a.description, system_prompt: a.system_prompt,
           inherit_from: a.inherit_from || null, agent_config_slug: a.agent_config_slug || null,
-          group_slug: a.group_slug || null,
+          group_slug: a.group_slug || null, kanban_target_status: a.kanban_target_status || null,
+          capabilities: a.capabilities || "",
           model_slug: a.model_slug,
           tool_specs: a.tool_specs, skill_slugs: a.skill_slugs,
           params: a.params, mcp_config: a.mcp_config, extra_volumes: a.extra_volumes,
@@ -454,6 +458,38 @@ export default function AgentEdit() {
                 </Link>
               )}
               <Link to="/agent-groups/new" className="btn text-xs py-1 px-2">+ new group</Link>
+            </div>
+          </div>
+
+          {/* ───── Set Kanban card to ───── */}
+          <div className="card">
+            <h2 className="text-base font-semibold mb-1">Set Kanban card to:</h2>
+            <p className="text-xs text-muted mb-3">
+              Kanban status this agent moves its card to on completion. Overrides the Agent
+              group's default (if any) when set here.
+            </p>
+            <select value={a.kanban_target_status ?? ""}
+                    onChange={e => setA({ ...a, kanban_target_status: e.target.value || null })}
+                    data-testid="agent-kanban-target-status">
+              <option value="">(inherit from group)</option>
+              {KANBAN_STATUS_KEYS.map(s => (
+                <option key={s.key} value={s.key}>{s.label}</option>
+              ))}
+            </select>
+          </div>
+
+          {/* ───── Capabilities short description ───── */}
+          <div className="card">
+            <h2 className="text-base font-semibold mb-1">Capabilities short description</h2>
+            <p className="text-xs text-muted mb-3">
+              What this agent can do, in plain English — ≤100 words. Other agents read this
+              to decide whether to hand a task off to it. Leave blank to inherit the Agent
+              group's description (if any).
+            </p>
+            <textarea value={a.capabilities} onChange={e => setA({ ...a, capabilities: e.target.value })}
+                      rows={4} className="text-sm w-full" data-testid="agent-capabilities" />
+            <div className="text-xs text-muted mt-1">
+              {a.capabilities.trim() ? a.capabilities.trim().split(/\s+/).length : 0} words
             </div>
           </div>
 

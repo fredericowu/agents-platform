@@ -93,11 +93,21 @@ async def _handle_exec(ws, req_id: str, command: str, timeout: float = 900) -> N
     (e.g. `docker compose logs -f`, builds) are visible to the caller live
     instead of only after they finish or hit the request timeout.
     """
+    import websockets
+
     send_lock = asyncio.Lock()
 
     async def _send(payload: dict) -> None:
         async with send_lock:
-            await ws.send(json.dumps(payload))
+            try:
+                await ws.send(json.dumps(payload))
+            except (websockets.exceptions.ConnectionClosed, OSError) as e:
+                # Connection dropped mid-exec (server restart, network blip).
+                # Swallow here instead of letting it escape the fire-and-forget
+                # create_task() call, which would otherwise surface as an
+                # unhandled "Task exception was never retrieved" log line.
+                log.debug("exec[%s]: dropped %s, connection closed: %s",
+                          req_id, payload.get("type"), e)
 
     async def _pump(stream, stream_name: str) -> None:
         while True:

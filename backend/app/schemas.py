@@ -38,6 +38,9 @@ class AgentIn(BaseModel):
     inherit_from: str | None = None  # slug of parent agent to inherit system_prompt from
     agent_config_slug: str | None = None  # slug of an AgentConfig bundling permissions/volumes/mcp
     group_slug: str | None = None  # slug of an AgentGroup — its instructions are prepended to system_prompt at run time
+    kanban_target_status: str | None = None  # logical Kanban status key this agent moves its card to on completion — overrides the AgentGroup's default when set
+    capabilities: str = ""  # short (<=100 words) summary of what this agent can do — overrides the AgentGroup's when set
+    hidden_from_flow: bool = False  # excluded from Agents Flow connected-agents context lists — still callable by slug
     use_cases: list[str] = []
     model_slug: str | None = None
     tool_specs: list[Any] = []
@@ -57,6 +60,9 @@ class AgentUpdate(BaseModel):
     inherit_from: str | None = None
     agent_config_slug: str | None = None
     group_slug: str | None = None
+    kanban_target_status: str | None = None
+    capabilities: str | None = None
+    hidden_from_flow: bool | None = None
     use_cases: list[str] | None = None
     model_slug: str | None = None
     tool_specs: list[Any] | None = None
@@ -77,6 +83,9 @@ class AgentOut(_Base):
     inherit_from: str | None = None
     agent_config_slug: str | None = None
     group_slug: str | None = None
+    kanban_target_status: str | None = None
+    capabilities: str = ""
+    hidden_from_flow: bool = False
     use_cases: list[str] = []
     model_slug: str | None
     tool_specs: list[Any]
@@ -131,12 +140,16 @@ class AgentGroupIn(BaseModel):
     name: str
     description: str = ""
     instructions: str = ""
+    kanban_target_status: str | None = None  # default status member agents move their card to on completion
+    capabilities: str = ""  # short (<=100 words) summary of what member agents can do
 
 
 class AgentGroupUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
     instructions: str | None = None
+    kanban_target_status: str | None = None
+    capabilities: str | None = None
 
 
 class AgentGroupOut(_Base):
@@ -144,6 +157,8 @@ class AgentGroupOut(_Base):
     name: str
     description: str
     instructions: str
+    kanban_target_status: str | None = None
+    capabilities: str = ""
     deleted_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
@@ -184,20 +199,32 @@ class AgentFlowIn(BaseModel):
     slug: str | None = None  # auto-generated from name if omitted
     name: str
     description: str = ""
+    enabled: bool = False
     graph: dict[str, Any] = {}
+    max_hops: int | None = None
+    budget_tokens: int | None = None
+    budget_usd: float | None = None
 
 
 class AgentFlowUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
+    enabled: bool | None = None
     graph: dict[str, Any] | None = None
+    max_hops: int | None = None
+    budget_tokens: int | None = None
+    budget_usd: float | None = None
 
 
 class AgentFlowOut(_Base):
     slug: str
     name: str
     description: str
+    enabled: bool = False
     graph: dict[str, Any]
+    max_hops: int | None = None
+    budget_tokens: int | None = None
+    budget_usd: float | None = None
     deleted_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
@@ -259,6 +286,10 @@ class RunOut(_Base):
     github_issue_url: str | None = None
     session_id: str | None = None
     notion_task_id: str | None = None
+    system_prompt: str | None = None
+    flow_run_id: str | None = None
+    flow_slug: str | None = None
+    flow_needs_human: bool = False
 
 
 class RunEventOut(_Base):

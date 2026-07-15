@@ -14,8 +14,23 @@ class Base(DeclarativeBase):
     pass
 
 
-engine = create_engine(settings.database_url, future=True, echo=False,
-                       connect_args={"check_same_thread": False} if "sqlite" in settings.database_url else {})
+# Pool sized for real concurrency: several agent runs are active at once, each
+# holding sessions across run/session bookkeeping, event polling, and wakeup
+# watchers (backend/app/core/wakeups.py) — the SQLAlchemy defaults
+# (pool_size=5, max_overflow=10) exhaust under that load ("QueuePool limit of
+# size 5 overflow 10 reached, connection timed out", 2026-07-14). Bumped to a
+# ceiling of 30 (15+15) rather than higher — the shared Postgres instance has
+# max_connections=100 and an unrelated app (penpot) alone holds ~60 of those,
+# so headroom for agents-platform's own pool is limited; remote_agents_db.py
+# reuses this same engine (see below) instead of opening a second pool that
+# would double this ceiling. pool_pre_ping avoids handing out dead connections
+# after the DB restarts or drops idle ones.
+_is_sqlite = "sqlite" in settings.database_url
+engine = create_engine(
+    settings.database_url, future=True, echo=False,
+    connect_args={"check_same_thread": False} if _is_sqlite else {},
+    **({} if _is_sqlite else dict(pool_size=15, max_overflow=15, pool_timeout=45, pool_pre_ping=True)),
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 
@@ -99,6 +114,24 @@ def _apply_inline_migrations() -> None:
         # Notion Kanban card linkage — persisted (not just an in-flight kwarg)
         # so a restart-recovery reattach can still fire _notify_kanban_run_done.
         ("notion_task_id", "VARCHAR"),
+        # Agents Flow safety net (see Run.return_to_caller_done / is_flow_reprompt).
+        ("return_to_caller_done", "BOOLEAN DEFAULT false"),
+        ("is_flow_reprompt", "BOOLEAN DEFAULT false"),
+        ("marked_flow_done", "BOOLEAN DEFAULT false"),
+        # Structured verdict on the two flow terminal actions (see
+        # Run.flow_outcome / Run.return_kind).
+        ("flow_outcome", "VARCHAR"),
+        ("return_kind", "VARCHAR"),
+        # Denormalized from AgentFlowRun — which live flow execution (if any)
+        # this run belongs to (see Run.flow_run_id / Run.flow_slug).
+        ("flow_run_id", "VARCHAR"),
+        ("flow_slug", "VARCHAR"),
+        ("flow_needs_human", "BOOLEAN DEFAULT false"),
+        # mark_flow_done QA accountability (see Run.qa_run_id / Run.qa_not_needed).
+        ("qa_run_id", "VARCHAR"),
+        ("qa_not_needed", "BOOLEAN DEFAULT false"),
+        # Effective system prompt sent to the LLM (see Run.system_prompt).
+        ("system_prompt", "TEXT"),
     ]
     with engine.begin() as conn:
         for col, ddl in additions:
@@ -218,6 +251,21 @@ def _apply_inline_migrations() -> None:
     if "agents" in insp.get_table_names():
         with engine.begin() as conn:
             _ensure_column(conn, "agents", "group_slug", "group_slug VARCHAR")
+            _ensure_column(conn, "agents", "kanban_target_status", "kanban_target_status VARCHAR")
+            _ensure_column(conn, "agents", "capabilities", "capabilities TEXT DEFAULT ''")
+            _ensure_column(conn, "agents", "hidden_from_flow", "hidden_from_flow BOOLEAN DEFAULT false")
+
+    if "agent_groups" in insp.get_table_names():
+        with engine.begin() as conn:
+            _ensure_column(conn, "agent_groups", "kanban_target_status", "kanban_target_status VARCHAR")
+            _ensure_column(conn, "agent_groups", "capabilities", "capabilities TEXT DEFAULT ''")
+
+    if "agent_flows" in insp.get_table_names():
+        with engine.begin() as conn:
+            _ensure_column(conn, "agent_flows", "enabled", "enabled BOOLEAN DEFAULT false")
+            _ensure_column(conn, "agent_flows", "max_hops", "max_hops INTEGER")
+            _ensure_column(conn, "agent_flows", "budget_tokens", "budget_tokens INTEGER")
+            _ensure_column(conn, "agent_flows", "budget_usd", "budget_usd FLOAT")
 
     if "agent_configs" in insp.get_table_names():
         with engine.begin() as conn:

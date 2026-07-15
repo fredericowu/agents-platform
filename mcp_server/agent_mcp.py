@@ -436,6 +436,108 @@ async def _list_tools() -> list[Tool]:
                                          "call_me_back": {"type": "boolean", "default": True,
                                                           "description": "Default true: when this workflow finishes, your own session gets woken up with its result and replies down your own channel automatically. Set false for pure fire-and-forget."}},
                           "required": ["slug", "input", "target_slug"]}),
+        Tool(name="return_to_caller_agent",
+             description=("Agentic-flow action: send `message` back to whoever called YOU "
+                          "(via run_agent_async), resuming their exact session with full "
+                          "context — not a fresh, memory-less dispatch of the same agent. "
+                          "Use this when you were handed off a task and have a result, a "
+                          "question, or anything else to report back to that specific caller.\n\n"
+                          "`kind` is REQUIRED and structured — pick the one that matches what "
+                          "you're actually sending, don't default to 'result' out of habit:\n"
+                          "- `result`: you finished your part; this is the outcome/answer.\n"
+                          "- `question`: you need the caller to decide something before you "
+                          "can continue — they should expect to reply, not just receive.\n"
+                          "- `blocker`: you got stuck (missing access, ambiguous ask, external "
+                          "failure) and can't proceed without help.\n\n"
+                          "No-op if the run that called you already has call_me_back=true — "
+                          "in that case the caller is woken up automatically when your run "
+                          "ends, and calling this too would double-resume it. Still returns "
+                          "{ok:true, noop:true} in that case, not an error — safe to always "
+                          "call as your \"report back\" action without checking first.\n\n"
+                          "Fails with a clear reason if you have no caller (you're the root "
+                          "of the chain, e.g. a Kanban `Ready`-dispatched run) — in that case "
+                          "there's nothing to return to; move the Kanban card status instead."),
+             inputSchema={"type": "object",
+                          "properties": {"message": {"type": "string",
+                                                     "description": "What to tell your caller — free text, the human-readable detail."},
+                                        "kind": {"type": "string",
+                                                 "enum": ["result", "question", "blocker"],
+                                                 "description": "What you're sending back — result | question | blocker. Required."}},
+                          "required": ["message", "kind"]}),
+        Tool(name="ask_human",
+             description=("Ask the human a question when you genuinely can't decide or don't "
+                          "know how to proceed — sends it to the sysadmin Telegram bot as a "
+                          "clickable link (a small page showing your question with a text box "
+                          "to answer). Works whether or not this run carries a Kanban card — "
+                          "no card required. This call itself just sends the question and "
+                          "returns; you do NOT poll for the answer. When the human answers, "
+                          "your session is automatically resumed with their answer as the next "
+                          "prompt (same mechanism used for Agents Flow wakeups), so simply stop "
+                          "here for this turn.\n\n"
+                          "If this run also carries a Kanban card, ALSO call "
+                          "`move_kanban_task(status='need_human', comment=...)` yourself — this "
+                          "tool does not move Kanban cards, it only reaches the human directly."),
+             inputSchema={"type": "object",
+                          "properties": {"question": {"type": "string",
+                                                      "description": "The question/decision needed, in plain language. Be specific — this is shown verbatim to the human."}},
+                          "required": ["question"]}),
+        Tool(name="mark_flow_done",
+             description=("Agentic-flow action: declare the task you were dispatched to do "
+                          "FINISHED — the third terminal action, alongside calling another "
+                          "agent (run_agent_async) and reporting to your caller "
+                          "(return_to_caller_agent). Use this when you completed the work "
+                          "yourself and there's nothing left to hand off or report.\n\n"
+                          "`outcome` is REQUIRED and structured — it decides the Kanban status, "
+                          "not just informational text:\n"
+                          "- `success`: fully done as asked → card moves to `done`.\n"
+                          "- `partial`: you did meaningful work but it's incomplete/degraded → "
+                          "card still moves to `done` (there's nothing more YOU can do), explain "
+                          "the gap in `summary`.\n"
+                          "- `failed`: the task did NOT conclude successfully → card moves to "
+                          "`need_human` instead, with `summary` as the required explanation of "
+                          "what went wrong (same rule as `need_human` elsewhere: problem, what "
+                          "you tried, what's needed).\n\n"
+                          "If this run is tied to a Kanban card (you have a NOTION_TASK_ID), "
+                          "this moves that card for you — you don't need to call "
+                          "move_kanban_task yourself. Without a card, marking the run is the "
+                          "only effect.\n\n"
+                          "QA accountability — pass `qa_run_id` (the Run.id of the QA agent run that "
+                          "reviewed this work) or `qa_not_needed=true` (explicit \"no QA applies here\", "
+                          "e.g. docs-only/trivial change) if you know which applies. Never both. If you "
+                          "pass NEITHER, the backend auto-looks-up a recent succeeded QA-agent run "
+                          "against this same card/target before giving up — useful in a multi-hop flow "
+                          "where a different hop already ran QA and you don't know its run_id. Only "
+                          "rejected (asking you to pick one explicitly) when no such run is found."),
+             inputSchema={"type": "object",
+                          "properties": {"summary": {"type": "string",
+                                                     "description": "What was done (or what went wrong, if outcome=failed) — becomes the Kanban card comment if there's a card. Required when outcome='failed'."},
+                                        "outcome": {"type": "string",
+                                                    "enum": ["success", "partial", "failed"],
+                                                    "description": "How the task concluded — success | partial | failed. Required."},
+                                        "qa_run_id": {"type": "string",
+                                                      "description": "Run.id of the QA agent run that reviewed this work. Mutually exclusive with qa_not_needed — exactly one is required."},
+                                        "qa_not_needed": {"type": "boolean",
+                                                          "description": "True if no QA pass applies to this task. Mutually exclusive with qa_run_id — exactly one is required."}},
+                          "required": ["outcome"]}),
+        Tool(name="mark_as_planned",
+             description=("Agentic-flow action for PLANNING work — use this instead of "
+                          "`mark_flow_done` when what you concluded is a PLAN/design/spec, not "
+                          "a shippable implementation (e.g. Architect finishing a design, a "
+                          "planning pass before building). `mark_flow_done(outcome='success')` "
+                          "means 'the feature is done' — this means 'the plan now exists and is "
+                          "ready for someone to build against', which is a different claim and "
+                          "moves the card to a different column (`planned`, not `done`).\n\n"
+                          "Counts as a valid way to end your flow turn (same as the 3 other "
+                          "terminal actions) — no extra action needed alongside it.\n\n"
+                          "If this run is tied to a Kanban card (NOTION_TASK_ID set), moves it to "
+                          "`planned` with `summary` as the card comment. Without a card, marking "
+                          "the run is the only effect — the plan lives in this run's own output, "
+                          "which is where it belongs when there's nothing to persist it to.\n\n"
+                          "No QA accountability required (there's no code yet to review)."),
+             inputSchema={"type": "object",
+                          "properties": {"summary": {"type": "string",
+                                                     "description": "Summary of what was planned — becomes the Kanban card comment if there's a card."}},
+                          "required": []}),
         Tool(name="run_status",
              description=("Return the current Run row: status, output, error, tokens, "
                           "and (for workflows) `limit_reached` if a budget cap stopped it.\n\n"
@@ -1150,6 +1252,16 @@ def _err(status: int, text: str) -> list[TextContent]:
                         text=json.dumps({"error": True, "status": status, "message": text}, indent=2))]
 
 
+def _caller_run_id(args: dict) -> str | None:
+    """Which run is calling us. Prefers the gateway-injected
+    ``_gateway_caller_run_id`` (set from the per-run X-Aw-Caller-Run-Id
+    header — see api/agents.py::write_run_mcp_config) since this process is a
+    single shared subprocess whose own os.environ can't carry per-call
+    identity. Falls back to AW_RUN_ID for direct/non-gateway invocations
+    (e.g. a local stdio test)."""
+    return args.get("_gateway_caller_run_id") or os.environ.get("AW_RUN_ID")
+
+
 async def _poll_run(c: httpx.AsyncClient, run_id: str, *, timeout_s: int = 900) -> dict:
     for _ in range(timeout_s):
         await asyncio.sleep(1.0)
@@ -1242,11 +1354,10 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
                 body["session_id"] = args["session_id"]
             if args.get("notion_task_id"):
                 body["notion_task_id"] = args["notion_task_id"]
-            # Chain-depth loop guard: tell the backend which run is dispatching this
-            # one, from our own AW_RUN_ID env var (set by core/models/cli.py when this
-            # docker CLI agent was launched) — not something the calling LLM sets.
-            if os.environ.get("AW_RUN_ID"):
-                body["caller_run_id"] = os.environ["AW_RUN_ID"]
+            # Chain-depth loop guard: tell the backend which run is dispatching
+            # this one — not something the calling LLM sets, see _caller_run_id.
+            if _rid := _caller_run_id(args):
+                body["caller_run_id"] = _rid
             r = await c.post(f"{BASE}/api/agents/{args['slug']}/run", json=body)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "run_workflow_async":
@@ -1257,9 +1368,52 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
                 body["target_id"] = args["target_id"]
             if args.get("target_slug"):
                 body["target_slug"] = args["target_slug"]
-            if os.environ.get("AW_RUN_ID"):
-                body["caller_run_id"] = os.environ["AW_RUN_ID"]
+            if _rid := _caller_run_id(args):
+                body["caller_run_id"] = _rid
             r = await c.post(f"{BASE}/api/workflows/{args['slug']}/run", json=body)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "return_to_caller_agent":
+            own_run_id = _caller_run_id(args)
+            if not own_run_id:
+                return _err(400, "Could not identify the calling run — this tool only works inside a docker CLI agent run.")
+            if args.get("kind") not in ("result", "question", "blocker"):
+                return _err(400, "kind is required and must be one of: result, question, blocker")
+            r = await c.post(f"{BASE}/api/runs/{own_run_id}/return-to-caller",
+                             json={"message": args["message"], "kind": args["kind"]})
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "ask_human":
+            own_run_id = _caller_run_id(args)
+            if not own_run_id:
+                return _err(400, "Could not identify this run — this tool only works inside a docker CLI agent run.")
+            question = (args.get("question") or "").strip()
+            if not question:
+                return _err(400, "question is required")
+            r = await c.post(f"{BASE}/api/telegram/question",
+                             json={"run_id": own_run_id, "question": question})
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "mark_flow_done":
+            own_run_id = _caller_run_id(args)
+            if not own_run_id:
+                return _err(400, "Could not identify this run — this tool only works inside a docker CLI agent run.")
+            if args.get("outcome") not in ("success", "partial", "failed"):
+                return _err(400, "outcome is required and must be one of: success, partial, failed")
+            qa_run_id = args.get("qa_run_id") or None
+            qa_not_needed = bool(args.get("qa_not_needed"))
+            if qa_run_id and qa_not_needed:
+                return _err(400, "pass either qa_run_id or qa_not_needed=true, not both")
+            # Neither given is NOT rejected here — the backend auto-resolves qa_run_id
+            # from context (same notion_task_id/target_id, most recent succeeded qa-*
+            # agent run) before rejecting for real. See core.wakeups.mark_flow_done.
+            r = await c.post(f"{BASE}/api/runs/{own_run_id}/mark-done",
+                             json={"summary": args.get("summary") or "", "outcome": args["outcome"],
+                                   "qa_run_id": qa_run_id, "qa_not_needed": qa_not_needed})
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "mark_as_planned":
+            own_run_id = _caller_run_id(args)
+            if not own_run_id:
+                return _err(400, "Could not identify this run — this tool only works inside a docker CLI agent run.")
+            r = await c.post(f"{BASE}/api/runs/{own_run_id}/mark-planned",
+                             json={"summary": args.get("summary") or ""})
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name in ("run_status", "get_run"):
             params = {"summary": "true"} if args.get("summary") else {}

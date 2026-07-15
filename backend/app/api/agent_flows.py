@@ -49,7 +49,9 @@ def create_agent_flow(body: AgentFlowIn, s: Session = Depends(get_session)):
     slug = (body.slug or "").strip() or _generate_slug(s, body.name)
     if _slug_taken(slug, s):
         raise HTTPException(409, "slug already exists")
-    f = AgentFlow(slug=slug, name=body.name, description=body.description, graph=body.graph)
+    f = AgentFlow(slug=slug, name=body.name, description=body.description, graph=body.graph,
+                 enabled=body.enabled, max_hops=body.max_hops,
+                 budget_tokens=body.budget_tokens, budget_usd=body.budget_usd)
     s.add(f)
     s.commit()
     s.refresh(f)

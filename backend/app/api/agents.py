@@ -51,8 +51,10 @@ def _inject_gateway_token(cfg: dict) -> dict:
     return updated
 
 
-def _write_agent_mcp_config(agent: Agent, cli: str | None = None, s: Session | None = None) -> None:
-    """Generate CLI-specific MCP config files in data/agents-platform/{agent.id}/."""
+def _resolve_agent_mcp_servers(agent: Agent, s: Session | None) -> dict:
+    """The effective mcp_config.servers dict for `agent` — AgentConfig's wins
+    over the inline column when `agent_config_slug` is set, same precedence
+    as `_resolve_agent_config` in core/executor.py."""
     mcp = agent.mcp_config or {}
     if agent.agent_config_slug and s is not None:
         from ..models import AgentConfig
@@ -60,12 +62,16 @@ def _write_agent_mcp_config(agent: Agent, cli: str | None = None, s: Session | N
                                           AgentConfig.deleted_at.is_(None)).first()
         if cfg:
             mcp = cfg.mcp_config or {}
-    servers: dict = mcp.get("servers") or {}
-    if not servers:
-        return
+    return mcp.get("servers") or {}
 
-    agent_dir = _AGENTS_DATA_DIR / agent.id
+
+def _write_mcp_config_files(agent_dir: Path, servers: dict, extra_headers: dict[str, str] | None = None) -> None:
+    """Write CLI-specific MCP config files (mcp.json for Claude/Gemini/Cursor,
+    mcp_codex.toml for Codex) into `agent_dir`. `extra_headers` are merged
+    onto every server's headers (e.g. a per-run caller-identity header) —
+    they win over the server's own headers of the same name."""
     agent_dir.mkdir(parents=True, exist_ok=True)
+    extra_headers = extra_headers or {}
 
     # ── Claude format (used for --mcp-config flag) ─────────────────────────
     claude_mcp = {
@@ -73,7 +79,7 @@ def _write_agent_mcp_config(agent: Agent, cli: str | None = None, s: Session | N
             name: {
                 "type": cfg.get("type", "streamable-http"),
                 "url": cfg["url"],
-                **({"headers": h} if (h := _inject_gateway_token(cfg).get("headers")) else {}),
+                **({"headers": h} if (h := {**_inject_gateway_token(cfg).get("headers", {}), **extra_headers}) else {}),
             }
             for name, cfg in servers.items()
             if cfg.get("url")
@@ -96,12 +102,63 @@ def _write_agent_mcp_config(agent: Agent, cli: str | None = None, s: Session | N
         lines.append(f"[mcp_servers.{key}]")
         lines.append(f'type = "{cfg.get("type", "streamable-http")}"')
         lines.append(f'url = "{cfg["url"]}"')
-        if cfg.get("headers"):
-            for k, v in cfg["headers"].items():
-                lines.append(f'[mcp_servers.{key}.headers]')
+        merged_headers = {**(cfg.get("headers") or {}), **extra_headers}
+        if merged_headers:
+            lines.append(f'[mcp_servers.{key}.headers]')
+            for k, v in merged_headers.items():
                 lines.append(f'{k} = "{v}"')
-                break  # only first header section needed
     (agent_dir / "mcp_codex.toml").write_text("\n".join(lines) + "\n")
+
+
+def _write_agent_mcp_config(agent: Agent, cli: str | None = None, s: Session | None = None) -> None:
+    """Generate CLI-specific MCP config files in data/agents-platform/{agent.id}/."""
+    servers = _resolve_agent_mcp_servers(agent, s)
+    if not servers:
+        return
+    _write_mcp_config_files(_AGENTS_DATA_DIR / agent.id, servers)
+
+
+def _context_headers(extra_context: dict[str, str] | None) -> dict[str, str]:
+    """Turn {"NOTION_TASK_ID": "abc"} into {"X-Aw-Context-Notion-Task-Id": "abc"}.
+
+    The AW MCP gateway (src/mcp/gateway.py) reads any `X-Aw-Context-*` header
+    on the connection and exposes it to every upstream MCP tool call as
+    `arguments["_aw_context"][NAME]` (header name uppercased, hyphens ->
+    underscores) — so e.g. src/mcp/kanban.py can fall back to it for page_id
+    instead of depending on the model reading $NOTION_TASK_ID and passing it
+    correctly on every call.
+    """
+    if not extra_context:
+        return {}
+    return {
+        "X-Aw-Context-" + "-".join(w.capitalize() for w in k.split("_")): v
+        for k, v in extra_context.items() if v
+    }
+
+
+def write_run_mcp_config(agent: Agent, run_id: str, s: Session,
+                          extra_context: dict[str, str] | None = None) -> str | None:
+    """Write a PER-RUN mcp config — same servers as `_write_agent_mcp_config`,
+    plus an `X-Aw-Caller-Run-Id: <run_id>` header on every server so the AW
+    MCP gateway can identify which run is calling it (agent_mcp.py's
+    run_agent_async/return_to_caller_agent need this — see core/wakeups.py),
+    plus one `X-Aw-Context-*` header per `extra_context` entry (see
+    `_context_headers` — e.g. NOTION_TASK_ID for a run tied to a Kanban card).
+
+    Written to its own `runs/{run_id}/` subdirectory (not the shared
+    per-agent one `_write_agent_mcp_config` uses) so concurrent runs of the
+    same agent never race on which run_id "wins" in a shared file.
+
+    Returns the directory path if servers were configured, else None (caller
+    should fall back to the static per-agent dir with no caller-id header).
+    """
+    servers = _resolve_agent_mcp_servers(agent, s)
+    if not servers:
+        return None
+    run_dir = _AGENTS_DATA_DIR / agent.id / "runs" / run_id
+    extra_headers = {"X-Aw-Caller-Run-Id": run_id, **_context_headers(extra_context)}
+    _write_mcp_config_files(run_dir, servers, extra_headers=extra_headers)
+    return str(run_dir)
 
 
 @router.get("/_resettable")
@@ -374,6 +431,16 @@ async def run_agent_ep(slug: str, body: RunInput, s: Session = Depends(get_sessi
         target_id = adhoc.id
     from ..core.executor import AgentChainLoopError, _resolve_hop_count
     caller_run_id = body.caller_run_id
+    if not notion_task_id and caller_run_id:
+        # Inherit the calling run's own Kanban-card binding when the caller
+        # (a flow hop via run_agent_async) didn't pass notion_task_id itself
+        # — same fix as X-Aw-Context for page_id, one layer up: a handoff
+        # shouldn't silently drop the card just because the dispatching
+        # agent forgot to read $NOTION_TASK_ID and pass it through.
+        from ..models import Run
+        caller = s.query(Run).filter(Run.id == caller_run_id).first()
+        if caller and caller.notion_task_id:
+            notion_task_id = caller.notion_task_id
     try:
         hop_count = _resolve_hop_count(caller_run_id)
     except AgentChainLoopError as e:

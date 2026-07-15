@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from . import admin, agent_configs, agent_flows, agent_groups, agents, consolidation, evals, flowise, github, health, lessons, mcp, models, playground, remote_agents, retro_scores, runs, sessions, settings, skills, targets, telegram, tools, tunnels, whatsapp, workflows, ws, ws_agent
+from . import admin, agent_configs, agent_flows, agent_groups, agents, consolidation, evals, flowise, gallery, github, health, lessons, mcp, models, playground, remote_agents, retro_scores, runs, sessions, settings, skills, targets, telegram, tools, tunnels, whatsapp, workflows, ws, ws_agent
 
 api_router = APIRouter()
 api_router.include_router(health.router)
@@ -35,3 +35,4 @@ api_router.include_router(tunnels.router)
 api_router.include_router(sessions.router)
 api_router.include_router(flowise.router)
 api_router.include_router(whatsapp.router)
+api_router.include_router(gallery.router)

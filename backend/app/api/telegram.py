@@ -16,7 +16,7 @@ import re
 import tempfile
 import threading
 import time as _time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session
 from ..core.security import get_setting
 from ..db import get_session, session_scope
 from ..models import (Agent, CrispalConversationSuggestion, CrispalSuggestionFeedback,
-                      CrispalWhatsappMessage, Run, RunEvent,
+                      CrispalWhatsappMessage, HumanQuestion, Run, RunEvent,
                       Target, TelegramBot, TelegramInboundMessage, TelegramSession)
 
 log = logging.getLogger("ap.telegram")
@@ -165,7 +165,7 @@ def _edit_message_text(token: str, chat_id: str, message_id: int,
             text=text, parse_mode=parse_mode,
             reply_markup={"inline_keyboard": []})
     except Exception:
-        pass
+        log.exception("edit_message_text failed chat_id=%s message_id=%s", chat_id, message_id)
 
 
 def _delete_history_messages(token: str, chat_id: str, message_ids: list) -> None:
@@ -404,6 +404,233 @@ def suggestion_edit_submit(suggestion_id: str, body: SuggestionEditSubmit,
                                f"✏️ Editado e enviado — {row.customer_name}\n\n{final_text}")
 
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Ask-human question mini-app — any agent's `ask_human` MCP tool call lands
+# here. Independent of Kanban: works whether or not the run carries a card.
+# Sends a clickable link to the sysadmin bot's admins; answering resumes the
+# SAME agent session (core.executor.run_agent with session_id=session_id),
+# same "reprompt" mechanism Agents Flow uses for its own wakeups.
+# Served publicly (Caddy whitelists /api/telegram/question/*) — same reason
+# as the progress/suggestion mini-apps: no aw_jwt cookie in the WebApp shell.
+# ---------------------------------------------------------------------------
+
+class AskHumanCreate(BaseModel):
+    run_id: str
+    question: str
+
+
+@router.post("/question", include_in_schema=False)
+def create_human_question(body: AskHumanCreate, s: Session = Depends(get_session)) -> dict:
+    run = s.query(Run).filter(Run.id == body.run_id).first()
+    if not run:
+        raise HTTPException(404, f"run {body.run_id} not found")
+    question = body.question.strip()
+    if not question:
+        raise HTTPException(400, "question is required")
+
+    bot = _sysadmin_bot(s)
+    if not bot:
+        raise HTTPException(503, "no enabled sysadmin bot configured — cannot reach a human")
+    admin_ids = list(bot.admin_user_ids or [])
+    if not admin_ids:
+        raise HTTPException(503, "sysadmin bot has no admin_user_ids configured")
+
+    row = HumanQuestion(
+        run_id=run.id, session_id=run.session_id, agent_slug=run.source_slug or "unknown",
+        target_id=run.target_id, notion_task_id=run.notion_task_id, question=question,
+        bot_id=bot.id, chat_id=str(admin_ids[0]),
+    )
+    s.add(row)
+    s.commit()
+    s.refresh(row)
+
+    ap_url = os.environ.get("AP_PUBLIC_URL", "https://agents-platform.app.aw.tekflox.com")
+    url = f"{ap_url}/api/telegram/question/{row.token}"
+    text = f"❓ <b>{row.agent_slug}</b> precisa de uma definição sua:\n\n{question[:500]}"
+    try:
+        message_id, _ = _send_button_message(bot.token, row.chat_id, text,
+                                             "Ver e responder", url, web_app=True)
+        if message_id:
+            row.message_id = message_id
+            s.commit()
+    except Exception:
+        log.warning("ask_human: telegram send failed for question %s", row.id, exc_info=True)
+
+    return {"ok": True, "id": row.id, "token": row.token, "url": url}
+
+
+@router.get("/question/{token}", include_in_schema=False)
+def human_question_page(token: str) -> HTMLResponse:
+    return HTMLResponse(_HUMAN_QUESTION_HTML.replace("__TOKEN__", token))
+
+
+@router.get("/question/{token}/data", include_in_schema=False)
+def human_question_data(token: str, s: Session = Depends(get_session)) -> dict:
+    row = s.query(HumanQuestion).filter(HumanQuestion.token == token).first()
+    if not row:
+        raise HTTPException(404, "question not found")
+    return {"agent_slug": row.agent_slug, "question": row.question,
+            "status": row.status, "answer": row.answer}
+
+
+class HumanQuestionAnswer(BaseModel):
+    answer: str
+
+
+@router.post("/question/{token}/answer", include_in_schema=False)
+def human_question_answer(token: str, body: HumanQuestionAnswer,
+                          s: Session = Depends(get_session)) -> dict:
+    row = s.query(HumanQuestion).filter(HumanQuestion.token == token).first()
+    if not row:
+        raise HTTPException(404, "question not found")
+    if row.status != "pending":
+        raise HTTPException(409, f"question already {row.status}")
+
+    answer = body.answer.strip()
+    if not answer:
+        raise HTTPException(400, "answer is required")
+
+    row.answer = answer
+    row.status = "answered"
+    row.answered_at = datetime.utcnow()
+    s.commit()
+
+    if row.bot_id and row.chat_id and row.message_id:
+        bot = s.query(TelegramBot).filter(TelegramBot.id == row.bot_id).first()
+        if bot:
+            try:
+                _edit_message_text(bot.token, row.chat_id, row.message_id,
+                                   f"✅ Respondido — {row.agent_slug}\n\n{row.question[:300]}\n\n"
+                                   f"<b>Resposta:</b> {answer[:500]}")
+            except Exception:
+                log.warning("ask_human: telegram edit failed for question %s", row.id, exc_info=True)
+
+    if row.session_id:
+        prompt = (f"A human answered your question:\n\n{answer}\n\n"
+                 f"(original question: {row.question})\n\nContinue the task with this answer.")
+        import uuid as _uuid_mod
+        new_run_id = _uuid_mod.uuid4().hex
+        from ..core.executor import run_agent as _run_agent
+        with session_scope() as s2:
+            s2.add(Run(id=new_run_id, kind="agent", target_slug=row.agent_slug, status="pending",
+                      input={"input": prompt}, target_id=row.target_id, source_slug=row.agent_slug,
+                      notion_task_id=row.notion_task_id, initiator_kind="wakeup"))
+        _coro = _run_agent(row.agent_slug, prompt, run_id=new_run_id, session_id=row.session_id,
+                           target_id=row.target_id, notion_task_id=row.notion_task_id,
+                           initiator_kind="wakeup")
+        if _MAIN_LOOP is not None:
+            asyncio.run_coroutine_threadsafe(_coro, _MAIN_LOOP)
+        else:
+            log.warning("ask_human: _MAIN_LOOP not set, cannot resume run %s", row.run_id)
+
+    return {"ok": True}
+
+
+_HUMAN_QUESTION_HTML = r"""<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Pergunta do agente</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0d0d0f;--surface:#1a1a1f;--border:#2a2a32;--fg:#e8e8ed;--hint:#8e8e98;--red:#ff453a;--green:#30d158}
+html,body{height:100%}
+body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:flex;flex-direction:column;padding:14px;gap:12px}
+#head{font-size:13px;color:var(--hint)}
+#head b{color:var(--fg)}
+#question{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px;font-size:15px;line-height:1.5;white-space:pre-wrap}
+label{font-size:12px;color:var(--hint);font-weight:600}
+textarea{background:var(--surface);color:var(--fg);border:1px solid var(--border);border-radius:10px;padding:12px;font-size:15px;line-height:1.5;resize:vertical;font-family:inherit;min-height:140px}
+textarea:focus{outline:none;border-color:#0a84ff}
+.field{display:flex;flex-direction:column;gap:6px}
+#status{font-size:13px;padding:8px 0}
+#status.ok{color:var(--green)}
+#status.err{color:var(--red)}
+#send{display:none;background:var(--green);color:#000;border:none;border-radius:10px;padding:12px;font-size:15px;font-weight:600;cursor:pointer}
+#send:disabled{background:var(--border);color:var(--hint);cursor:not-allowed}
+</style>
+</head>
+<body>
+<div id="head">Pergunta de <b id="agent">…</b></div>
+<div id="question">Carregando…</div>
+<div class="field">
+  <label for="answer">Sua resposta</label>
+  <textarea id="answer" placeholder="Digite a resposta ou decisão…"></textarea>
+</div>
+<div id="status"></div>
+<button id="send">Enviar resposta</button>
+<script>
+const TOKEN = "__TOKEN__";
+const tg = window.Telegram && window.Telegram.WebApp;
+const agentEl = document.getElementById("agent");
+const questionEl = document.getElementById("question");
+const answerEl = document.getElementById("answer");
+const statusEl = document.getElementById("status");
+const sendBtn = document.getElementById("send");
+
+async function load() {
+  try {
+    const r = await fetch(`/api/telegram/question/${TOKEN}/data`);
+    if (!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    agentEl.textContent = d.agent_slug || "agente";
+    questionEl.textContent = d.question || "";
+    if (d.status !== "pending") {
+      statusEl.textContent = `Essa pergunta já foi ${d.status}.`;
+      statusEl.className = "err";
+      answerEl.value = d.answer || "";
+      answerEl.disabled = true;
+    }
+  } catch (e) {
+    statusEl.textContent = "Erro ao carregar: " + e.message;
+    statusEl.className = "err";
+  }
+}
+
+async function send() {
+  const answer = answerEl.value.trim();
+  if (!answer) return;
+  sendBtn.disabled = true;
+  statusEl.textContent = "Enviando…";
+  statusEl.className = "";
+  try {
+    const r = await fetch(`/api/telegram/question/${TOKEN}/answer`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({answer}),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    statusEl.textContent = "✅ Enviado! O agente vai continuar com essa resposta.";
+    statusEl.className = "ok";
+    answerEl.disabled = true;
+    setTimeout(() => { tg && tg.close && tg.close(); }, 1200);
+  } catch (e) {
+    statusEl.textContent = "Erro ao enviar: " + e.message;
+    statusEl.className = "err";
+    sendBtn.disabled = false;
+  }
+}
+
+sendBtn.addEventListener("click", send);
+sendBtn.style.display = "block";
+load();
+if (tg) {
+  tg.ready && tg.ready();
+  tg.expand && tg.expand();
+  if (tg.MainButton) {
+    tg.MainButton.setText("Enviar resposta");
+    tg.MainButton.show();
+    tg.MainButton.onClick(send);
+  }
+}
+</script>
+</body>
+</html>
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -2053,6 +2280,7 @@ def _handle_approval_callback(cq_id: str, cq_data: str, chat_id: str, bot_token:
 
     is_agent_run = entry.get("request_type") == "agent_run"
     _noun = "Execução" if is_agent_run else "Segredo"
+    _secret_html = html.escape(str(entry.get("secret_name") or ""))
 
     if action == "deny":
         entry["status"] = "denied"
@@ -2060,7 +2288,7 @@ def _handle_approval_callback(cq_id: str, cq_data: str, chat_id: str, bot_token:
         msg_id = entry["message_ids"].get(str(chat_id))
         if msg_id:
             _edit_message_text(bot_token, str(chat_id), msg_id,
-                               f"❌ {_noun} <code>{entry['secret_name']}</code> negad{'a' if is_agent_run else 'o'}.")
+                               f"❌ {_noun} <code>{_secret_html}</code> negad{'a' if is_agent_run else 'o'}.")
         return
 
     if is_agent_run:
@@ -2071,7 +2299,7 @@ def _handle_approval_callback(cq_id: str, cq_data: str, chat_id: str, bot_token:
         msg_id = entry["message_ids"].get(str(chat_id))
         if msg_id:
             _edit_message_text(bot_token, str(chat_id), msg_id,
-                               f"✅ Execução <code>{entry['secret_name']}</code> aprovada.")
+                               f"✅ Execução <code>{_secret_html}</code> aprovada.")
         return
 
     # approve — retrieve the actual secret value (vault-first, Lambda fallback,
@@ -2087,7 +2315,7 @@ def _handle_approval_callback(cq_id: str, cq_data: str, chat_id: str, bot_token:
         _answer_callback_query(bot_token, cq_id, f"✅ Aprovado ({_scope_label})")
         msg_id = entry["message_ids"].get(str(chat_id))
         _edit_message_text(bot_token, str(chat_id), msg_id,
-                           f"✅ Segredo <code>{entry['secret_name']}</code> aprovado "
+                           f"✅ Segredo <code>{_secret_html}</code> aprovado "
                            f"(<b>{_scope_label}</b>).")
     except Exception as exc:
         log.exception("approval: Lambda call failed for %s", request_id)
@@ -2146,6 +2374,18 @@ def _kanban_update_status(page_id: str, status_name: str) -> None:
         json={"properties": {"Status": {"select": {"name": status_name}}}},
         timeout=10,
     )
+
+
+def _kanban_set_rich_text(page_id: str, prop: str, value: str) -> None:
+    try:
+        httpx.patch(
+            f"{_NOTION_API}/pages/{page_id}",
+            headers=_notion_headers(),
+            json={"properties": {prop: {"rich_text": [{"text": {"content": value}}]}}},
+            timeout=8,
+        )
+    except Exception:
+        log.exception("kanban: failed to stamp %s=%s on page %s", prop, value, page_id)
 
 
 def _kanban_text_prop(page: dict, prop: str) -> str:
@@ -2311,6 +2551,17 @@ def execute_kanban_card(page_id: str, agent_slug: str | None = None) -> dict:
         run_id = asyncio.run_coroutine_threadsafe(_start_run(), _MAIN_LOOP).result(timeout=30)
     else:
         run_id = asyncio.run(_start_run())
+
+    _kanban_set_rich_text(page_id, "AgentRunId", run_id)
+    if agent_slug.startswith("qa-"):
+        # QA-typed agents (slug convention "qa-*" — AgentGroup "qas") get
+        # QARunId/QAAgent stamped automatically, server-side, the instant the
+        # run is known — never left to the agent to call set_qa_status
+        # itself (2026-07-15, mirrors the same fix in AW's notion_kanban.py
+        # _fire_agent_run, which only covers the webhook/move_kanban_task
+        # dispatch path — this is the start_now / Telegram-button path).
+        _kanban_set_rich_text(page_id, "QARunId", run_id)
+        _kanban_set_rich_text(page_id, "QAAgent", agent_slug)
 
     return {"ok": True, "run_id": run_id, "card_title": card_title, "agent_slug": agent_slug}
 
@@ -3035,6 +3286,33 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
             ).start()
             return {"ok": True, "reason": "slash /compact queued"}
 
+        if cmd == "images":
+            # Admin-only, independent of the general ACL check above (which
+            # only fires when bot.admin_user_ids is already non-empty) —
+            # mints a 24h gallery share-link token so photos can be uploaded
+            # through the webapp instead of inline through the LLM context.
+            if user_id not in (bot.admin_user_ids or []):
+                _send_message(bot.token, chat_id, "⛔ Only bot admins can use /images.")
+                return {"ok": True, "reason": "slash /images not authorized"}
+            from ..models import GalleryToken
+            expires_at = datetime.utcnow() + timedelta(hours=24)
+            with session_scope() as ss:
+                tok = GalleryToken(bot_slug=bot.id, origin_chat_id=chat_id,
+                                   created_by=user_id, expires_at=expires_at)
+                ss.add(tok)
+                ss.flush()
+                token = tok.token
+            ap_url = os.environ.get("AP_PUBLIC_URL", "https://agents-platform.app.aw.tekflox.com")
+            gallery_url = f"{ap_url}/gallery?token={token}"
+            if str(chat_id) == str(user_id):
+                # Private DM → Mini App shell (enables tg.expand()/MainButton).
+                # Web app buttons only work in private chats, not groups.
+                _send_button_message(bot.token, chat_id, "🖼 Galeria de Imagens (24h)",
+                                     "🖼 Abrir galeria", gallery_url, web_app=True)
+            else:
+                _send_message(bot.token, chat_id, f"🖼 Galeria (24h):\n{gallery_url}")
+            return {"ok": True, "reason": "slash /images"}
+
         if cmd in ("help", "?"):
             _send_message(bot.token, chat_id,
                           "🤖 <b>Agents Platform commands</b>\n"
@@ -3046,6 +3324,7 @@ async def webhook(bot_id: str, request: Request, s: Session = Depends(get_sessio
                           "/abort — stop the run in progress\n"
                           "/compact — compress conversation context to save tokens\n"
                           "/clear — same as /new: start a fresh conversation\n"
+                          "/images — get a gallery upload link (admin only)\n"
                           "/help — show this message")
             return {"ok": True, "reason": "slash /help"}
         # Unknown slash command → fall through to the agent dispatch below.

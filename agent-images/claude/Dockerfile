@@ -48,9 +48,13 @@ RUN echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers && \
     chown -R ubuntu:ubuntu /opt/agent-npm
 
 # ── aw-connector (WS event streamer) ─────────────────────────────────────────
-RUN pip3 install --no-cache-dir --break-system-packages websockets
+RUN pip3 install --no-cache-dir --break-system-packages websockets redis
 COPY shared/aw-connector /usr/local/bin/aw-connector
 RUN chmod +x /usr/local/bin/aw-connector
+
+# ── aw-connector-redis (Redis Stream event streamer) ─────────────────────────
+COPY shared/aw-connector-redis /usr/local/bin/aw-connector-redis
+RUN chmod +x /usr/local/bin/aw-connector-redis
 
 # ── Claude CLI ────────────────────────────────────────────────────────────────
 USER ubuntu

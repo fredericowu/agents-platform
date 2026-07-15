@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timedelta
+from typing import Any
 
 from ..db import session_scope
 from ..models import Run, ScheduledWakeup
@@ -166,6 +167,11 @@ async def _rerun_and_deliver(log_id: str, *, agent_slug: str, prompt: str, sessi
                                  target_id=target_id, initiator_kind="wakeup",
                                  initiator_id=initiator_id)
         fired_run_id = (result or {}).get("run_id")
+        if fired_run_id:
+            # Tag this resumed turn with whatever flow the session's own
+            # prior turn belonged to — see executor._inherit_flow_from_session.
+            from .executor import _inherit_flow_from_session
+            _inherit_flow_from_session(fired_run_id, session_id)
         out = (result or {}).get("reply") or (result or {}).get("text", "")
         if (result or {}).get("status") != "success":
             err = (result or {}).get("error") or "run did not succeed"
@@ -179,6 +185,301 @@ async def _rerun_and_deliver(log_id: str, *, agent_slug: str, prompt: str, sessi
         err = str(e)
         log.warning("%s failed: %s", log_id, e)
     return fired_run_id, err
+
+
+RETURN_KINDS = ("result", "question", "blocker")
+
+_RETURN_KIND_LABEL = {
+    "result": "✅ Resultado do agente que você chamou",
+    "question": "❓ Pergunta do agente que você chamou",
+    "blocker": "🚧 Bloqueio reportado pelo agente que você chamou",
+}
+
+
+async def return_to_caller(*, run_id: str, message: str, kind: str) -> dict[str, Any]:
+    """Explicit agentic-flow action: the CALLEE decides to send ``message``
+    back to whoever called it — resolved via its own row's ``parent_run_id``
+    (always set on any run_agent_async-dispatched run, independent of
+    ``call_me_back`` — see ``_resolve_hop_count``), NOT via the
+    callback_origin_run_id/register_agent_callback machinery (which only
+    arms when the caller set call_me_back not-false).
+
+    ``kind`` (one of RETURN_KINDS) is the agent's structured declaration of
+    WHAT it's sending back — persisted on ``Run.return_kind`` so a caller
+    (or a human auditing runs) can check the *tool call*, not just parse
+    ``message`` prose. Validated here (not just at the MCP schema layer) so
+    a malformed direct HTTP call can't slip an unlisted value through.
+
+    No-op (but still ``{"ok": True, "noop": True}``, not a silent failure)
+    when this run's own ``call_me_back`` is already True — the automatic
+    callback path (``_watch_and_callback``) will already resume the caller
+    when this run ends, and firing both would double-resume it.
+    """
+    if kind not in RETURN_KINDS:
+        return {"ok": False, "reason": f"kind must be one of {RETURN_KINDS}, got {kind!r}"}
+
+    with session_scope() as s:
+        own = s.query(Run).filter(Run.id == run_id).first()
+        if own is None:
+            return {"ok": False, "reason": f"run {run_id} not found"}
+        # Mark unconditionally (even on the "no caller"/no-op branches below) —
+        # calling this tool at all is the signal that the agent deliberately
+        # tried to report back, which is what the Agents Flow "lost agent"
+        # safety net (_took_flow_action) checks for.
+        own.return_to_caller_done = True
+        own.return_kind = kind
+        if own.call_me_back:
+            return {"ok": True, "noop": True,
+                    "reason": ("call_me_back is already true on this run — the automatic "
+                              "callback will deliver your result to the caller when this "
+                              "run ends, no need to call return_to_caller_agent")}
+        parent_run_id = own.parent_run_id
+
+    if not parent_run_id:
+        return {"ok": False, "reason": "no caller — this run has no parent_run_id (it's the root of its chain)"}
+
+    with session_scope() as s:
+        parent = s.query(Run).filter(Run.id == parent_run_id).first()
+        if parent is None:
+            return {"ok": False, "reason": f"caller run {parent_run_id} not found"}
+        agent_slug = parent.source_slug
+        target_id = parent.target_id
+        session_id = parent.session_id
+        initiator_kind = parent.initiator_kind
+        initiator_id = parent.initiator_id
+
+    if not agent_slug or not session_id:
+        return {"ok": False, "reason": "caller run is missing agent_slug/session_id — can't resume it"}
+
+    channel = _resolve_channel(initiator_kind, parent_run_id, session_id)
+    label = _RETURN_KIND_LABEL[kind]
+    prompt = f"{label} (run {run_id}):\n\n{message}"
+    fired_run_id, err = await _rerun_and_deliver(
+        f"return-to-caller {run_id}", agent_slug=agent_slug, prompt=prompt,
+        session_id=session_id, target_id=target_id, initiator_id=initiator_id or "",
+        channel=channel or "",
+    )
+    if err:
+        return {"ok": False, "reason": err}
+    return {"ok": True, "resumed_run_id": fired_run_id, "caller_agent": agent_slug, "kind": kind}
+
+
+FLOW_OUTCOMES = ("success", "partial", "failed")
+
+
+def _find_qa_run_for_context(s, *, notion_task_id: str | None, target_id: str | None,
+                             exclude_run_id: str) -> str | None:
+    """Best-effort lookup for mark_flow_done's QA auto-resolution: the most
+    recent SUCCEEDED run of any agent whose slug starts with ``qa-`` (the
+    project's naming convention — qa-haiku, qa-sonnet, ...) against the same
+    context. Same Kanban card (``notion_task_id``) when there is one,
+    otherwise same ``target_id``. Never matches ``exclude_run_id`` itself.
+    Returns None (not an error) when nothing matches — the caller decides
+    what that means."""
+    from ..models import Agent
+    qa_slugs = [a.slug for a in
+                s.query(Agent.slug).filter(Agent.slug.like("qa-%"), Agent.deleted_at.is_(None)).all()]
+    if not qa_slugs:
+        return None
+    q = s.query(Run).filter(Run.source_slug.in_(qa_slugs), Run.status == "success",
+                            Run.id != exclude_run_id)
+    if notion_task_id:
+        q = q.filter(Run.notion_task_id == notion_task_id)
+    elif target_id:
+        q = q.filter(Run.target_id == target_id)
+    else:
+        return None
+    match = q.order_by(Run.ended_at.desc().nullslast(), Run.started_at.desc()).first()
+    return match.id if match else None
+
+
+async def mark_flow_done(*, run_id: str, summary: str, outcome: str,
+                         qa_run_id: str | None = None, qa_not_needed: bool = False) -> dict[str, Any]:
+    """Explicit agentic-flow action: the agent declares the task finished —
+    the third of the 3 terminal actions (alongside handoff and
+    return_to_caller_agent). Marks ``Run.marked_flow_done`` and persists
+    ``outcome`` on ``Run.flow_outcome`` — the agent's structured verdict,
+    checkable via the tool call itself (see FLOW_OUTCOMES) rather than by
+    parsing ``summary`` prose.
+
+    ``outcome`` also decides which Kanban status this drives when the run
+    carries a card (notion_task_id): "success"/"partial" move it to
+    ``done``; "failed" moves it to ``need_human`` instead (the task did NOT
+    conclude successfully — that's a human-needed outcome, not a done one),
+    reusing ``summary`` as the required need_human comment. Without a card,
+    marking the run is the only effect.
+
+    **QA accountability — enforced here, not just at the MCP schema layer:**
+    exactly one of ``qa_run_id`` (the Run.id of the QA agent run that
+    reviewed this work) or ``qa_not_needed=True`` (an explicit declaration
+    that no QA pass applies) must end up set. Both given at once →
+    rejected (contradictory). Neither given → before rejecting, this
+    AUTO-RESOLVES: it looks for a QA agent run (any agent whose slug starts
+    with ``qa-``) that already succeeded against the same context (same
+    ``notion_task_id``, or same ``target_id`` when there's no card) and
+    uses that run's id — a flow can fan out into several hops before the
+    one that finally calls mark_flow_done, and that hop has no way to know
+    which earlier hop's run_id a QA agent used. Only if no such run is
+    found does this actually reject and ask the caller to pass one of the
+    two explicitly. A supplied ``qa_run_id`` must also resolve to a real
+    run — a fabricated id is rejected rather than silently trusted.
+
+    If the card IS linked but the move is rejected (e.g. the hard lock in
+    /api/notion/kanban/move that blocks done/ready_to_deploy/need_human while
+    QAStatus=In Progress — see notion_kanban.py), this must NOT fall back to
+    set-qa-status: that would stamp QAStatus=Done and force the card to
+    "done" out from under an *active* QA review that this run has nothing to
+    do with, silently clobbering it. Instead — same pattern as
+    core.executor._escalate_need_human — ping sysadmins on Telegram so a
+    human notices the card wasn't updated, rather than dropping it silently."""
+    if outcome not in FLOW_OUTCOMES:
+        return {"ok": False, "reason": f"outcome must be one of {FLOW_OUTCOMES}, got {outcome!r}"}
+    if outcome == "failed" and not summary.strip():
+        return {"ok": False, "reason": "summary is required when outcome='failed' — it becomes the "
+                                       "need_human comment explaining what went wrong"}
+
+    qa_run_id = (qa_run_id or "").strip() or None
+    if qa_run_id and qa_not_needed:
+        return {"ok": False, "reason": "pass either qa_run_id or qa_not_needed=True, not both"}
+
+    with session_scope() as s:
+        own = s.query(Run).filter(Run.id == run_id).first()
+        if own is None:
+            return {"ok": False, "reason": f"run {run_id} not found"}
+
+        if qa_run_id:
+            qa_run = s.query(Run.id).filter(Run.id == qa_run_id).first()
+            if qa_run is None:
+                return {"ok": False, "reason": f"qa_run_id {qa_run_id!r} does not match any known run"}
+        elif not qa_not_needed:
+            auto_qa_run_id = _find_qa_run_for_context(
+                s, notion_task_id=own.notion_task_id, target_id=own.target_id, exclude_run_id=run_id)
+            if auto_qa_run_id:
+                qa_run_id = auto_qa_run_id
+                log.info("mark-flow-done auto-resolved qa_run_id=%s for run=%s (context match, "
+                        "caller didn't pass qa_run_id/qa_not_needed)", auto_qa_run_id, run_id)
+            else:
+                return {"ok": False, "reason": "QA accountability is required — call mark_flow_done "
+                                               "again with either qa_run_id=<the QA run's Run.id> (if "
+                                               "a QA agent reviewed this work) or qa_not_needed=True "
+                                               "(if no QA pass applies here). No prior QA run was found "
+                                               "automatically for this context."}
+
+        own.marked_flow_done = True
+        own.flow_outcome = outcome
+        own.qa_run_id = qa_run_id
+        own.qa_not_needed = qa_not_needed
+        notion_task_id = own.notion_task_id
+
+    if not notion_task_id:
+        return {"ok": True, "notion_task_id": None}
+
+    kanban_status = "need_human" if outcome == "failed" else "done"
+    import os as _os
+
+    def _notify_mark_done_rejected(extra: str) -> None:
+        try:
+            from ..api.telegram import notify_sysadmins
+            notify_sysadmins(f"🆘 Agents Flow mark_flow_done couldn't update Kanban — run "
+                             f"{run_id}, card {notion_task_id}, outcome={outcome}.{extra}\n"
+                             f"https://agents-platform.app.aw.tekflox.com/runs/{run_id}")
+        except Exception:
+            log.warning("mark-flow-done sysadmin notify failed run=%s", run_id, exc_info=True)
+
+    try:
+        import httpx as _httpx
+        awserv = _os.environ.get("AWSERV_BASE", "http://127.0.0.1:9123")
+        api_key = ""
+        try:
+            key_path = _os.path.join(_os.environ.get("AW_BASE_DIR", "/opt/agentic-workspace"), ".tmp", "awserv_api_key")
+            with open(key_path) as _f:
+                api_key = _f.read().strip()
+        except Exception:
+            pass
+        headers = {"X-Api-Key": api_key} if api_key else {}
+        async with _httpx.AsyncClient(timeout=10.0) as c:
+            resp = await c.post(f"{awserv}/api/notion/kanban/move",
+                                json={"page_id": notion_task_id, "status": kanban_status,
+                                      "comment": summary, "run_id": run_id},
+                                headers=headers)
+        if resp.status_code != 200:
+            _notify_mark_done_rejected(
+                f"\n(move to {kanban_status} was rejected — {resp.status_code}: {resp.text[:200]} — "
+                "likely mid-QA-cycle hard lock. Card status was NOT updated, check it manually.)")
+            return {"ok": False, "reason": f"kanban move to {kanban_status} failed: {resp.status_code} {resp.text[:200]}"}
+    except Exception as e:
+        _notify_mark_done_rejected(f"\n(move to {kanban_status} failed — {e}. Card status was NOT updated, check it manually.)")
+        return {"ok": False, "reason": f"kanban move to {kanban_status} failed: {e}"}
+    return {"ok": True, "notion_task_id": notion_task_id, "kanban_status": kanban_status, "outcome": outcome}
+
+
+async def mark_flow_planned(*, run_id: str, summary: str) -> dict[str, Any]:
+    """A 4th terminal action, alongside handoff / return_to_caller_agent /
+    mark_flow_done — for PLANNING work (design, ADR, spec) rather than
+    implementation. Distinct from mark_flow_done("success") because
+    planning concluding does NOT mean the feature is done/shippable — it
+    means a plan now exists and is ready for someone to build against. No
+    QA accountability is required here (there's no code to review yet).
+
+    Sets ``Run.marked_flow_done = True`` (so the Agents Flow safety net's
+    ``_took_flow_action`` check is satisfied — planning IS a valid way to
+    conclude a flow turn, not a special case it needs to know about
+    separately) and ``Run.flow_outcome = "planned"`` (distinguishable from
+    success/partial/failed in the run's own record).
+
+    If this run carries a Kanban card, moves it to the ``planned`` status
+    (a new column, alongside backlog/ready/done/etc. — see
+    notion.agents_kanban.statuses in aw.json) with ``summary`` as the
+    card comment. Without a card, marking the run is the only effect — the
+    plan lives in this run's own output/context, which is exactly where
+    Frederico asked for it to be when there's nothing to persist it to."""
+    with session_scope() as s:
+        own = s.query(Run).filter(Run.id == run_id).first()
+        if own is None:
+            return {"ok": False, "reason": f"run {run_id} not found"}
+        own.marked_flow_done = True
+        own.flow_outcome = "planned"
+        notion_task_id = own.notion_task_id
+
+    if not notion_task_id:
+        return {"ok": True, "notion_task_id": None, "outcome": "planned"}
+
+    import os as _os
+
+    def _notify_mark_planned_rejected(extra: str) -> None:
+        try:
+            from ..api.telegram import notify_sysadmins
+            notify_sysadmins(f"🆘 Agents Flow mark_flow_planned couldn't update Kanban — run "
+                             f"{run_id}, card {notion_task_id}.{extra}\n"
+                             f"https://agents-platform.app.aw.tekflox.com/runs/{run_id}")
+        except Exception:
+            log.warning("mark-flow-planned sysadmin notify failed run=%s", run_id, exc_info=True)
+
+    try:
+        import httpx as _httpx
+        awserv = _os.environ.get("AWSERV_BASE", "http://127.0.0.1:9123")
+        api_key = ""
+        try:
+            key_path = _os.path.join(_os.environ.get("AW_BASE_DIR", "/opt/agentic-workspace"), ".tmp", "awserv_api_key")
+            with open(key_path) as _f:
+                api_key = _f.read().strip()
+        except Exception:
+            pass
+        headers = {"X-Api-Key": api_key} if api_key else {}
+        async with _httpx.AsyncClient(timeout=10.0) as c:
+            resp = await c.post(f"{awserv}/api/notion/kanban/move",
+                                json={"page_id": notion_task_id, "status": "planned",
+                                      "comment": summary, "run_id": run_id},
+                                headers=headers)
+        if resp.status_code != 200:
+            _notify_mark_planned_rejected(
+                f"\n(move to planned was rejected — {resp.status_code}: {resp.text[:200]} — "
+                "likely mid-QA-cycle hard lock. Card status was NOT updated, check it manually.)")
+            return {"ok": False, "reason": f"kanban move to planned failed: {resp.status_code} {resp.text[:200]}"}
+    except Exception as e:
+        _notify_mark_planned_rejected(f"\n(move to planned failed — {e}. Card status was NOT updated, check it manually.)")
+        return {"ok": False, "reason": f"kanban move to planned failed: {e}"}
+    return {"ok": True, "notion_task_id": notion_task_id, "kanban_status": "planned", "outcome": "planned"}
 
 
 def register_agent_callback(*, watch_run_id: str, origin_run_id: str) -> bool:
@@ -205,26 +506,72 @@ def register_agent_callback(*, watch_run_id: str, origin_run_id: str) -> bool:
     return True
 
 
+_CALLBACK_DB_MAX_RETRIES = 5  # transient DB errors per poll (pool timeout, dropped connection)
+_CALLBACK_DB_RETRY_BACKOFF_S = 2  # doubles each retry: 2, 4, 8, 16, 32s
+# Redis pub/sub (executor.notify_run_finished) wakes this up immediately when
+# the watched run finalises. This fallback interval only covers a missed
+# publish (subscribe/publish race, Redis blip) — normal case never waits it out.
+_CALLBACK_FALLBACK_POLL_S = 30
+_CALLBACK_MAX_ITERS = (_CALLBACK_POLL_S * _CALLBACK_MAX_POLLS) // _CALLBACK_FALLBACK_POLL_S  # same ~1h ceiling
+
+
 async def _watch_and_callback(watch_run_id: str) -> None:
+    """Wait for ``watch_run_id`` to go terminal, then deliver the callback.
+
+    Event-driven: blocks on a Redis pub/sub signal (``notify_run_finished``,
+    fired by executor.py right after it commits the run's terminal status)
+    instead of sleeping and re-querying Postgres on a fixed cadence. The DB
+    row is still the source of truth — a wake-up (real or fallback-timeout)
+    only means "go check it", never "assume success". If Redis is down or a
+    publish is missed, ``wait_run_finished`` returns False after
+    ``_CALLBACK_FALLBACK_POLL_S`` and we just re-check the DB anyway, so this
+    degrades to the old polling behaviour (at a coarser interval) rather than
+    hanging forever.
+
+    A transient DB error here (pool exhaustion, dropped connection) must not
+    kill this asyncio task outright — an unhandled exception in a
+    fire-and-forget ``asyncio.create_task`` is only visible as "Task
+    exception was never retrieved" in the logs, with no retry and no signal
+    to the user that their callback was silently dropped (confirmed
+    2026-07-14: a QueuePool timeout did exactly this). Each check gets its
+    own short retry-with-backoff before giving up on THAT check and moving to
+    the next wait cycle; only exhausting retries across
+    ``_CALLBACK_DB_MAX_RETRIES`` consecutive attempts (not just one) escalates
+    to ERROR and abandons the watch."""
+    from .redis_streams import wait_run_finished
     terminal = {"success", "error", "cancelled"}
     status, output, run_error, origin_run_id = None, None, None, None
-    for _ in range(_CALLBACK_MAX_POLLS):
-        with session_scope() as s:
-            r = s.query(Run).filter(Run.id == watch_run_id).first()
-            if r is None:
-                log.warning("agent-callback: watched run %s vanished", watch_run_id)
+    consecutive_db_errors = 0
+    for _ in range(_CALLBACK_MAX_ITERS):
+        try:
+            with session_scope() as s:
+                r = s.query(Run).filter(Run.id == watch_run_id).first()
+                if r is None:
+                    log.warning("agent-callback: watched run %s vanished", watch_run_id)
+                    return
+                if r.callback_done:
+                    return  # already handled (e.g. a rearm raced this same task)
+                origin_run_id = r.callback_origin_run_id
+                if r.status in terminal:
+                    status, run_error = r.status, r.error
+                    output = (r.output or {}).get("text", "") if isinstance(r.output, dict) else None
+                    break
+        except Exception as e:  # noqa: BLE001 — transient DB error, retry before giving up
+            consecutive_db_errors += 1
+            log.warning("agent-callback: DB error checking watch_run=%s (attempt %d/%d): %s",
+                       watch_run_id, consecutive_db_errors, _CALLBACK_DB_MAX_RETRIES, e)
+            if consecutive_db_errors >= _CALLBACK_DB_MAX_RETRIES:
+                log.error("agent-callback: giving up on watch_run=%s after %d consecutive DB "
+                         "errors — callback NOT delivered, origin_run=%s left unresumed",
+                         watch_run_id, consecutive_db_errors, origin_run_id, exc_info=True)
                 return
-            if r.callback_done:
-                return  # already handled (e.g. a rearm raced this same task)
-            origin_run_id = r.callback_origin_run_id
-            if r.status in terminal:
-                status, run_error = r.status, r.error
-                output = (r.output or {}).get("text", "") if isinstance(r.output, dict) else None
-                break
-        await asyncio.sleep(_CALLBACK_POLL_S)
+            await asyncio.sleep(_CALLBACK_DB_RETRY_BACKOFF_S * (2 ** (consecutive_db_errors - 1)))
+            continue
+        consecutive_db_errors = 0
+        await wait_run_finished(watch_run_id, timeout_s=_CALLBACK_FALLBACK_POLL_S)
     else:
         log.warning("agent-callback: watched run %s never reached terminal after %ds",
-                    watch_run_id, _CALLBACK_POLL_S * _CALLBACK_MAX_POLLS)
+                    watch_run_id, _CALLBACK_FALLBACK_POLL_S * _CALLBACK_MAX_ITERS)
         return
 
     if not origin_run_id:
@@ -245,13 +592,23 @@ async def _watch_and_callback(watch_run_id: str) -> None:
         initiator_kind = origin.initiator_kind
         initiator_id = origin.initiator_id
 
+    # `channel` only decides how (or whether) a human gets notified — it must
+    # NOT gate whether the caller's session gets resumed. A run whose origin
+    # isn't telegram/watch/wakeup (e.g. dispatched by the Kanban webhook, or
+    # itself a plain agent-to-agent call — initiator_kind=="agent_run" in
+    # both cases) has no channel, but the caller's session must still resume:
+    # that's the entire point of agentic-flow hand-offs, where the "delivery"
+    # that matters is the resumed session continuing to work the Kanban card,
+    # not a human-facing notification. See _rerun_and_deliver / the
+    # `deliver_recovered_run` / `_deliver_watch` callees — both already
+    # self-guard when there's nothing to notify (2026-07-13 fix).
     channel = _resolve_channel(initiator_kind, origin_run_id, session_id) if session_id else None
     # Atomic claim (False->True) so a concurrent rearm can't double-fire.
     if not _mark_callback_done(watch_run_id):
         return
-    if not channel or not initiator_id or not agent_slug or not session_id:
-        log.info("agent-callback: watch_run=%s not deliverable (agent=%s session=%s channel=%s)",
-                 watch_run_id, agent_slug, session_id, channel)
+    if not agent_slug or not session_id:
+        log.info("agent-callback: watch_run=%s can't resume (missing agent=%s session=%s)",
+                 watch_run_id, agent_slug, session_id)
         return
 
     if status == "success":
@@ -264,7 +621,7 @@ async def _watch_and_callback(watch_run_id: str) -> None:
 
     await _rerun_and_deliver(
         f"agent-callback {watch_run_id}", agent_slug=agent_slug, prompt=prompt,
-        session_id=session_id, target_id=target_id, initiator_id=initiator_id, channel=channel,
+        session_id=session_id, target_id=target_id, initiator_id=initiator_id or "", channel=channel or "",
     )
 
 
@@ -339,4 +696,71 @@ def rearm_pending_wakeups() -> int:
         asyncio.create_task(_fire_after(wid))
     if ids:
         log.info("re-armed %d pending wakeup(s) after restart", len(ids))
+    return len(ids)
+
+
+async def _fire_stuck_wakeup_run(run_id: str) -> None:
+    """Actually execute a pre-created wakeup Run row that never got its
+    scheduled `run_agent()` coroutine off the ground (see
+    `rearm_stuck_wakeup_runs` for why this happens)."""
+    with session_scope() as s:
+        r = s.query(Run).filter(Run.id == run_id).first()
+        if r is None or r.status != "pending":
+            return  # vanished or already picked up by something else
+        agent_slug = r.source_slug
+        session_id = r.session_id
+        target_id = r.target_id
+        notion_task_id = r.notion_task_id
+        user_input = (r.input or {}).get("input", "")
+    if not agent_slug or not user_input:
+        log.warning("stuck-wakeup-run %s missing agent_slug/input — leaving as-is", run_id)
+        return
+    try:
+        from .executor import run_agent
+        log.info("firing stuck wakeup run=%s agent=%s session=%s", run_id, agent_slug,
+                 (session_id or "")[:8])
+        result = await run_agent(agent_slug, user_input, run_id=run_id, session_id=session_id,
+                                 target_id=target_id, notion_task_id=notion_task_id,
+                                 initiator_kind="wakeup")
+        out = (result or {}).get("reply") or (result or {}).get("text", "")
+        if out:
+            from ..api.telegram import deliver_recovered_run
+            await deliver_recovered_run(run_id, out)
+    except Exception:
+        log.warning("failed to fire stuck wakeup run=%s", run_id, exc_info=True)
+
+
+_STUCK_WAKEUP_MIN_AGE_S = 20  # don't race a run whose fire-and-forget task is merely still in flight
+
+
+def rearm_stuck_wakeup_runs() -> int:
+    """Re-fire wakeup-initiated Run rows that were pre-created (to avoid a
+    race — see `_rerun_and_deliver` / `ask_human`'s answer handler, both of
+    which insert the Run row with status='pending' BEFORE scheduling the
+    actual `run_agent()` coroutine as fire-and-forget via
+    `asyncio.run_coroutine_threadsafe`) but never executed, because the
+    process that scheduled them died/restarted before that coroutine ran.
+
+    Unlike `rearm_pending_agent_callbacks` (which re-arms WATCHERS for runs
+    still in flight) and `recover_orphaned_runs` (which only re-attaches runs
+    that reached status='running'), nothing previously covered this case: a
+    Run stuck at status='pending' with initiator_kind='wakeup' is invisible
+    to both — the fire-and-forget scheduling was the only thing that would
+    have ever moved it forward, and that's exactly what a restart destroys.
+    Confirmed live 2026-07-15 (run left pending indefinitely after an
+    `ask_human` answer landed right as the backend was mid-restart for an
+    unrelated deploy).
+
+    Only re-fires rows older than `_STUCK_WAKEUP_MIN_AGE_S` — a fresh pending
+    row's fire-and-forget task may simply not have started yet (this function
+    also runs at boot, when nothing has had a chance to run at all)."""
+    cutoff = datetime.utcnow() - timedelta(seconds=_STUCK_WAKEUP_MIN_AGE_S)
+    with session_scope() as s:
+        ids = [r.id for r in s.query(Run).filter(
+            Run.status == "pending", Run.initiator_kind == "wakeup",
+            Run.started_at < cutoff).all()]
+    for rid in ids:
+        asyncio.create_task(_fire_stuck_wakeup_run(rid))
+    if ids:
+        log.info("re-fired %d stuck wakeup run(s)", len(ids))
     return len(ids)

@@ -49,6 +49,9 @@ class Agent(Base):
     inherit_from: Mapped[str | None] = mapped_column(String, nullable=True)  # slug of parent agent to inherit system_prompt from
     agent_config_slug: Mapped[str | None] = mapped_column(String, nullable=True)  # slug of an AgentConfig — when set, its permissions/extra_volumes/mcp_config win over the columns above
     group_slug: Mapped[str | None] = mapped_column(String, nullable=True)  # slug of an AgentGroup — when set, AgentGroup.instructions is prepended to this agent's system_prompt at run time
+    kanban_target_status: Mapped[str | None] = mapped_column(String, nullable=True)  # logical Kanban status key (e.g. "ready_to_deploy") this agent moves its card to on completion — overrides AgentGroup.kanban_target_status when set
+    capabilities: Mapped[str] = mapped_column(Text, default="")  # short (<=100 words) plain-English summary of what this agent can do — read by other agents deciding who to hand a task off to; overrides AgentGroup.capabilities when set
+    hidden_from_flow: Mapped[bool] = mapped_column(Boolean, default=False)  # excluded from the Agents Flow connected-agents context list (direct or via group expansion) — NOT enforced, still callable by slug
     builtin: Mapped[bool] = mapped_column(Boolean, default=False)
     icon: Mapped[str] = mapped_column(String, default="bot")
     color: Mapped[str] = mapped_column(String, default="#58a6ff")
@@ -89,6 +92,8 @@ class AgentGroup(Base):
     name: Mapped[str] = mapped_column(String)
     description: Mapped[str] = mapped_column(Text, default="")
     instructions: Mapped[str] = mapped_column(Text, default="")
+    kanban_target_status: Mapped[str | None] = mapped_column(String, nullable=True)  # default logical Kanban status key member agents move their card to on completion — Agent.kanban_target_status overrides this per-agent
+    capabilities: Mapped[str] = mapped_column(Text, default="")  # short (<=100 words) plain-English summary of what member agents can do — Agent.capabilities overrides this per-agent
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
@@ -116,16 +121,52 @@ class AgentFlow(Base):
 
     Unlike Workflow.graph (an *execution* DAG the executor runs), this graph
     is descriptive only — agents read it (via their instructions) to decide
-    who to call next. Not tied to Notion; may be used alongside it."""
+    who to call next. Not tied to Notion; may be used alongside it.
+
+    ``enabled`` gates runtime behavior: when True, any agent that appears as
+    a node in this graph gets the aw-agents-flow skill auto-injected into
+    its system prompt at dispatch time, followed by the list of agents
+    directly connected to it in THIS graph (see
+    core/executor.py::_agents_flow_context). Still not enforced — the agent
+    can call anyone, the connected-agents list is just guidance."""
     __tablename__ = "agent_flows"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
     slug: Mapped[str] = mapped_column(String, unique=True, index=True)
     name: Mapped[str] = mapped_column(String)
     description: Mapped[str] = mapped_column(Text, default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     graph: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)   # {nodes:[{id,type:"source"|"agent",agent_slug?,label,position}], edges:[{id,source,target}]}
+    # Per-flow overrides for the Agents Flow safety net (core/executor.py::
+    # _check_flow_completion). All nullable — null means "fall back to the
+    # global agent_chain_max_hops setting" (max_hops) or "no cap" (the two
+    # budgets). Checked against the rolled-up totals across every run
+    # sharing a flow_run_id (Run.flow_run_id); hitting either escalates the
+    # flow to Need Human instead of continuing, same destination as the
+    # hop-count guard.
+    max_hops: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    budget_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    budget_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class AgentFlowRun(Base):
+    """One row per hop (round) inside a live Agents Flow execution — not to
+    be confused with AgentFlow (the topology graph definition). ``flow_run_id``
+    is generated once, on the root hop (hop_index=0), and shared by every
+    subsequent hop in the same chain (inherited via Run.parent_run_id ->
+    Run.flow_run_id, see core/executor.py::_record_flow_hop). Denormalized
+    onto Run.flow_run_id/Run.flow_slug too so the Runs list UI never needs to
+    join here — this table exists for the full round-by-round history."""
+    __tablename__ = "agent_flow_runs"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    flow_run_id: Mapped[str] = mapped_column(String, index=True)
+    flow_slug: Mapped[str] = mapped_column(String, index=True)
+    run_id: Mapped[str] = mapped_column(String, ForeignKey("runs.id"), index=True)
+    agent_slug: Mapped[str] = mapped_column(String)
+    hop_index: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
 class Run(Base):
@@ -187,6 +228,59 @@ class Run(Base):
     # AW_RUN_ID (auto-forwarded by mcp_server/agent_mcp.py). Checked against the
     # `agent_chain_max_hops` setting to abort runaway A→B→A call chains.
     hop_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # Agents Flow safety net (core/executor.py::_took_flow_action /
+    # _agents_flow_context). return_to_caller_done is set by
+    # core.wakeups.return_to_caller on ITS OWN run's row when called (even a
+    # no-op counts — it's still a deliberate decision). is_flow_reprompt marks
+    # a run that was fired BY the "lost agent" safety net (not a normal
+    # dispatch) — used to count how many times a session has been reprompted
+    # before escalating to Need Human.
+    return_to_caller_done: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_flow_reprompt: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Denormalized from AgentFlowRun (see that model) so the Runs list UI can
+    # show/group/color by flow without a join. Set once at Run-creation time
+    # by core/executor.py::_record_flow_hop; null for runs outside any flow.
+    flow_run_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    flow_slug: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Set on every run sharing this flow_run_id once _escalate_need_human
+    # fires for the flow (hop-count exceeded or the "lost agent" reprompt
+    # gave up) — a persistent "this flow needed a human at some point" mark,
+    # not just the one hop that triggered it. Drives the yellow border on
+    # the Flow chip in the Runs UI. Propagated onto new hops the same way
+    # flow_run_id/flow_slug are (see core/executor.py::_record_flow_hop /
+    # _inherit_flow_from_session) so it survives a human resuming the flow.
+    flow_needs_human: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Set by core.wakeups.mark_flow_done when the agent calls the
+    # mark_flow_done MCP tool — the explicit "I'm done" exit distinct from
+    # handing off (①) or returning to caller (②). Also moves the Kanban card
+    # to done when notion_task_id is set.
+    marked_flow_done: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Structured verdict fields on the two "free text" terminal actions — the
+    # agent's actual DECISION lives in these enum-ish columns (validated by
+    # the MCP tool's inputSchema, so a caller can check the *tool call*
+    # rather than parse prose), while message/summary remains free text for
+    # the human-readable detail. flow_outcome: "success" | "failed" |
+    # "partial" (mark_flow_done). return_kind: "result" | "question" |
+    # "blocker" (return_to_caller_agent). Both nullable — null for runs that
+    # predate this column or never took that action.
+    flow_outcome: Mapped[str | None] = mapped_column(String, nullable=True)
+    return_kind: Mapped[str | None] = mapped_column(String, nullable=True)
+    # mark_flow_done's QA accountability fields (core.wakeups.mark_flow_done) —
+    # exactly one of the two must be set, enforced server-side: either
+    # qa_run_id points at the Run.id of the QA agent run that reviewed this
+    # work, or qa_not_needed=True is the agent's explicit declaration that no
+    # QA pass applies here. Prevents a card sliding to done with neither a QA
+    # trail nor an explicit "QA doesn't apply" call.
+    qa_run_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    qa_not_needed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # Effective system prompt actually sent to the LLM for this run (instructions
+    # + skills + Agents Flow context, joined) — persisted at dispatch time so it's
+    # inspectable afterwards (e.g. in the Run Detail UI), since it's otherwise
+    # only held in-memory by the one-shot CLI process. None for runs predating
+    # this column or where composition failed.
+    system_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     events: Mapped[list["RunEvent"]] = relationship(back_populates="run", cascade="all, delete-orphan")
     children: Mapped[list["Run"]] = relationship("Run",
@@ -598,6 +692,32 @@ class CrispalConversationSuggestion(Base):
     decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
+class HumanQuestion(Base):
+    """A question an agent couldn't resolve on its own, sent to the human via
+    the sysadmin Telegram bot as a clickable link (mini-app: question text +
+    a free-text answer box), independent of whether the run carries a Kanban
+    card. Answering resumes the SAME agent session with the answer as the
+    next prompt (see api/telegram.py's question-answer route calling
+    core.executor.run_agent with session_id=session_id) — this is the
+    ask_human MCP tool's backing store."""
+    __tablename__ = "human_questions"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    token: Mapped[str] = mapped_column(String, unique=True, index=True, default=_uuid)
+    run_id: Mapped[str] = mapped_column(String, index=True)
+    session_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    agent_slug: Mapped[str] = mapped_column(String)
+    target_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    notion_task_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    question: Mapped[str] = mapped_column(Text)
+    answer: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String, default="pending")  # pending|answered
+    bot_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    chat_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class CrispalWhatsappMessage(Base):
     """One WhatsApp Cloud API message for the Crispal store, in or out.
 
@@ -630,3 +750,100 @@ class CrispalSuggestionFeedback(Base):
     suggestion_id: Mapped[str] = mapped_column(String, ForeignKey("crispal_conversation_suggestions.id"), index=True)
     instruction_text: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class GalleryToken(Base):
+    """A share-link token minted by the `/images` Telegram command — lets an
+    admin upload photos through the gallery webapp without those images ever
+    entering the LLM's context window."""
+    __tablename__ = "gallery_tokens"
+    token: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    bot_slug: Mapped[str] = mapped_column(String, index=True)
+    origin_chat_id: Mapped[str] = mapped_column(String)
+    created_by: Mapped[str] = mapped_column(String)  # Telegram user id of the admin who minted it
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class GalleryBlock(Base):
+    """One upload action (one HTTP multipart POST) = one block. Scoping unit
+    for `list_gallery_images` — spans all tokens for a bot, not just the
+    active one (rotating the link must not orphan earlier blocks)."""
+    __tablename__ = "gallery_blocks"
+    __table_args__ = (
+        Index("ix_gallery_blocks_bot_slug", "bot_slug"),
+    )
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    token: Mapped[str] = mapped_column(String, ForeignKey("gallery_tokens.token"), index=True)
+    bot_slug: Mapped[str] = mapped_column(String)
+    origin_chat_id: Mapped[str] = mapped_column(String)
+    image_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    notified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    images: Mapped[list["GalleryImage"]] = relationship(
+        back_populates="block", cascade="all, delete-orphan"
+    )
+
+
+class GalleryImage(Base):
+    """One uploaded file. `file_path` is the absolute, on-disk path — the
+    same input `arvin`/`crispal_image_search` already accept, so intake
+    stays a flat file-path handoff."""
+    __tablename__ = "gallery_images"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    block_id: Mapped[str] = mapped_column(
+        String, ForeignKey("gallery_blocks.id", ondelete="CASCADE"), index=True
+    )
+    file_path: Mapped[str] = mapped_column(Text)
+    original_name: Mapped[str] = mapped_column(String)
+    mime: Mapped[str] = mapped_column(String, default="")
+    bytes: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+    block: Mapped["GalleryBlock"] = relationship(back_populates="images")
+    image_tags: Mapped[list["GalleryImageTag"]] = relationship(
+        back_populates="image", cascade="all, delete-orphan"
+    )
+
+
+def _normalize_tag(raw: str) -> str:
+    """Case-insensitive, whitespace-collapsed tag vocabulary key — shared
+    business rule (not UI convention) enforced by GalleryTag's unique
+    constraint so "Inverno"/"inverno"/" INVERNO " collapse to one row."""
+    return " ".join(raw.strip().casefold().split())
+
+
+class GalleryTag(Base):
+    """A tag in a bot's gallery vocabulary. First-class entity (not a loose
+    string on GalleryImage) so autocomplete and the agent's free-text tag
+    queries share one normalized vocabulary."""
+    __tablename__ = "gallery_tags"
+    __table_args__ = (
+        UniqueConstraint("bot_slug", "normalized_name", name="uq_gallery_tag_bot_norm"),
+        Index("ix_gallery_tags_bot_slug", "bot_slug"),
+    )
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    bot_slug: Mapped[str] = mapped_column(String)
+    name: Mapped[str] = mapped_column(String)             # display form, first-typed casing wins
+    normalized_name: Mapped[str] = mapped_column(String)  # _normalize_tag(name)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class GalleryImageTag(Base):
+    """Join row linking one GalleryImage to one GalleryTag."""
+    __tablename__ = "gallery_image_tags"
+    __table_args__ = (
+        UniqueConstraint("image_id", "tag_id", name="uq_gallery_image_tag"),
+    )
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    image_id: Mapped[str] = mapped_column(
+        String, ForeignKey("gallery_images.id", ondelete="CASCADE"), index=True
+    )
+    tag_id: Mapped[str] = mapped_column(
+        String, ForeignKey("gallery_tags.id", ondelete="CASCADE"), index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+    image: Mapped["GalleryImage"] = relationship(back_populates="image_tags")

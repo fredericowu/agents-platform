@@ -46,6 +46,10 @@ function AgentFlowCanvas() {
   const [name, setName] = useState(isNew ? "" : "");
   const [description, setDescription] = useState("");
   const [editedSlug, setEditedSlug] = useState(isNew ? "" : "");
+  const [enabled, setEnabled] = useState(false);
+  const [maxHops, setMaxHops] = useState<string>("");
+  const [budgetTokens, setBudgetTokens] = useState<string>("");
+  const [budgetUsd, setBudgetUsd] = useState<string>("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
@@ -70,6 +74,10 @@ function AgentFlowCanvas() {
       setName(f.name);
       setDescription(f.description);
       setEditedSlug(f.slug);
+      setEnabled(f.enabled);
+      setMaxHops(f.max_hops != null ? String(f.max_hops) : "");
+      setBudgetTokens(f.budget_tokens != null ? String(f.budget_tokens) : "");
+      setBudgetUsd(f.budget_usd != null ? String(f.budget_usd) : "");
       setNodes((f.graph?.nodes || []).map(toRfNode));
       setEdges((f.graph?.edges || []).map(toRfEdge));
     }).catch(e => setError(String(e.message || e)));
@@ -149,15 +157,23 @@ function AgentFlowCanvas() {
     setSaving(true); setError("");
     try {
       if (!name.trim()) throw new Error("name is required");
+      const max_hops = maxHops.trim() ? Number(maxHops) : null;
+      const budget_tokens = budgetTokens.trim() ? Number(budgetTokens) : null;
+      const budget_usd = budgetUsd.trim() ? Number(budgetUsd) : null;
       if (isNew) {
-        const created = await api.createAgentFlow({ slug: editedSlug || undefined, name, description, graph });
+        const created = await api.createAgentFlow({
+          slug: editedSlug || undefined, name, description, enabled, graph,
+          max_hops, budget_tokens, budget_usd,
+        });
         nav(`/agents-flow/${created.slug}`);
       } else if (slug) {
         const targetSlug = editedSlug.trim() || slug;
         if (targetSlug !== slug) {
           await api.renameAgentFlow(slug, targetSlug);
         }
-        await api.saveAgentFlow(targetSlug, { name, description, graph });
+        await api.saveAgentFlow(targetSlug, {
+          name, description, enabled, graph, max_hops, budget_tokens, budget_usd,
+        });
         if (targetSlug !== slug) nav(`/agents-flow/${targetSlug}`);
       }
     } catch (e: any) {
@@ -173,6 +189,13 @@ function AgentFlowCanvas() {
           actions={
             <>
               <button className="btn" onClick={() => nav("/agents-flow")} data-testid="agent-flow-back">back</button>
+              <button
+                className={`btn ${enabled ? "btn-primary" : ""}`}
+                onClick={() => setEnabled(v => !v)}
+                title="When enabled, agents in this flow get the aw-agents-flow skill and their connected-agents context injected at dispatch time."
+                data-testid="agent-flow-enabled-toggle">
+                {enabled ? "● enabled" : "○ disabled"}
+              </button>
               <button className="btn btn-primary" onClick={onSave} disabled={saving} data-testid="agent-flow-save">
                 {saving ? "saving..." : (isNew ? "create" : "save")}
               </button>
@@ -189,6 +212,18 @@ function AgentFlowCanvas() {
         </FormRow>
         <FormRow label="description">
           <input value={description} onChange={e => setDescription(e.target.value)} data-testid="agent-flow-description" />
+        </FormRow>
+        <FormRow label="max hops" hint="loop guard override for this flow — blank falls back to the global agent_chain_max_hops setting">
+          <input type="number" min={1} value={maxHops} onChange={e => setMaxHops(e.target.value)}
+                 placeholder="global default" data-testid="agent-flow-max-hops" />
+        </FormRow>
+        <FormRow label="token budget" hint="total tokens across every run in this flow — reaching it escalates to Need Human instead of continuing">
+          <input type="number" min={0} value={budgetTokens} onChange={e => setBudgetTokens(e.target.value)}
+                 placeholder="no cap" data-testid="agent-flow-budget-tokens" />
+        </FormRow>
+        <FormRow label="cost budget (USD)" hint="total cost across every run in this flow — reaching it escalates to Need Human instead of continuing">
+          <input type="number" min={0} step="0.01" value={budgetUsd} onChange={e => setBudgetUsd(e.target.value)}
+                 placeholder="no cap" data-testid="agent-flow-budget-usd" />
         </FormRow>
       </div>
 

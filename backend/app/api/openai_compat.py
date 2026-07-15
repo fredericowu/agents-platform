@@ -9,6 +9,12 @@ Endpoints (mounted at the app root, NOT under ``/api``):
   GET  /v1/models             list agents + workflows as OpenAI "models"
   GET  /v1/models/{id}        describe one
   POST /v1/chat/completions   run an agent/workflow (streaming + non-streaming)
+  POST /v1/responses          same, via the newer OpenAI Responses API shape
+                               (see the "Responses API" section below) —
+                               added because @ai-sdk/openai v3+ (used by
+                               CopilotKit, Vercel AI SDK, etc.) defaults to
+                               this API instead of Chat Completions when a
+                               client just does ``createOpenAI({baseURL})(model)``.
 
 Model-name grammar accepted by ``/v1/chat/completions``:
   agent/<slug>       → run the agent <slug>
@@ -75,6 +81,22 @@ class _ChatRequest(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class _ResponsesRequest(BaseModel):
+    """Body shape for the newer ``POST /v1/responses`` API.
+
+    ``input`` is deliberately typed ``Any`` — real clients send a bare
+    string, a flat list of ``{role, content}`` message dicts, or a list of
+    ``{type: "message", role, content: [{type: "input_text", text}, ...]}``
+    items. ``_responses_input_to_messages`` below normalizes all three.
+    """
+
+    model: str
+    input: Any = None
+    stream: bool = False
+
+    model_config = {"extra": "allow"}
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -107,6 +129,53 @@ def _split_messages(messages: list[_Message]) -> tuple[str, list[dict]]:
         if m.as_text()
     ]
     return messages[-1].as_text(), prior
+
+
+def _responses_input_to_messages(raw_input: Any) -> tuple[str, list[dict]]:
+    """Normalize a Responses API ``input`` into (last_user_text, prior_messages).
+
+    Accepts the three shapes real clients send:
+      - a bare string                              → single user turn
+      - a flat list of ``{"role": ..., "content": ...}``
+      - a list of ``{"type": "message", "role": ..., "content": [...]}``
+        where each content part is ``{"type": "input_text"|"output_text", "text": ...}``
+
+    Mirrors ``_split_messages``'s contract so both APIs can share ``_run``.
+    """
+    if raw_input is None:
+        return "", []
+    if isinstance(raw_input, str):
+        return raw_input, []
+
+    def _part_text(part: Any) -> str:
+        if isinstance(part, str):
+            return part
+        if isinstance(part, dict):
+            return part.get("text") or ""
+        return ""
+
+    def _content_text(content: Any) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "\n".join(t for t in (_part_text(p) for p in content) if t)
+        return str(content)
+
+    messages: list[dict] = []
+    for item in raw_input or []:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role", "user")
+        text = _content_text(item.get("content"))
+        if text:
+            messages.append({"role": role, "content": text})
+
+    if not messages:
+        return "", []
+    last = messages[-1]
+    return last["content"], messages[:-1]
 
 
 def _adhoc_target_id() -> str:
@@ -209,6 +278,89 @@ async def _stream(kind: str, slug: str, user_input: str, prior: list[dict],
 
 
 # ---------------------------------------------------------------------------
+# Responses API — request/response shapes (see openai-responses-language-model.ts
+# in @ai-sdk/openai for the exact event-by-event contract this mirrors; only
+# the plain-text-message path is implemented, no tool calls/reasoning, since
+# the platform's own executor — not the calling client — owns tool use).
+# ---------------------------------------------------------------------------
+
+
+def _responses_object(rid: str, model: str, status: str, text: str,
+                      usage: dict, *, msg_id: str) -> dict:
+    return {
+        "id": rid,
+        "object": "response",
+        "created_at": int(time.time()),
+        "model": model,
+        "status": status,
+        "output": [{
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "status": status,
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }],
+        "output_text": text,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+        },
+        "incomplete_details": None,
+    }
+
+
+def _responses_sse(event_type: str, **fields: Any) -> str:
+    return f"data: {json.dumps({'type': event_type, **fields})}\n\n"
+
+
+async def _responses_stream(kind: str, slug: str, user_input: str,
+                            prior: list[dict], rid: str, model: str) -> AsyncGenerator[str, None]:
+    """Run to completion, then emit the result as Responses-API SSE events.
+
+    Same "resolve, then chunk the final text" approach as ``_stream`` for
+    Chat Completions — agents/workflows don't give us token-level
+    passthrough, so streaming here is about shape-compatibility with
+    Responses-API clients, not real incremental generation.
+    """
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    output_index = 0
+
+    yield _responses_sse("response.created", response={
+        "id": rid, "object": "response", "created_at": int(time.time()),
+        "model": model, "status": "in_progress",
+    })
+    yield _responses_sse(
+        "response.output_item.added", output_index=output_index,
+        item={"id": msg_id, "type": "message", "role": "assistant",
+              "status": "in_progress", "content": []},
+    )
+
+    try:
+        text, usage = await _run(kind, slug, user_input, prior)
+    except Exception as exc:  # surface as content, never break the stream
+        text, usage = f"[error] {exc}", {}
+
+    step = 80
+    for i in range(0, len(text), step):
+        yield _responses_sse(
+            "response.output_text.delta", item_id=msg_id,
+            output_index=output_index, delta=text[i:i + step],
+        )
+
+    yield _responses_sse(
+        "response.output_item.done", output_index=output_index,
+        item={"id": msg_id, "type": "message", "role": "assistant",
+              "status": "completed",
+              "content": [{"type": "output_text", "text": text, "annotations": []}]},
+    )
+    yield _responses_sse(
+        "response.completed",
+        response=_responses_object(rid, model, "completed", text, usage, msg_id=msg_id),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -280,3 +432,30 @@ async def chat_completions(req: _ChatRequest):
         }],
         "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
+
+
+@router.post("/v1/responses")
+async def responses(req: _ResponsesRequest):
+    kind, slug = _parse_model(req.model)
+
+    with session_scope() as s:
+        cls = Workflow if kind == "workflow" else Agent
+        if not s.query(cls).filter(cls.slug == slug, cls.deleted_at.is_(None)).first():
+            raise HTTPException(
+                400,
+                f"unknown {kind}: {slug!r}. Use 'agent/<slug>' or 'workflow/<slug>'.",
+            )
+
+    user_input, prior = _responses_input_to_messages(req.input)
+    rid = f"resp_{uuid.uuid4().hex[:24]}"
+
+    if req.stream:
+        return StreamingResponse(
+            _responses_stream(kind, slug, user_input, prior, rid, req.model),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    text, usage = await _run(kind, slug, user_input, prior)
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    return _responses_object(rid, req.model, "completed", text, usage, msg_id=msg_id)

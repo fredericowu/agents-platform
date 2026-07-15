@@ -11,68 +11,17 @@ Required env vars:
     AW_RUN_ID      — run ID used as stream key: run:{run_id}:events
     AW_REDIS_URL   — Redis URL (default redis://host.docker.internal:6379/0)
 
-No third-party libraries needed — uses raw RESP protocol over a TCP socket.
+Uses the official `redis` package (redis.asyncio) — baked into the agent
+image, no hand-rolled RESP protocol.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-import socket
 import sys
-from urllib.parse import urlparse
 
-
-class _RespClient:
-    """Minimal synchronous RESP client — just enough for XADD and EXPIRE."""
-
-    def __init__(self, host: str, port: int) -> None:
-        self._sock = socket.create_connection((host, port), timeout=10)
-        self._buf = b""
-
-    def _send(self, *args: str) -> None:
-        parts: list[bytes] = [f"*{len(args)}\r\n".encode()]
-        for a in args:
-            b = a.encode("utf-8") if isinstance(a, str) else a
-            parts.append(f"${len(b)}\r\n".encode())
-            parts.append(b)
-            parts.append(b"\r\n")
-        self._sock.sendall(b"".join(parts))
-        self._drain_reply()
-
-    def _drain_reply(self) -> None:
-        """Read and discard the server reply."""
-        data = b""
-        while True:
-            chunk = self._sock.recv(4096)
-            data += chunk
-            if b"\r\n" in data:
-                break
-        first = data.split(b"\r\n", 1)[0]
-        if first.startswith(b"$"):
-            n = int(first[1:])
-            if n >= 0:
-                needed = n + 2  # data + \r\n
-                while len(data) < len(first) + 2 + needed:
-                    data += self._sock.recv(4096)
-        elif first.startswith(b"*"):
-            # bulk array — just ignore, not used in our simple calls
-            pass
-
-    def xadd(self, key: str, fields: dict[str, str], maxlen: int = 50_000) -> None:
-        args = ["XADD", key, "MAXLEN", "~", str(maxlen), "*"]
-        for k, v in fields.items():
-            args += [k, v]
-        self._send(*args)
-
-    def expire(self, key: str, seconds: int) -> None:
-        self._send("EXPIRE", key, str(seconds))
-
-    def close(self) -> None:
-        try:
-            self._sock.close()
-        except Exception:
-            pass
+import redis.asyncio as redis
 
 
 async def run() -> None:
@@ -84,15 +33,13 @@ async def run() -> None:
         print("aw-connector-redis: no CLI args provided", file=sys.stderr)
         sys.exit(1)
 
-    parsed = urlparse(redis_url)
-    r_host = parsed.hostname or "host.docker.internal"
-    r_port = parsed.port or 6379
     stream_key = f"run:{run_id}:events"
 
     try:
-        r = _RespClient(r_host, r_port)
+        r = redis.from_url(redis_url, socket_connect_timeout=10, socket_timeout=10)
+        await r.ping()
     except Exception as e:
-        print(f"aw-connector-redis: cannot connect to Redis at {r_host}:{r_port} ({e})",
+        print(f"aw-connector-redis: cannot connect to Redis at {redis_url} ({e})",
               file=sys.stderr)
         sys.exit(1)
 
@@ -116,7 +63,7 @@ async def run() -> None:
             if source == "stderr":
                 line = json.dumps({"type": "cli.stderr", "text": line[:20000]})
             try:
-                r.xadd(stream_key, {"type": source, "line": line})
+                await r.xadd(stream_key, {"type": source, "line": line}, maxlen=50_000, approximate=True)
             except Exception as e:
                 print(f"aw-connector-redis: XADD failed ({e})", file=sys.stderr)
 
@@ -127,12 +74,12 @@ async def run() -> None:
 
     rc = await proc.wait()
     try:
-        r.xadd(stream_key, {"done": "1", "returncode": str(rc)})
-        r.expire(stream_key, 86400)
+        await r.xadd(stream_key, {"done": "1", "returncode": str(rc)}, maxlen=50_000, approximate=True)
+        await r.expire(stream_key, 86400)
     except Exception as e:
         print(f"aw-connector-redis: final XADD failed ({e})", file=sys.stderr)
     finally:
-        r.close()
+        await r.aclose()
 
 
 if __name__ == "__main__":

@@ -40,6 +40,10 @@ def _maybe_truncate(r: Run, summary: bool) -> Run:
     # SQLAlchemy will see r.input as dirty; expunge to keep it transient
     # (RunOut serialises from attributes, so set on the instance works).
     r.__dict__["input"] = preview
+    if r.system_prompt and len(r.system_prompt) > _INPUT_SUMMARY_CHARS:
+        r.__dict__["system_prompt"] = (
+            r.system_prompt[:_INPUT_SUMMARY_CHARS] + f"… [+{len(r.system_prompt)-_INPUT_SUMMARY_CHARS} chars]"
+        )
     return r
 
 
@@ -82,6 +86,8 @@ def list_runs(limit: int = Query(50, ge=1, le=5000),
             func.lower(Run.initiator_kind).like(like),
             func.lower(Run.initiator_id).like(like),
             func.lower(Run.id).like(like),
+            func.lower(Run.flow_run_id).like(like),
+            func.lower(Run.flow_slug).like(like),
         ))
     rows = qry.limit(limit).all()
     if summary:
@@ -645,3 +651,57 @@ async def stream_run(run_id: str):
         async for evt in bus.subscribe(run_id):
             yield {"event": evt.get("kind", "log"), "data": _json.dumps(evt, default=str)}
     return EventSourceResponse(gen())
+
+
+class _ReturnToCaller(BaseModel):
+    message: str
+    kind: str  # one of core.wakeups.RETURN_KINDS — "result" | "question" | "blocker"
+
+
+@router.post("/{run_id}/return-to-caller")
+async def return_to_caller_ep(run_id: str, body: _ReturnToCaller):
+    """Agentic-flow action: resume the session of whoever called ``run_id``
+    (via its parent_run_id) with ``message``, tagged with the structured
+    ``kind`` of what's being sent back. See core.wakeups.return_to_caller
+    for the no-op-when-call_me_back-already-true rule, the parent_run_id
+    resolution (independent of the call_me_back/callback machinery), and the
+    kind validation (re-checked there, not just here)."""
+    if not body.message.strip():
+        raise HTTPException(400, "message is required")
+    from ..core.wakeups import return_to_caller
+    return await return_to_caller(run_id=run_id, message=body.message, kind=body.kind)
+
+
+class _MarkFlowDone(BaseModel):
+    summary: str = ""
+    outcome: str  # one of core.wakeups.FLOW_OUTCOMES — "success" | "partial" | "failed"
+    qa_run_id: str | None = None  # exactly one of qa_run_id / qa_not_needed required
+    qa_not_needed: bool = False
+
+
+@router.post("/{run_id}/mark-done")
+async def mark_flow_done_ep(run_id: str, body: _MarkFlowDone):
+    """Agentic-flow action: declare ``run_id``'s task finished — the third
+    terminal action alongside handoff and return_to_caller_agent, tagged
+    with a structured ``outcome`` and QA accountability (``qa_run_id`` xor
+    ``qa_not_needed``). Moves the Kanban card to done (success/partial) or
+    need_human (failed) — see core.wakeups.mark_flow_done for the full
+    status-mapping and validation rules."""
+    from ..core.wakeups import mark_flow_done
+    return await mark_flow_done(run_id=run_id, summary=body.summary, outcome=body.outcome,
+                                qa_run_id=body.qa_run_id, qa_not_needed=body.qa_not_needed)
+
+
+class _MarkFlowPlanned(BaseModel):
+    summary: str = ""
+
+
+@router.post("/{run_id}/mark-planned")
+async def mark_flow_planned_ep(run_id: str, body: _MarkFlowPlanned):
+    """Agentic-flow action for PLANNING work: declare ``run_id``'s planning
+    task concluded — a plan/design/spec now exists, distinct from
+    mark_flow_done (which means the FEATURE is done/shippable). Moves the
+    Kanban card to `planned` (no QA accountability required — there's no
+    code yet). See core.wakeups.mark_flow_planned."""
+    from ..core.wakeups import mark_flow_planned
+    return await mark_flow_planned(run_id=run_id, summary=body.summary)

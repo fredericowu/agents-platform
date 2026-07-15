@@ -15,6 +15,9 @@ export type Agent = {
   inherit_from: string | null;
   agent_config_slug: string | null;
   group_slug: string | null;
+  kanban_target_status: string | null;
+  capabilities: string;
+  hidden_from_flow: boolean;
   model_slug: string | null;
   tool_specs: string[];
   skill_slugs: string[];
@@ -41,7 +44,26 @@ export type AgentGroup = {
   name: string;
   description: string;
   instructions: string;
+  kanban_target_status: string | null;
+  capabilities: string;
 };
+
+// Logical status keys from AW's aw.json (notion.agents_kanban.statuses) —
+// kept as a small static list here since agents-platform doesn't read AW's
+// config; keep this in sync if that list changes.
+export const KANBAN_STATUS_KEYS: { key: string; label: string }[] = [
+  { key: "planned", label: "Planned" },
+  { key: "backlog", label: "Backlog" },
+  { key: "ready", label: "Ready" },
+  { key: "running", label: "In Progress" },
+  { key: "ready_to_deploy", label: "Ready to Deploy" },
+  { key: "need_human", label: "Need Human" },
+  { key: "done", label: "Done" },
+  { key: "auto_resolved", label: "Self-closed" },
+  { key: "archived", label: "Archived" },
+  { key: "done_archived", label: "Done Archived" },
+  { key: "self_closed_archived", label: "Self-closed Archived" },
+];
 
 export type Workflow = {
   slug: string;
@@ -66,7 +88,11 @@ export type AgentFlow = {
   slug: string;
   name: string;
   description: string;
+  enabled: boolean;
   graph: { nodes: AgentFlowNode[]; edges: AgentFlowEdge[] };
+  max_hops?: number | null;
+  budget_tokens?: number | null;
+  budget_usd?: number | null;
 };
 
 export type Model = {
@@ -99,7 +125,12 @@ export type Run = {
   target_id: string | null;
   source_slug: string | null;
   session_id: string | null;
+  notion_task_id?: string | null;
+  system_prompt?: string | null;
   retro_score_summary?: RetroScoreSummary | null;
+  flow_run_id?: string | null;
+  flow_slug?: string | null;
+  flow_needs_human?: boolean;
 };
 
 export type TargetPr = {

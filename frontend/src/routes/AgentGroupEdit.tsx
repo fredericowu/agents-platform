@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import Page from "../components/Page";
-import { api, type Agent, type AgentGroup } from "../lib/api";
+import { api, KANBAN_STATUS_KEYS, type Agent, type AgentGroup } from "../lib/api";
 
-const BLANK: AgentGroup = { slug: "", name: "", description: "", instructions: "" };
+const BLANK: AgentGroup = { slug: "", name: "", description: "", instructions: "", kanban_target_status: null, capabilities: "" };
 
 export default function AgentGroupEdit() {
   const { slug } = useParams<{ slug: string }>();
@@ -41,6 +41,8 @@ export default function AgentGroupEdit() {
         const created = await api.createAgentGroup({
           slug: g.slug || undefined, name: g.name || g.slug,
           description: g.description, instructions: g.instructions,
+          kanban_target_status: g.kanban_target_status || null,
+          capabilities: g.capabilities || "",
         });
         nav(`/agent-groups/${created.slug}`);
       } else if (slug) {
@@ -48,7 +50,11 @@ export default function AgentGroupEdit() {
         if (targetSlug !== slug) {
           await api.renameAgentGroup(slug, targetSlug);
         }
-        await api.saveAgentGroup(targetSlug, { name: g.name, description: g.description, instructions: g.instructions });
+        await api.saveAgentGroup(targetSlug, {
+          name: g.name, description: g.description, instructions: g.instructions,
+          kanban_target_status: g.kanban_target_status || null,
+          capabilities: g.capabilities || "",
+        });
         if (targetSlug !== slug) nav(`/agent-groups/${targetSlug}`);
       }
     } catch (e: any) { setError(String(e.message || e)); }
@@ -71,6 +77,11 @@ export default function AgentGroupEdit() {
   async function removeMember(agentSlug: string) {
     if (!slug) return;
     try { await api.removeAgentGroupMember(slug, agentSlug); await loadAgents(); }
+    catch (e: any) { setError(String(e.message || e)); }
+  }
+
+  async function toggleHidden(agent: Agent) {
+    try { await api.saveAgent(agent.slug, { hidden_from_flow: !agent.hidden_from_flow }); await loadAgents(); }
     catch (e: any) { setError(String(e.message || e)); }
   }
 
@@ -115,6 +126,35 @@ export default function AgentGroupEdit() {
                     rows={12} className="font-mono text-sm w-full" />
         </div>
 
+        <div className="card">
+          <h2 className="text-base font-semibold mb-1">Capabilities short description</h2>
+          <p className="text-xs text-muted mb-3">
+            What member agents can do, in plain English — ≤100 words. Other agents read this
+            to decide whether to hand a task off to this group.
+          </p>
+          <textarea value={g.capabilities} onChange={e => setG({ ...g, capabilities: e.target.value })}
+                    rows={4} className="text-sm w-full" data-testid="agent-group-capabilities" />
+          <div className="text-xs text-muted mt-1">
+            {g.capabilities.trim() ? g.capabilities.trim().split(/\s+/).length : 0} words
+          </div>
+        </div>
+
+        <div className="card">
+          <h2 className="text-base font-semibold mb-1">Set Kanban card to:</h2>
+          <p className="text-xs text-muted mb-3">
+            Default Kanban status member agents move their card to on completion. Any agent
+            in this group can override this on its own settings.
+          </p>
+          <select value={g.kanban_target_status ?? ""}
+                  onChange={e => setG({ ...g, kanban_target_status: e.target.value || null })}
+                  data-testid="agent-group-kanban-target-status">
+            <option value="">(none)</option>
+            {KANBAN_STATUS_KEYS.map(s => (
+              <option key={s.key} value={s.key}>{s.label}</option>
+            ))}
+          </select>
+        </div>
+
         {!isNew && (
           <div className="card">
             <h2 className="text-base font-semibold mb-3">Members ({members.length})</h2>
@@ -125,7 +165,16 @@ export default function AgentGroupEdit() {
                     <Link to={`/agents/${a.slug}`} className="font-medium hover:text-accent">{a.name}</Link>
                     <div className="text-xs font-mono text-muted">{a.slug} · {a.model_slug}</div>
                   </div>
-                  <button className="btn btn-danger text-xs py-1" onClick={() => removeMember(a.slug)}>remove</button>
+                  <div className="flex gap-1 items-center">
+                    <button
+                      className={`btn text-xs py-1 ${a.hidden_from_flow ? "btn-primary" : ""}`}
+                      onClick={() => toggleHidden(a)}
+                      title="When hidden, this agent won't appear in the Agents Flow connected-agents suggestion list — it can still be called by slug."
+                      data-testid={`agent-group-hide-${a.slug}`}>
+                      {a.hidden_from_flow ? "hidden from flow" : "hide from flow"}
+                    </button>
+                    <button className="btn btn-danger text-xs py-1" onClick={() => removeMember(a.slug)}>remove</button>
+                  </div>
                 </div>
               ))}
               {members.length === 0 && <div className="text-xs text-muted">No agents in this group yet.</div>}

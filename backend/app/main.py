@@ -60,6 +60,11 @@ async def lifespan(app: FastAPI):
         rearm_pending_agent_callbacks()
     except Exception as e:
         print(f"[main] agent-callback re-arm skipped: {e}")
+    try:
+        from .core.wakeups import rearm_stuck_wakeup_runs
+        rearm_stuck_wakeup_runs()
+    except Exception as e:
+        print(f"[main] stuck-wakeup-run re-arm skipped: {e}")
     yield
 
 
