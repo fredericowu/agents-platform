@@ -775,9 +775,15 @@ class GalleryBlock(Base):
         Index("ix_gallery_blocks_bot_slug", "bot_slug"),
     )
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
-    token: Mapped[str] = mapped_column(String, ForeignKey("gallery_tokens.token"), index=True)
+    # Nullable: blocks created by a tool (e.g. Arvin) rather than a share-link
+    # upload have no token/origin_chat_id to point at — see `source` below.
+    token: Mapped[str | None] = mapped_column(String, ForeignKey("gallery_tokens.token"), index=True, nullable=True)
     bot_slug: Mapped[str] = mapped_column(String)
-    origin_chat_id: Mapped[str] = mapped_column(String)
+    origin_chat_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # "upload" (default, via the /images share link) or "arvin" (auto-filed
+    # after an Arvin generation job finishes) — lets the gallery UI show
+    # separate folders/tabs without a second table.
+    source: Mapped[str] = mapped_column(String, default="upload")
     image_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     notified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

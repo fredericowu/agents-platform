@@ -272,6 +272,18 @@ def _apply_inline_migrations() -> None:
             _ensure_column(conn, "agent_configs", "auto_compact_threshold_tokens",
                            "auto_compact_threshold_tokens INTEGER")
 
+    # gallery_blocks.source — distinguishes upload-created blocks from ones
+    # a tool (Arvin) files automatically, plus token/origin_chat_id going
+    # nullable since tool-filed blocks have no share-link token.
+    if "gallery_blocks" in insp.get_table_names():
+        with engine.begin() as conn:
+            _ensure_column(conn, "gallery_blocks", "source", "source VARCHAR DEFAULT 'upload'")
+            gallery_cols = {c["name"]: c for c in inspect(conn).get_columns("gallery_blocks")}
+            if not gallery_cols["token"]["nullable"]:
+                conn.execute(text("ALTER TABLE gallery_blocks ALTER COLUMN token DROP NOT NULL"))
+            if not gallery_cols["origin_chat_id"]["nullable"]:
+                conn.execute(text("ALTER TABLE gallery_blocks ALTER COLUMN origin_chat_id DROP NOT NULL"))
+
     # Backfill cli_sessions from existing runs.session_id values
     if "cli_sessions" in insp.get_table_names() and "runs" in insp.get_table_names():
         with engine.begin() as conn:

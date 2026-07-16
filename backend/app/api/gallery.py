@@ -119,13 +119,13 @@ async def upload_images(token: str, files: list[UploadFile]):
 
 
 @router.get("/api/gallery/{token}/blocks")
-def list_blocks(token: str):
+def list_blocks(token: str, source: str = ""):
     with session_scope() as s:
         tok = _get_valid_token(s, token)
-        blocks = (s.query(GalleryBlock)
-                  .filter(GalleryBlock.bot_slug == tok.bot_slug)
-                  .order_by(GalleryBlock.created_at.desc())
-                  .all())
+        q = s.query(GalleryBlock).filter(GalleryBlock.bot_slug == tok.bot_slug)
+        if source:
+            q = q.filter(GalleryBlock.source == source)
+        blocks = q.order_by(GalleryBlock.created_at.desc()).all()
 
         image_ids = [img.id for b in blocks for img in b.images]
         tags_by_image = _load_tags_by_image(s, image_ids)
@@ -133,6 +133,7 @@ def list_blocks(token: str):
         return {"blocks": [
             {
                 "id": b.id, "image_count": b.image_count, "created_at": b.created_at.isoformat(),
+                "source": b.source,
                 "images": [
                     {"id": img.id, "tags": tags_by_image.get(img.id, [])}
                     for img in b.images
@@ -392,6 +393,9 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
 #confirmModal .cancel{background:var(--border);color:var(--fg)}
 #confirmModal .danger{background:var(--red);color:#fff}
 .thumb .tagBadge{position:absolute;top:4px;left:4px;background:rgba(0,0,0,.65);border-radius:50%;width:20px;height:20px;display:flex;align-items:center;justify-content:center;font-size:11px}
+.folderTabs{display:flex;gap:8px}
+.folderTab{flex:1;background:var(--surface);color:var(--hint);border:1px solid var(--border);border-radius:10px;padding:10px;font-size:13px;font-weight:600;cursor:pointer}
+.folderTab.active{background:var(--blue);color:#fff;border-color:var(--blue)}
 </style>
 </head>
 <body>
@@ -407,6 +411,11 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
 </div>
 <div id="status"></div>
 <button id="save">Enviar</button>
+
+<div id="folderTabs" class="folderTabs">
+  <button class="folderTab active" data-source="upload">📤 Uploads</button>
+  <button class="folderTab" data-source="arvin">🤖 Gerado pelo Arvin</button>
+</div>
 
 <div id="empty"><div class="icon">🖼️</div><div>Nenhuma imagem ainda.<br>Toque em "Adicionar fotos" para começar.</div></div>
 <div id="gallery"></div>
@@ -445,6 +454,8 @@ const saveBtn = document.getElementById("save");
 const statusEl = document.getElementById("status");
 const galleryEl = document.getElementById("gallery");
 const emptyEl = document.getElementById("empty");
+const folderTabs = document.getElementById("folderTabs");
+let currentSource = "upload";
 const progressWrap = document.getElementById("progressWrap");
 const progressFill = document.getElementById("progressFill");
 const progressLabel = document.getElementById("progressLabel");
@@ -799,7 +810,7 @@ async function loadBlocks() {
   }
   renderSkeleton();
   try {
-    const res = await fetch(`/api/gallery/${token}/blocks`);
+    const res = await fetch(`/api/gallery/${token}/blocks?source=${currentSource}`);
     if (!res.ok) {
       if (res.status === 401) setStatus("Link expirado. Peça um novo com /images.", "err");
       else setStatus("Não foi possível carregar a galeria.", "err");
@@ -870,6 +881,15 @@ function uploadStaged() {
 }
 
 saveBtn.addEventListener("click", uploadStaged);
+
+folderTabs.addEventListener("click", (e) => {
+  const btn = e.target.closest(".folderTab");
+  if (!btn || btn.classList.contains("active")) return;
+  folderTabs.querySelectorAll(".folderTab").forEach(b => b.classList.remove("active"));
+  btn.classList.add("active");
+  currentSource = btn.dataset.source;
+  loadBlocks();
+});
 
 if (tg) {
   tg.ready && tg.ready();
