@@ -7,8 +7,8 @@ the timer and re-invokes the model when it fires. In AP every run is a one-shot
 ``claude -p`` subprocess: the model schedules the wakeup in good faith, the
 process exits seconds later and the timer dies with it.
 
-This module closes that gap for two distinct triggers that both end up doing
-the same thing — re-invoke the ORIGIN session and ship the reply back down
+This module closes that gap for three distinct triggers that all end up doing
+the same thing — re-invoke an ORIGIN session and ship the reply back down
 whatever channel it came from:
 
 **Timer-based (``ScheduleWakeup``):**
@@ -17,7 +17,7 @@ whatever channel it came from:
   ``schedule_wakeup`` — persisted to the ``scheduled_wakeups`` table so it
   survives an AP restart, then armed as an asyncio timer (``_fire_after``).
 
-**Event-based (agent-to-agent "call me back"):**
+**Event-based, agent-level (agent-to-agent "call me back"):**
 - An agent dispatches ``run_agent_async`` / ``run_workflow_async`` with
   ``call_me_back`` not explicitly ``false`` (the default is to call back).
   ``executor._run_agent_impl`` captures the child run_id from the tool_result
@@ -26,9 +26,26 @@ whatever channel it came from:
   terminal, then re-invokes the ORIGIN session with a summary of the child's
   result. NOT yet persisted across an AP restart (unlike timer wakeups) — a
   restart mid-flight silently drops pending callbacks; fine for a v1, follow
-  up if that turns out to matter in practice.
+  up if that turns out to matter in practice. This only ever resolves ONE
+  hop — it wakes whoever dispatched THIS run, nothing further up the chain.
 
-Both paths converge on the same delivery: telegram via the recovery path
+**Event-based, flow-level (2026-07-16 — "flow finished", distinct from "agent
+finished"):** in a multi-hop chain (e.g. Telegram -> Architect -> Product
+Owner, each hop dispatched with ``call_me_back=true``), the agent-level
+callback above resolves as soon as each hop's OWN turn ends — Telegram gets
+woken the moment Architect's first turn finishes, long before the flow (which
+may bounce through several more agents) actually concludes, and there is no
+per-hop mechanism left to notify Telegram once it does. ``FlowWaiter``
+(``models.py``) closes that gap: keyed by ``flow_run_id`` (shared by every hop
+in the chain, see ``Run.flow_run_id`` / ``executor._record_flow_hop``),
+first-writer-wins — ``register_agent_callback`` calls
+``_register_flow_waiter`` to record whichever run FIRST asked for a callback
+anywhere in the flow as that flow's waiter. When any hop later calls
+``mark_flow_done``/``mark_flow_planned`` (however many hops deep), ``_deliver_
+flow_done`` resumes that waiter once — a separate wake-up from the agent-level
+one, not a replacement for it.
+
+All three paths converge on the same delivery: telegram via the recovery path
 (``deliver_recovered_run``, bot/chat from the inherited ``initiator_id``),
 watch/meta/glasses via awserv's ``POST /api/meta/agent_push`` (history + WS
 broadcast + spoken TTS, falling back to a real APNs alert push if nothing's
@@ -44,7 +61,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from ..db import session_scope
-from ..models import Run, ScheduledWakeup
+from ..models import FlowWaiter, Run, ScheduledWakeup
 
 log = logging.getLogger("wakeups")
 
@@ -264,6 +281,75 @@ async def return_to_caller(*, run_id: str, message: str, kind: str) -> dict[str,
     return {"ok": True, "resumed_run_id": fired_run_id, "caller_agent": agent_slug, "kind": kind}
 
 
+_FLOW_DONE_LABEL = {
+    "success": "concluído com sucesso",
+    "partial": "concluído parcialmente",
+    "failed": "encerrado sem sucesso",
+    "planned": "planejado (aguardando implementação)",
+}
+
+
+async def _deliver_flow_done(*, run_id: str, summary: str, outcome: str) -> None:
+    """Flow-level wakeup — distinct from the per-hop callback in
+    ``_watch_and_callback``/``register_agent_callback`` (which only ever
+    resolves ONE hop and typically already fired long before the flow as a
+    whole concluded). Called from mark_flow_done / mark_flow_planned: resumes
+    whichever run first registered as this flow's waiter
+    (``_register_flow_waiter``), however many hops removed that is from
+    ``run_id``. No-ops quietly if no one registered as a waiter for this
+    flow, the waiter was already delivered to (one-shot per flow instance),
+    or the waiter run can't be resumed (missing agent/session) — this must
+    never raise, since it's a best-effort tail on top of the actual
+    mark_flow_done/mark_flow_planned outcome."""
+    try:
+        with session_scope() as s:
+            own = s.query(Run).filter(Run.id == run_id).first()
+            if own is None or not own.flow_run_id:
+                return
+            waiter = (s.query(FlowWaiter)
+                      .filter(FlowWaiter.flow_run_id == own.flow_run_id,
+                              FlowWaiter.delivered.is_(False))
+                      .first())
+            if waiter is None:
+                return
+            # Atomic claim — guards a race if mark_flow_done fired from more
+            # than one hop of the same flow around the same time.
+            claimed = (s.query(FlowWaiter)
+                       .filter(FlowWaiter.id == waiter.id, FlowWaiter.delivered.is_(False))
+                       .update({"delivered": True, "delivered_at": datetime.utcnow()}))
+            if not claimed:
+                return
+            origin_run_id = waiter.origin_run_id
+
+        with session_scope() as s:
+            origin = s.query(Run).filter(Run.id == origin_run_id).first()
+            if origin is None:
+                log.warning("flow-done: waiter origin run %s vanished (flow=%s)",
+                           origin_run_id, run_id)
+                return
+            agent_slug = origin.source_slug
+            target_id = origin.target_id
+            session_id = origin.session_id
+            initiator_kind = origin.initiator_kind
+            initiator_id = origin.initiator_id
+
+        if not agent_slug or not session_id:
+            log.info("flow-done: waiter run=%s can't resume (missing agent=%s session=%s)",
+                     origin_run_id, agent_slug, session_id)
+            return
+
+        channel = _resolve_channel(initiator_kind, origin_run_id, session_id)
+        label = _FLOW_DONE_LABEL.get(outcome, outcome)
+        prompt = (f"O fluxo (Agents Flow) que você iniciou foi {label} (run {run_id}). "
+                 f"Resumo:\n\n{summary.strip() or '(sem resumo)'}")
+        await _rerun_and_deliver(
+            f"flow-done {run_id}", agent_slug=agent_slug, prompt=prompt, session_id=session_id,
+            target_id=target_id, initiator_id=initiator_id or "", channel=channel or "",
+        )
+    except Exception:
+        log.warning("flow-done delivery failed run=%s", run_id, exc_info=True)
+
+
 FLOW_OUTCOMES = ("success", "partial", "failed")
 
 
@@ -371,6 +457,8 @@ async def mark_flow_done(*, run_id: str, summary: str, outcome: str,
         own.qa_not_needed = qa_not_needed
         notion_task_id = own.notion_task_id
 
+    await _deliver_flow_done(run_id=run_id, summary=summary, outcome=outcome)
+
     if not notion_task_id:
         return {"ok": True, "notion_task_id": None}
 
@@ -441,6 +529,8 @@ async def mark_flow_planned(*, run_id: str, summary: str) -> dict[str, Any]:
         own.flow_outcome = "planned"
         notion_task_id = own.notion_task_id
 
+    await _deliver_flow_done(run_id=run_id, summary=summary, outcome="planned")
+
     if not notion_task_id:
         return {"ok": True, "notion_task_id": None, "outcome": "planned"}
 
@@ -501,9 +591,28 @@ def register_agent_callback(*, watch_run_id: str, origin_run_id: str) -> bool:
         r.call_me_back = True
         r.callback_origin_run_id = origin_run_id
         r.callback_done = False
+        _register_flow_waiter(s, origin_run_id)
     log.info("agent-callback armed: watch_run=%s origin=%s", watch_run_id, origin_run_id)
     asyncio.create_task(_watch_and_callback(watch_run_id))
     return True
+
+
+def _register_flow_waiter(s, origin_run_id: str) -> None:
+    """First-writer-wins: record ``origin_run_id`` as the run waiting for its
+    ENTIRE flow to conclude, not just the one child it dispatched — keyed by
+    ``flow_run_id`` (shared by every hop in the chain, see Run.flow_run_id).
+    Only the first call_me_back dispatch inside a flow instance claims this
+    row; a later nested dispatch (e.g. Architect calling Product Owner) must
+    NOT overwrite it, or a deep hop's own immediate caller would wrongly
+    become "the flow's waiter" instead of the channel-facing root that
+    actually needs the final wake-up. See mark_flow_done's flow-done delivery
+    below for the consumer side."""
+    origin = s.query(Run).filter(Run.id == origin_run_id).first()
+    if origin is None or not origin.flow_run_id:
+        return
+    if s.query(FlowWaiter.id).filter(FlowWaiter.flow_run_id == origin.flow_run_id).first():
+        return
+    s.add(FlowWaiter(flow_run_id=origin.flow_run_id, origin_run_id=origin_run_id))
 
 
 _CALLBACK_DB_MAX_RETRIES = 5  # transient DB errors per poll (pool timeout, dropped connection)

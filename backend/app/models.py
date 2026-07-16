@@ -169,6 +169,29 @@ class AgentFlowRun(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
+class FlowWaiter(Base):
+    """Flow-level 'call me back' — distinct from the per-hop
+    Run.call_me_back/callback_origin_run_id (core.wakeups.register_agent_callback),
+    which only resumes the ONE run that dispatched the ONE child it's watching.
+    In a multi-hop chain (Telegram -> Architect -> Product Owner) that hop-level
+    callback resolves as soon as Architect's own turn ends — long before
+    mark_flow_done is eventually called, possibly by a session several hops
+    deeper that Architect's original caller (Telegram) has no direct link to
+    anymore. One row per flow instance (``flow_run_id``, shared by every hop —
+    see Run.flow_run_id / core/executor.py::_record_flow_hop): first-writer-wins,
+    set to whichever run first asked for a callback anywhere in the flow (see
+    core.wakeups._register_flow_waiter). core.wakeups.mark_flow_done /
+    mark_flow_planned resolve this to resume that run once, regardless of how
+    many hops or intermediate agent-level callbacks happened in between."""
+    __tablename__ = "flow_waiters"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    flow_run_id: Mapped[str] = mapped_column(String, unique=True, index=True)
+    origin_run_id: Mapped[str] = mapped_column(String, index=True)
+    delivered: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class Run(Base):
     __tablename__ = "runs"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)

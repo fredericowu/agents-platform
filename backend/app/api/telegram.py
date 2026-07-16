@@ -2395,6 +2395,8 @@ def _kanban_text_prop(page: dict, prop: str) -> str:
         return "".join(t.get("plain_text", "") for t in p.get("title", []))
     if ptype == "rich_text":
         return "".join(t.get("plain_text", "") for t in p.get("rich_text", []))
+    if ptype == "select":
+        return (p.get("select") or {}).get("name", "")
     return ""
 
 
