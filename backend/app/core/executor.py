@@ -2071,29 +2071,43 @@ class AgentChainLoopError(Exception):
 
 
 def _resolve_hop_count(caller_run_id: str | None) -> int:
-    """Compute a new run's hop_count from its caller's, enforcing agent_chain_max_hops.
+    """Compute a new run's hop_count from its caller's, enforcing the hop cap.
 
     A run started with no ``caller_run_id`` (human/UI/task-initiated) is hop 0.
     A run dispatched via ``run_agent_async``/``run_workflow_async`` inherits
     caller.hop_count + 1. Raises AgentChainLoopError once the chain would
-    exceed the configured cap (default 8) — this is the loop guard for
-    runaway A→B→A "call me back" cycles. Callers should surface the error to
-    whoever dispatched the run (HTTPException) and alert the sysadmin bot.
+    exceed the configured cap — this is the loop guard for runaway A→B→A
+    "call me back" cycles. Callers should surface the error to whoever
+    dispatched the run (HTTPException) and alert the sysadmin bot.
+
+    If the caller run belongs to an Agents Flow (``Run.flow_slug``) that has
+    its own ``AgentFlow.max_hops`` set, that overrides the global
+    ``agent_chain_max_hops`` setting (default 8) — same precedence as
+    ``_check_flow_completion``, so a flow-scoped limit raised above the
+    global default doesn't get pre-empted by this dispatch-time guard.
     """
     if not caller_run_id:
         return 0
     from .security import get_setting
-    max_hops = get_setting("agent_chain_max_hops", 8)
+    from ..models import Run, AgentFlow
     with session_scope() as s:
-        from ..models import Run
         caller = s.query(Run).filter(Run.id == caller_run_id).first()
         caller_hops = caller.hop_count if caller else 0
+        flow_max_hops = None
+        if caller and caller.flow_slug:
+            flow = (s.query(AgentFlow)
+                    .filter(AgentFlow.slug == caller.flow_slug, AgentFlow.deleted_at.is_(None))
+                    .first())
+            flow_max_hops = flow.max_hops if flow else None
+    max_hops = flow_max_hops if flow_max_hops is not None else get_setting("agent_chain_max_hops", 8)
     new_hops = caller_hops + 1
     if new_hops > max_hops:
         raise AgentChainLoopError(
-            f"agent chain depth {new_hops} would exceed agent_chain_max_hops={max_hops} "
-            f"(caller_run_id={caller_run_id}) — this looks like a runaway agent-to-agent "
-            f"call loop rather than legitimate depth; raise the limit in Settings if not."
+            f"agent chain depth {new_hops} would exceed "
+            f"{'flow' if flow_max_hops is not None else 'agent_chain_max_hops'} limit "
+            f"({max_hops}) (caller_run_id={caller_run_id}) — this looks like a runaway "
+            f"agent-to-agent call loop rather than legitimate depth; raise the limit "
+            f"in the flow's settings or in global Settings if not."
         )
     return new_hops
 
