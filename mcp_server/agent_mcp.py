@@ -403,6 +403,12 @@ async def _list_tools() -> list[Tool]:
                           "conversation (Telegram, Watch, etc.) — no polling needed. Pass "
                           "`call_me_back:false` to opt out and get pure fire-and-forget "
                           "(the old behavior) instead.\n\n"
+                          "**Redirect the callback (`call_me_back_on`):** by default the "
+                          "callback wakes YOUR OWN session. Pass `call_me_back_on:<session_id>` "
+                          "to wake a DIFFERENT session instead once this dispatched run "
+                          "finishes — lets you chain a hand-off (\"run agent B, and when B is "
+                          "done wake up session C\") in one call instead of B having to call C "
+                          "itself. Ignored if `call_me_back:false` is also set.\n\n"
                           "**`target_slug` is REQUIRED.** Create a Target first with "
                           "`create_target` if none exists. Calls without `target_slug` "
                           "are rejected with a 400 error."),
@@ -417,13 +423,18 @@ async def _list_tools() -> list[Tool]:
                                          "notion_task_id": {"type": ["string", "null"],
                                                             "description": "Notion page ID of the Kanban card that originated this run. When set, the agent receives NOTION_TASK_ID env var and awserv sends a Telegram notification on completion."},
                                          "call_me_back": {"type": "boolean", "default": True,
-                                                          "description": "Default true: when the dispatched run finishes, your own session gets woken up with its result and replies down your own channel automatically. Set false for pure fire-and-forget."}},
+                                                          "description": "Default true: when the dispatched run finishes, your own session gets woken up with its result and replies down your own channel automatically. Set false for pure fire-and-forget."},
+                                         "call_me_back_on": {"type": ["string", "null"],
+                                                             "description": "Optional session_id to redirect the callback to instead of your own session — e.g. a session_id returned by a prior run_agent_async call. That session's agent gets woken with this run's result instead of you."}},
                           "required": ["slug", "input", "target_slug"]}),
         Tool(name="run_workflow_async",
              description=("Start a workflow run in the background and return its run_id.\n\n"
                           "**Call-me-back (default ON):** same as `run_agent_async` — your "
                           "session is woken with the workflow's result when it finishes and "
                           "replies down your own channel, unless `call_me_back:false`.\n\n"
+                          "**Redirect the callback (`call_me_back_on`):** same as "
+                          "`run_agent_async` — pass a session_id to wake THAT session instead "
+                          "of your own once this workflow finishes.\n\n"
                           "**`target_slug` is REQUIRED.** Create a Target first with "
                           "`create_target` if none exists. Calls without `target_slug` "
                           "are rejected with a 400 error."),
@@ -434,7 +445,9 @@ async def _list_tools() -> list[Tool]:
                                                          "description": "Slug of the Target this run is delivering against. REQUIRED."},
                                          "target_id": {"type": ["string", "null"]},
                                          "call_me_back": {"type": "boolean", "default": True,
-                                                          "description": "Default true: when this workflow finishes, your own session gets woken up with its result and replies down your own channel automatically. Set false for pure fire-and-forget."}},
+                                                          "description": "Default true: when this workflow finishes, your own session gets woken up with its result and replies down your own channel automatically. Set false for pure fire-and-forget."},
+                                         "call_me_back_on": {"type": ["string", "null"],
+                                                             "description": "Optional session_id to redirect the callback to instead of your own session."}},
                           "required": ["slug", "input", "target_slug"]}),
         Tool(name="return_to_caller_agent",
              description=("Agentic-flow action: send `message` back to whoever called YOU "
@@ -538,6 +551,27 @@ async def _list_tools() -> list[Tool]:
                           "properties": {"summary": {"type": "string",
                                                      "description": "Summary of what was planned — becomes the Kanban card comment if there's a card."}},
                           "required": []}),
+        Tool(name="register_callback",
+             description=("Retroactively subscribe to a run's completion — for when you "
+                          "dispatched `run_agent_async`/`run_workflow_async` with "
+                          "`call_me_back:false` (or the run was started some other way) and "
+                          "now want to be woken up when it finishes after all, instead of "
+                          "polling `run_status`/`wait_run` yourself. Reuses the exact same "
+                          "'call me back' delivery as `call_me_back:true` — your session (or "
+                          "`session_id`, if given) is re-invoked with the run's result and "
+                          "the reply goes down whatever channel started that conversation.\n\n"
+                          "If `run_id` has already finished by the time you call this, the "
+                          "wake-up fires immediately with its result — it does not silently "
+                          "no-op.\n\n"
+                          "`session_id` is optional — same as `call_me_back_on`: omit it to "
+                          "wake your OWN session, or pass a session_id to wake a different one "
+                          "instead."),
+             inputSchema={"type": "object",
+                          "properties": {"run_id": {"type": "string",
+                                                    "description": "The already-dispatched run to watch. REQUIRED."},
+                                        "session_id": {"type": ["string", "null"],
+                                                       "description": "Optional session_id to wake instead of your own — same as call_me_back_on."}},
+                          "required": ["run_id"]}),
         Tool(name="run_status",
              description=("Return the current Run row: status, output, error, tokens, "
                           "and (for workflows) `limit_reached` if a budget cap stopped it.\n\n"
@@ -1414,6 +1448,16 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
                 return _err(400, "Could not identify this run — this tool only works inside a docker CLI agent run.")
             r = await c.post(f"{BASE}/api/runs/{own_run_id}/mark-planned",
                              json={"summary": args.get("summary") or ""})
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "register_callback":
+            own_run_id = _caller_run_id(args)
+            if not own_run_id:
+                return _err(400, "Could not identify the calling run — this tool only works inside a docker CLI agent run.")
+            run_id = args.get("run_id")
+            if not run_id:
+                return _err(400, "run_id is required")
+            r = await c.post(f"{BASE}/api/runs/{run_id}/register-callback",
+                             json={"origin_run_id": own_run_id, "session_id": args.get("session_id")})
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name in ("run_status", "get_run"):
             params = {"summary": "true"} if args.get("summary") else {}

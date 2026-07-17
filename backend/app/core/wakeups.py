@@ -29,6 +29,15 @@ whatever channel it came from:
   up if that turns out to matter in practice. This only ever resolves ONE
   hop — it wakes whoever dispatched THIS run, nothing further up the chain.
 
+  (2026-07-17) **Redirected target (``call_me_back_on``):** the dispatching
+  agent may pass a session_id in the tool call instead of relying on the
+  default (wake the caller's own session). ``register_agent_callback``
+  persists it as ``callback_target_session_id`` on the child row;
+  ``_watch_and_callback`` then resumes THAT session's own agent/target/
+  channel context instead of the dispatcher's — a one-call chain ("run
+  agent B, and when it's done wake up session C") instead of B having to
+  explicitly call C via ``return_to_caller_agent``/another dispatch.
+
 **Event-based, flow-level (2026-07-16 — "flow finished", distinct from "agent
 finished"):** in a multi-hop chain (e.g. Telegram -> Architect -> Product
 Owner, each hop dispatched with ``call_me_back=true``), the agent-level
@@ -572,7 +581,8 @@ async def mark_flow_planned(*, run_id: str, summary: str) -> dict[str, Any]:
     return {"ok": True, "notion_task_id": notion_task_id, "kanban_status": "planned", "outcome": "planned"}
 
 
-def register_agent_callback(*, watch_run_id: str, origin_run_id: str) -> bool:
+def register_agent_callback(*, watch_run_id: str, origin_run_id: str,
+                            target_session_id: str | None = None) -> bool:
     """Wire up 'call me back' for a run_agent_async/run_workflow_async dispatch
     (``call_me_back`` not explicitly ``false`` — the default).
 
@@ -582,7 +592,14 @@ def register_agent_callback(*, watch_run_id: str, origin_run_id: str) -> bool:
     ``_watch_and_callback`` looks that up fresh from the origin run's row each
     time it fires, so a restart's ``rearm_pending_agent_callbacks`` can revive
     a watcher from nothing but the child run's id.
-    """
+
+    ``target_session_id`` (the ``call_me_back_on`` tool param) redirects the
+    wake-up to a session OTHER than ``origin_run_id``'s own — e.g. an agent
+    dispatches this run, but asks for the callback to land on a third
+    session so it can chain a hand-off (A calls B, B's completion wakes C)
+    in one dispatch instead of B having to explicitly call C itself. Still
+    persisted on the child row (``callback_target_session_id``), so it
+    survives a restart the same way the plain case does."""
     with session_scope() as s:
         r = s.query(Run).filter(Run.id == watch_run_id).first()
         if r is None:
@@ -590,9 +607,11 @@ def register_agent_callback(*, watch_run_id: str, origin_run_id: str) -> bool:
             return False
         r.call_me_back = True
         r.callback_origin_run_id = origin_run_id
+        r.callback_target_session_id = target_session_id
         r.callback_done = False
         _register_flow_waiter(s, origin_run_id)
-    log.info("agent-callback armed: watch_run=%s origin=%s", watch_run_id, origin_run_id)
+    log.info("agent-callback armed: watch_run=%s origin=%s target_session=%s",
+             watch_run_id, origin_run_id, target_session_id or "(caller's own)")
     asyncio.create_task(_watch_and_callback(watch_run_id))
     return True
 
@@ -649,7 +668,7 @@ async def _watch_and_callback(watch_run_id: str) -> None:
     to ERROR and abandons the watch."""
     from .redis_streams import wait_run_finished
     terminal = {"success", "error", "cancelled"}
-    status, output, run_error, origin_run_id = None, None, None, None
+    status, output, run_error, origin_run_id, target_session_id = None, None, None, None, None
     consecutive_db_errors = 0
     for _ in range(_CALLBACK_MAX_ITERS):
         try:
@@ -661,6 +680,7 @@ async def _watch_and_callback(watch_run_id: str) -> None:
                 if r.callback_done:
                     return  # already handled (e.g. a rearm raced this same task)
                 origin_run_id = r.callback_origin_run_id
+                target_session_id = r.callback_target_session_id
                 if r.status in terminal:
                     status, run_error = r.status, r.error
                     output = (r.output or {}).get("text", "") if isinstance(r.output, dict) else None
@@ -688,18 +708,39 @@ async def _watch_and_callback(watch_run_id: str) -> None:
         _mark_callback_done(watch_run_id)
         return
 
-    with session_scope() as s:
-        origin = s.query(Run).filter(Run.id == origin_run_id).first()
-        if origin is None:
-            log.warning("agent-callback: origin run %s vanished (watch=%s)",
-                        origin_run_id, watch_run_id)
-            _mark_callback_done(watch_run_id)
-            return
-        agent_slug = origin.source_slug
-        target_id = origin.target_id
-        session_id = origin.session_id
-        initiator_kind = origin.initiator_kind
-        initiator_id = origin.initiator_id
+    if target_session_id:
+        # call_me_back_on: resume the SPECIFIED session instead of the
+        # caller's own — pull its agent/target/channel context from the most
+        # recent run that actually used that session (usually a different
+        # agent than the one that dispatched this watch).
+        with session_scope() as s:
+            target_run = (s.query(Run).filter(Run.session_id == target_session_id)
+                         .order_by(Run.started_at.desc()).first())
+            if target_run is None:
+                log.warning("agent-callback: call_me_back_on session %s has no run to resume "
+                           "(watch=%s)", target_session_id, watch_run_id)
+                _mark_callback_done(watch_run_id)
+                return
+            agent_slug = target_run.source_slug
+            target_id = target_run.target_id
+            session_id = target_session_id
+            initiator_kind = target_run.initiator_kind
+            initiator_id = target_run.initiator_id
+            resolve_run_id = target_run.id
+    else:
+        with session_scope() as s:
+            origin = s.query(Run).filter(Run.id == origin_run_id).first()
+            if origin is None:
+                log.warning("agent-callback: origin run %s vanished (watch=%s)",
+                            origin_run_id, watch_run_id)
+                _mark_callback_done(watch_run_id)
+                return
+            agent_slug = origin.source_slug
+            target_id = origin.target_id
+            session_id = origin.session_id
+            initiator_kind = origin.initiator_kind
+            initiator_id = origin.initiator_id
+            resolve_run_id = origin_run_id
 
     # `channel` only decides how (or whether) a human gets notified — it must
     # NOT gate whether the caller's session gets resumed. A run whose origin
@@ -711,7 +752,7 @@ async def _watch_and_callback(watch_run_id: str) -> None:
     # not a human-facing notification. See _rerun_and_deliver / the
     # `deliver_recovered_run` / `_deliver_watch` callees — both already
     # self-guard when there's nothing to notify (2026-07-13 fix).
-    channel = _resolve_channel(initiator_kind, origin_run_id, session_id) if session_id else None
+    channel = _resolve_channel(initiator_kind, resolve_run_id, session_id) if session_id else None
     # Atomic claim (False->True) so a concurrent rearm can't double-fire.
     if not _mark_callback_done(watch_run_id):
         return

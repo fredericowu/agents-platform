@@ -705,3 +705,35 @@ async def mark_flow_planned_ep(run_id: str, body: _MarkFlowPlanned):
     code yet). See core.wakeups.mark_flow_planned."""
     from ..core.wakeups import mark_flow_planned
     return await mark_flow_planned(run_id=run_id, summary=body.summary)
+
+
+class _RegisterCallback(BaseModel):
+    origin_run_id: str
+    session_id: str | None = None
+
+
+@router.post("/{run_id}/register-callback")
+async def register_callback_ep(run_id: str, body: _RegisterCallback):
+    """Retroactively subscribe a session to ``run_id``'s completion — reuses
+    the exact same 'call me back' mechanism ``call_me_back=true`` arms at
+    dispatch time (``core.wakeups.register_agent_callback`` /
+    ``_watch_and_callback``), for a run that was already dispatched with
+    ``call_me_back=false`` (or by any other means) and whose caller changed
+    their mind. ``origin_run_id`` (the calling run, injected by the MCP
+    layer) is who gets woken; ``session_id`` optionally redirects that wake-up
+    to a different session, same as ``call_me_back_on``.
+
+    Race-safe and "already finished" by construction, not by a special-cased
+    check here: ``_watch_and_callback``'s very first loop iteration re-reads
+    ``run_id``'s row from the DB — if it's already terminal, it delivers the
+    callback immediately instead of waiting; if it terminates in the window
+    between this call and that first read, the Redis pub/sub notification (or
+    the 30s fallback poll) still catches it. Same guarantee normal
+    ``call_me_back=true`` dispatches already rely on."""
+    from ..core.wakeups import register_agent_callback
+    ok = register_agent_callback(watch_run_id=run_id, origin_run_id=body.origin_run_id,
+                                 target_session_id=body.session_id)
+    if not ok:
+        raise HTTPException(404, f"run {run_id} not found")
+    return {"ok": True, "watch_run_id": run_id, "origin_run_id": body.origin_run_id,
+            "session_id": body.session_id}

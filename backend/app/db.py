@@ -109,6 +109,9 @@ def _apply_inline_migrations() -> None:
         ("call_me_back", "BOOLEAN DEFAULT false"),
         ("callback_done", "BOOLEAN DEFAULT false"),
         ("callback_origin_run_id", "VARCHAR"),
+        # "call_me_back_on" override — redirects the callback to a different
+        # session than callback_origin_run_id's own (see models.Run).
+        ("callback_target_session_id", "VARCHAR"),
         # Agent-to-agent chain depth loop guard (see Run.hop_count).
         ("hop_count", "INTEGER DEFAULT 0"),
         # Notion Kanban card linkage — persisted (not just an in-flight kwarg)

@@ -238,6 +238,13 @@ class Run(Base):
     call_me_back: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     callback_done: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     callback_origin_run_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    # "call_me_back_on" (run_agent_async/run_workflow_async param): redirects the
+    # callback to a DIFFERENT session than the caller's own — lets an agent chain
+    # a dispatch ("call agent B, and when B finishes wake up session C instead of
+    # me") in a single call instead of B having to explicitly call C itself. When
+    # unset (the common case), _watch_and_callback resumes callback_origin_run_id's
+    # own session as before.
+    callback_target_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # Notion Kanban card this run was dispatched for (set at creation time so it
     # survives a restart-recovery reattach — _notify_kanban_run_done reads it

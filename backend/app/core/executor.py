@@ -1304,8 +1304,11 @@ async def _run_agent_impl(
     # call_me_back not explicitly false (the default is to call back) —
     # matched against their tool_result to learn the dispatched child's
     # run_id, so we can arm an agent-callback once THIS run ends.
-    _pending_callback_calls: dict[str, str] = {}   # tool_use_id -> agent_slug (this agent, for the callback re-entry)
-    _callback_watch_run_ids: list[str] = []
+    # tool_use_id -> (agent_slug, call_me_back_on) — call_me_back_on is the
+    # optional session_id override (redirect the callback to a different
+    # session than this one, see core.wakeups.register_agent_callback).
+    _pending_callback_calls: dict[str, tuple[str, str | None]] = {}
+    _callback_watch_run_ids: list[tuple[str, str | None]] = []
     tin = tout = 0
     cost = 0.0
     err: str | None = None
@@ -1447,7 +1450,8 @@ async def _run_agent_impl(
                                 # call_me_back defaults to true — an agent must opt OUT
                                 # (call_me_back:false) to get the old pure fire-and-forget.
                                 if _tc_id and _tc_input.get("call_me_back") is not False:
-                                    _pending_callback_calls[_tc_id] = agent_slug
+                                    _cmb_on = _tc_input.get("call_me_back_on") or None
+                                    _pending_callback_calls[_tc_id] = (agent_slug, _cmb_on)
                             if runtime.get("verbose_replies"):
                                 if reply_text.strip() and not reply_text.endswith("\n\n"):
                                     reply_text += "\n\n"
@@ -1455,13 +1459,14 @@ async def _run_agent_impl(
                                 reply_text = ""
                         elif meta_kind == "tool_result" and _pending_callback_calls:
                             _tr_id = (meta_payload or {}).get("tool_use_id")
-                            _origin_agent_slug = _pending_callback_calls.pop(_tr_id, None)
-                            if _origin_agent_slug:
+                            _pending = _pending_callback_calls.pop(_tr_id, None)
+                            if _pending:
+                                _origin_agent_slug, _cmb_on = _pending
                                 import re as _re
                                 _m = _re.search(r'"run_id"\s*:\s*"([^"]+)"',
                                                str((meta_payload or {}).get("content") or ""))
                                 if _m:
-                                    _callback_watch_run_ids.append(_m.group(1))
+                                    _callback_watch_run_ids.append((_m.group(1), _cmb_on))
                                 else:
                                     _exec_log.warning("agent-callback: no run_id found in tool_result "
                                                       "for %s (tool_use_id=%s)", _origin_agent_slug, _tr_id)
@@ -1602,9 +1607,10 @@ async def _run_agent_impl(
     # beyond the two ids, so this survives an AP restart mid-flight.
     if status == "success" and _callback_watch_run_ids:
         from .wakeups import register_agent_callback
-        for _watch_id in _callback_watch_run_ids:
+        for _watch_id, _cmb_on in _callback_watch_run_ids:
             try:
-                register_agent_callback(watch_run_id=_watch_id, origin_run_id=run_id)
+                register_agent_callback(watch_run_id=_watch_id, origin_run_id=run_id,
+                                        target_session_id=_cmb_on)
             except Exception as _ce:
                 _exec_log.warning("agent-callback registration failed run=%s watch=%s: %s",
                                   run_id, _watch_id, _ce)
