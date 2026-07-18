@@ -883,3 +883,25 @@ class GalleryImageTag(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
     image: Mapped["GalleryImage"] = relationship(back_populates="image_tags")
+
+
+class ApiKey(Base):
+    """Static bearer key gating the OpenAI-compat surface (openai_compat.py).
+
+    Unlike the rest of the app (browser JWT/session cookie) that surface runs
+    real agents/workflows for non-interactive external callers (Roblox
+    scripts, curl, other services), so it needs its own credential. Each key
+    is scoped to a list of agent/workflow slugs it may invoke — empty means
+    "any" — so a leaked key for one integration (e.g. a game NPC) can't be
+    replayed against unrelated agents.
+    """
+    __tablename__ = "api_keys"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String)
+    token: Mapped[str] = mapped_column(String, unique=True, index=True)
+    # Slugs this key may call via /v1/chat/completions & /v1/responses
+    # (model = "agent/<slug>" or "workflow/<slug>"). Empty list = unrestricted.
+    agent_slugs: Mapped[list[str]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

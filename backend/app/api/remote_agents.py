@@ -687,12 +687,8 @@ def delete_remote_agent(agent_id: str):
 @router.get("/api/config")
 def get_config():
     with session_scope() as s:
-        mcp_row = s.get(ConfigRow, "mcp_api_key")
-        oai_row = s.get(ConfigRow, "openai_compat_api_key")
-        return {
-            "mcp_api_key": mcp_row.value if mcp_row else "",
-            "openai_compat_api_key": oai_row.value if oai_row else "",
-        }
+        row = s.get(ConfigRow, "mcp_api_key")
+        return {"mcp_api_key": row.value if row else ""}
 
 
 @router.post("/api/config/regenerate")
@@ -705,16 +701,3 @@ def regenerate_api_key():
         else:
             s.add(ConfigRow(key="mcp_api_key", value=new_key))
     return {"mcp_api_key": new_key}
-
-
-@router.post("/api/config/regenerate_openai_compat_key")
-def regenerate_openai_compat_key():
-    """Rotate the static bearer key that gates POST /v1/* (see openai_compat.py)."""
-    new_key = _sec.token_urlsafe(32)
-    with session_scope() as s:
-        row = s.get(ConfigRow, "openai_compat_api_key")
-        if row:
-            row.value = new_key
-        else:
-            s.add(ConfigRow(key="openai_compat_api_key", value=new_key))
-    return {"openai_compat_api_key": new_key}

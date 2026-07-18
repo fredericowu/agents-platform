@@ -100,8 +100,6 @@ def init_db() -> None:
     with session_scope() as s:
         if not s.get(ConfigRow, "mcp_api_key"):
             s.add(ConfigRow(key="mcp_api_key", value=secrets.token_urlsafe(32)))
-        if not s.get(ConfigRow, "openai_compat_api_key"):
-            s.add(ConfigRow(key="openai_compat_api_key", value=secrets.token_urlsafe(32)))
 
 
 def now_epoch() -> int:

@@ -42,34 +42,45 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from ..core.remote_agents_db import ConfigRow
-from ..core.remote_agents_db import session_scope as _config_session_scope
 from ..db import session_scope
-from ..models import Agent, Target, Workflow
+from ..models import ApiKey, Agent, Target, Workflow
 
-def require_api_key(authorization: Optional[str] = Header(default=None)) -> None:
-    """Gate every /v1/* route behind the platform's own static API key.
+router = APIRouter(tags=["openai-compat"])
+
+
+def require_api_key(authorization: Optional[str] = Header(default=None)) -> ApiKey:
+    """Resolve the presented bearer token to its ``ApiKey`` row.
 
     This surface runs real agents/workflows (real cost, real side effects),
     so unlike the rest of the app (browser JWT/session cookie) it needs a
     non-interactive credential external callers (Roblox scripts, curl, other
-    services) can present. Same ``ConfigRow`` table/pattern as ``mcp_api_key``
-    (see ``remote_agents.py``'s ``/api/config``), just a distinct key so
-    rotating one doesn't invalidate the other.
+    services) can present. Each key is scoped to a set of agent/workflow
+    slugs (Settings → Access Keys) — returning the row (not just True/False)
+    lets each route enforce that scope against the specific slug it resolves,
+    not just gate the surface as a whole.
     """
-    with _config_session_scope() as s:
-        row = s.get(ConfigRow, "openai_compat_api_key")
-        expected = row.value if row else None
-
-    if not expected:
-        raise HTTPException(500, "openai_compat_api_key not configured")
-
     presented = (authorization or "").removeprefix("Bearer ").strip()
-    if not presented or presented != expected:
-        raise HTTPException(401, "missing or invalid API key")
+    if not presented:
+        raise HTTPException(401, "missing API key")
+
+    with session_scope() as s:
+        row = s.query(ApiKey).filter(ApiKey.token == presented).first()
+        if not row or row.revoked_at is not None:
+            raise HTTPException(401, "missing or invalid API key")
+        import datetime as _dt
+        row.last_used_at = _dt.datetime.utcnow()
+        s.flush()
+        # Detach the plain data we need before the session closes.
+        return ApiKey(id=row.id, name=row.name, token=row.token,
+                       agent_slugs=list(row.agent_slugs or []))
 
 
-router = APIRouter(tags=["openai-compat"], dependencies=[Depends(require_api_key)])
+def _check_scope(api_key: ApiKey, slug: str) -> None:
+    """Bare agent/workflow slug (e.g. "roblox-genie") must be in the key's
+    ``agent_slugs`` allowlist — empty list means the key is unrestricted."""
+    allowed = api_key.agent_slugs or []
+    if allowed and slug not in allowed:
+        raise HTTPException(403, f"this API key isn't scoped to {slug!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -390,15 +401,20 @@ async def _responses_stream(kind: str, slug: str, user_input: str,
 
 
 @router.get("/v1/models")
-def list_models():
+def list_models(api_key: ApiKey = Depends(require_api_key)):
+    allowed = set(api_key.agent_slugs or [])
     data: list[dict] = []
     with session_scope() as s:
         for a in s.query(Agent).filter(Agent.deleted_at.is_(None)).all():
+            if allowed and a.slug not in allowed:
+                continue
             data.append({
                 "id": f"agent/{a.slug}", "object": "model", "created": 0,
                 "owned_by": "agents-platform", "description": a.description or a.name,
             })
         for w in s.query(Workflow).filter(Workflow.deleted_at.is_(None)).all():
+            if allowed and w.slug not in allowed:
+                continue
             data.append({
                 "id": f"workflow/{w.slug}", "object": "model", "created": 0,
                 "owned_by": "agents-platform", "description": w.description or w.name,
@@ -407,8 +423,9 @@ def list_models():
 
 
 @router.get("/v1/models/{model_id:path}")
-def get_model(model_id: str):
+def get_model(model_id: str, api_key: ApiKey = Depends(require_api_key)):
     kind, slug = _parse_model(model_id)
+    _check_scope(api_key, slug)
     with session_scope() as s:
         cls = Workflow if kind == "workflow" else Agent
         row = s.query(cls).filter(cls.slug == slug, cls.deleted_at.is_(None)).first()
@@ -422,8 +439,9 @@ def get_model(model_id: str):
 
 
 @router.post("/v1/chat/completions")
-async def chat_completions(req: _ChatRequest):
+async def chat_completions(req: _ChatRequest, api_key: ApiKey = Depends(require_api_key)):
     kind, slug = _parse_model(req.model)
+    _check_scope(api_key, slug)
 
     with session_scope() as s:
         cls = Workflow if kind == "workflow" else Agent
@@ -459,8 +477,9 @@ async def chat_completions(req: _ChatRequest):
 
 
 @router.post("/v1/responses")
-async def responses(req: _ResponsesRequest):
+async def responses(req: _ResponsesRequest, api_key: ApiKey = Depends(require_api_key)):
     kind, slug = _parse_model(req.model)
+    _check_scope(api_key, slug)
 
     with session_scope() as s:
         cls = Workflow if kind == "workflow" else Agent
