@@ -4,7 +4,7 @@ import Page from "../components/Page";
 import { FormRow } from "../components/Modal";
 import Tabs from "../components/Tabs";
 import TelegramBots from "./TelegramBots";
-import { api, type PlatformSettings, type RagHealth, type RagProviderConfig } from "../lib/api";
+import { api, type PlatformSettings, type RagHealth, type RagProviderConfig, type Agent, type ApiKey } from "../lib/api";
 
 const OPENAI_VOICE_OPTIONS = [
   { id: "alloy",   label: "Alloy",   desc: "Neutral, balanced" },
@@ -56,6 +56,134 @@ const EDGE_VOICES_BY_LANG: Record<string, { id: string; label: string }[]> = {
 const EDGE_LANG_LABELS: Record<string, string> = {
   pt: "Portuguese", en: "English", es: "Spanish", it: "Italian", fr: "French", de: "German",
 };
+
+function AccessKeysTab() {
+  const [keys, setKeys] = useState<ApiKey[]>([]);
+  const [agents, setAgents] = useState<Agent[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  const [newName, setNewName] = useState("");
+  const [newScope, setNewScope] = useState<string[]>([]);
+  const [creating, setCreating] = useState(false);
+  const [revealToken, setRevealToken] = useState<{ id: string; token: string } | null>(null);
+  const [copiedId, setCopiedId] = useState("");
+
+  async function load() {
+    setLoading(true); setError("");
+    try {
+      const [ks, ags] = await Promise.all([api.listApiKeys(), api.listAgents()]);
+      setKeys(ks);
+      setAgents(ags);
+    } catch (e: any) { setError(String(e.message || e)); }
+    finally { setLoading(false); }
+  }
+  useEffect(() => { load(); }, []);
+
+  async function createKey() {
+    if (!newName.trim()) return;
+    setCreating(true); setError("");
+    try {
+      const created = await api.createApiKey(newName.trim(), newScope);
+      setKeys(k => [created, ...k]);
+      setRevealToken({ id: created.id, token: created.token || "" });
+      setNewName(""); setNewScope([]);
+    } catch (e: any) { setError(String(e.message || e)); }
+    finally { setCreating(false); }
+  }
+
+  async function revoke(id: string, name: string) {
+    if (!confirm(`Revoke "${name}"? Anything still using this key will start getting 401s.`)) return;
+    try {
+      await api.revokeApiKey(id);
+      setKeys(k => k.filter(row => row.id !== id));
+    } catch (e: any) { setError(String(e.message || e)); }
+  }
+
+  function toggleScope(slug: string) {
+    setNewScope(s => s.includes(slug) ? s.filter(x => x !== slug) : [...s, slug]);
+  }
+
+  return (
+    <div className="card mb-4" data-testid="settings-access-keys">
+      <h2 className="text-base font-semibold mb-1">Access Keys</h2>
+      <div className="text-xs text-muted mb-3">
+        Bearer keys for the OpenAI-compat surface (<code className="font-mono">/v1/chat/completions</code>,{" "}
+        <code className="font-mono">/v1/responses</code>) — lets external callers (a game NPC, curl, another
+        service) run one specific agent or workflow without a browser session. Scope a key to the agents/workflows
+        it needs; an unscoped key (no agents selected) can call anything.
+      </div>
+
+      {error && <div className="codebox text-err mb-3">{error}</div>}
+
+      <div className="card mb-3" style={{ padding: 12, background: "var(--bg-2)" }}>
+        <div className="text-xs font-semibold uppercase text-muted mb-2">New key</div>
+        <div className="flex items-center gap-2 mb-2 flex-wrap">
+          <input type="text" className="w-56" placeholder="name (e.g. roblox-genie-npc)"
+                 value={newName} onChange={e => setNewName(e.target.value)}
+                 data-testid="access-key-new-name" />
+          <button className="btn btn-primary" disabled={creating || !newName.trim()}
+                  onClick={createKey} data-testid="access-key-create">
+            {creating ? "creating…" : "create key"}
+          </button>
+        </div>
+        <div className="text-xs text-muted mb-1">Scope (none selected = unrestricted, can call any agent/workflow):</div>
+        <div className="flex flex-wrap gap-1">
+          {agents.map(a => (
+            <button key={a.slug} type="button"
+                    className={`btn btn-xs ${newScope.includes(a.slug) ? "btn-primary" : "btn-ghost"}`}
+                    onClick={() => toggleScope(a.slug)}
+                    data-testid={`access-key-scope-${a.slug}`}>
+              {a.slug}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {revealToken && (
+        <div className="card mb-3" style={{ padding: 12, borderColor: "var(--ok)" }}>
+          <div className="text-xs font-semibold text-ok mb-1">Copy this now — it won't be shown again</div>
+          <div className="flex items-center gap-2">
+            <code className="font-mono text-sm flex-1" style={{ background: "var(--bg-2)", padding: "5px 10px", borderRadius: 6 }}>
+              {revealToken.token}
+            </code>
+            <button className="btn btn-ghost btn-icon" title="Copy"
+                    onClick={() => {
+                      navigator.clipboard.writeText(revealToken.token);
+                      setCopiedId(revealToken.id);
+                      setTimeout(() => setCopiedId(""), 1500);
+                    }}>
+              {copiedId === revealToken.id ? <Check size={14} style={{ color: "var(--ok)" }} /> : <Copy size={14} />}
+            </button>
+            <button className="btn btn-ghost" onClick={() => setRevealToken(null)}>done</button>
+          </div>
+        </div>
+      )}
+
+      {loading ? <div className="text-xs text-muted">loading…</div> : (
+        <div className="flex flex-col gap-1">
+          {keys.length === 0 && <div className="text-xs text-muted">No keys yet.</div>}
+          {keys.map(k => (
+            <div key={k.id} className="flex items-center gap-3 py-2 border-b border-line text-sm">
+              <span className="font-semibold w-40 shrink-0">{k.name}</span>
+              <code className="font-mono text-xs shrink-0" style={{ color: "var(--muted)" }}>{k.token_preview}</code>
+              <span className="text-xs text-muted flex-1">
+                {k.agent_slugs.length ? k.agent_slugs.join(", ") : "unrestricted"}
+              </span>
+              <span className="text-xs text-muted shrink-0">
+                {k.last_used_at ? `used ${new Date(k.last_used_at).toLocaleString()}` : "never used"}
+              </span>
+              <button className="btn btn-ghost btn-danger btn-icon" title="Revoke"
+                      onClick={() => revoke(k.id, k.name)}>
+                <Trash2 size={13} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export default function Settings() {
   const [s, setS] = useState<PlatformSettings | null>(null);
@@ -802,6 +930,7 @@ export default function Settings() {
           { id: "telegram", label: "Telegram", content: <TelegramBots /> },
           { id: "integrations", label: "Integrations", content: integrationsTab },
           { id: "remote-agents", label: "Remote Agents", content: remoteAgentsTab },
+          { id: "access-keys", label: "Access Keys", content: <AccessKeysTab /> },
           { id: "retro-scoring", label: "Retro Scoring", content: retroScoringTab },
         ]}
       />

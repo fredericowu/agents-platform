@@ -29,6 +29,17 @@ export type Agent = {
   color: string;
 };
 
+export type ApiKey = {
+  id: string;
+  name: string;
+  agent_slugs: string[];
+  token_preview: string;
+  token: string | null;  // only set on the response right after creation
+  created_at: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+};
+
 export type AgentConfig = {
   slug: string;
   name: string;
@@ -430,6 +441,12 @@ export const api = {
   resetAgent: (slug: string) =>
     call<Agent>(`/api/agents/${slug}/reset`, { method: "POST" }),
   listResettableAgents: () => call<string[]>("/api/agents/_resettable"),
+
+  listApiKeys: () => call<ApiKey[]>("/api/api-keys"),
+  createApiKey: (name: string, agent_slugs: string[]) =>
+    call<ApiKey>("/api/api-keys", { method: "POST", body: JSON.stringify({ name, agent_slugs }) }),
+  revokeApiKey: (id: string) =>
+    call<{ ok: boolean }>(`/api/api-keys/${id}`, { method: "DELETE" }),
   generateSlug: (kind: "agent" | "workflow", name?: string) =>
     call<{ slug: string }>(`/api/admin/slugs/generate?kind=${kind}${name ? `&name=${encodeURIComponent(name)}` : ""}`),
   renameAgent: (slug: string, newSlug: string) =>
