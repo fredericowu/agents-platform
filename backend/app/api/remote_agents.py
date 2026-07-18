@@ -256,6 +256,7 @@ def _agent_with_status(row: RemoteAgentRow) -> dict:
         "description": row.description,
         "created_at": row.created_at,
         "tunnels": tunnels,
+        "auto_mount_fuse": row.auto_mount_fuse,
         "connected": conn_data is not None,
         "info": conn_data["info"] if conn_data else None,
         "connected_at": conn_data["connected_at"] if conn_data else None,
@@ -598,9 +599,11 @@ class TunnelSpec(BaseModel):
 
 
 class RemoteAgentBody(BaseModel):
+    id: str | None = None  # present only when renaming the profile id
     name: str
     description: str = ""
     tunnels: list[TunnelSpec] = []
+    auto_mount_fuse: bool = True
 
 
 @router.get("/api/remote-agents")
@@ -616,6 +619,7 @@ async def create_remote_agent(body: RemoteAgentBody):
         row = RemoteAgentRow(id=str(_uuid.uuid4()), name=body.name,
                              description=body.description,
                              tunnels=json.dumps([t.model_dump() for t in body.tunnels]),
+                             auto_mount_fuse=body.auto_mount_fuse,
                              created_at=now_epoch())
         s.add(row)
         s.flush()
@@ -637,17 +641,35 @@ def get_remote_agent(agent_id: str):
 
 @router.put("/api/remote-agents/{agent_id}")
 async def update_remote_agent(agent_id: str, body: RemoteAgentBody):
+    new_id = (body.id or agent_id).strip()
     with session_scope() as s:
         row = s.get(RemoteAgentRow, agent_id)
         if not row:
             raise HTTPException(404, "Agent not found")
-        row.name = body.name
-        row.description = body.description
-        row.tunnels = json.dumps([t.model_dump() for t in body.tunnels])
+        if new_id != agent_id:
+            # id is the primary key (and the value clients pass as --profile),
+            # so a rename is a delete+recreate, not a column update. Any
+            # machine already connected under the old id needs its launch
+            # command updated to the new one before it can reconnect.
+            if s.get(RemoteAgentRow, new_id):
+                raise HTTPException(409, "That profile name is already in use")
+            row = RemoteAgentRow(
+                id=new_id, name=body.name, description=body.description,
+                tunnels=json.dumps([t.model_dump() for t in body.tunnels]),
+                auto_mount_fuse=body.auto_mount_fuse, created_at=row.created_at,
+            )
+            s.delete(s.get(RemoteAgentRow, agent_id))
+            s.flush()
+            s.add(row)
+        else:
+            row.name = body.name
+            row.description = body.description
+            row.tunnels = json.dumps([t.model_dump() for t in body.tunnels])
+            row.auto_mount_fuse = body.auto_mount_fuse
         s.flush()
         result = _agent_with_status(row)
     # Takes effect immediately — no need for the agent to reconnect.
-    await _apply_tunnels_for(agent_id, result["tunnels"])
+    await _apply_tunnels_for(new_id, result["tunnels"])
     return result
 
 
@@ -665,8 +687,12 @@ def delete_remote_agent(agent_id: str):
 @router.get("/api/config")
 def get_config():
     with session_scope() as s:
-        row = s.get(ConfigRow, "mcp_api_key")
-        return {"mcp_api_key": row.value if row else ""}
+        mcp_row = s.get(ConfigRow, "mcp_api_key")
+        oai_row = s.get(ConfigRow, "openai_compat_api_key")
+        return {
+            "mcp_api_key": mcp_row.value if mcp_row else "",
+            "openai_compat_api_key": oai_row.value if oai_row else "",
+        }
 
 
 @router.post("/api/config/regenerate")
@@ -679,3 +705,16 @@ def regenerate_api_key():
         else:
             s.add(ConfigRow(key="mcp_api_key", value=new_key))
     return {"mcp_api_key": new_key}
+
+
+@router.post("/api/config/regenerate_openai_compat_key")
+def regenerate_openai_compat_key():
+    """Rotate the static bearer key that gates POST /v1/* (see openai_compat.py)."""
+    new_key = _sec.token_urlsafe(32)
+    with session_scope() as s:
+        row = s.get(ConfigRow, "openai_compat_api_key")
+        if row:
+            row.value = new_key
+        else:
+            s.add(ConfigRow(key="openai_compat_api_key", value=new_key))
+    return {"openai_compat_api_key": new_key}

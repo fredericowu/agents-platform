@@ -38,14 +38,38 @@ import time
 import uuid
 from typing import Any, AsyncGenerator, Optional, Union
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from ..core.remote_agents_db import ConfigRow
+from ..core.remote_agents_db import session_scope as _config_session_scope
 from ..db import session_scope
 from ..models import Agent, Target, Workflow
 
-router = APIRouter(tags=["openai-compat"])
+def require_api_key(authorization: Optional[str] = Header(default=None)) -> None:
+    """Gate every /v1/* route behind the platform's own static API key.
+
+    This surface runs real agents/workflows (real cost, real side effects),
+    so unlike the rest of the app (browser JWT/session cookie) it needs a
+    non-interactive credential external callers (Roblox scripts, curl, other
+    services) can present. Same ``ConfigRow`` table/pattern as ``mcp_api_key``
+    (see ``remote_agents.py``'s ``/api/config``), just a distinct key so
+    rotating one doesn't invalidate the other.
+    """
+    with _config_session_scope() as s:
+        row = s.get(ConfigRow, "openai_compat_api_key")
+        expected = row.value if row else None
+
+    if not expected:
+        raise HTTPException(500, "openai_compat_api_key not configured")
+
+    presented = (authorization or "").removeprefix("Bearer ").strip()
+    if not presented or presented != expected:
+        raise HTTPException(401, "missing or invalid API key")
+
+
+router = APIRouter(tags=["openai-compat"], dependencies=[Depends(require_api_key)])
 
 
 # ---------------------------------------------------------------------------
