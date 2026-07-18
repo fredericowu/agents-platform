@@ -778,6 +778,23 @@ async def _list_tools() -> list[Tool]:
                           }}),
 
         # ----- Targets (overall delivery goals) -----
+        Tool(name="list_callers",
+             description=("List external caller identities (e.g. Roblox players) that have "
+                          "hit /v1/chat/completions with X-Caller-Meta-* headers. Each caller "
+                          "is keyed by (source, external_id), e.g. source='roblox', "
+                          "external_id='<UserId>'."),
+             inputSchema={"type": "object", "properties": {
+                 "source": {"type": "string", "description": "Filter by source, e.g. 'roblox'."},
+             }}),
+        Tool(name="list_caller_messages",
+             description=("Fetch one caller's full message history (both what they sent and "
+                          "what the agent replied), oldest first. Use `list_callers` first to "
+                          "find the (source, external_id) pair."),
+             inputSchema={"type": "object", "properties": {
+                 "source": {"type": "string"},
+                 "external_id": {"type": "string"},
+                 "limit": {"type": "integer", "description": "Max messages to return (default 50)."},
+             }, "required": ["source", "external_id"]}),
         Tool(name="list_targets",
              description=("List Targets — first-class umbrella goals that group runs. "
                           "Each Target represents the WHY of an orchestration (e.g. "
@@ -1566,6 +1583,18 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
 
         # --- Targets ---
+        if name == "list_callers":
+            params = {}
+            if args.get("source"):
+                params["source"] = args["source"]
+            r = await c.get(f"{BASE}/api/callers", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "list_caller_messages":
+            params = {"source": args["source"], "external_id": args["external_id"]}
+            if args.get("limit"):
+                params["limit"] = str(args["limit"])
+            r = await c.get(f"{BASE}/api/callers/messages", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "list_targets":
             params = {}
             if args.get("include_deleted"):

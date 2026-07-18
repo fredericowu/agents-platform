@@ -43,7 +43,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from ..db import session_scope
-from ..models import ApiKey, Agent, Target, Workflow
+from ..models import ApiKey, Agent, CallerIdentity, CallerMessage, Target, Workflow
 
 router = APIRouter(tags=["openai-compat"])
 
@@ -233,6 +233,45 @@ def _adhoc_target_id() -> str:
         return t.id
 
 
+def _upsert_caller_identity(source: Optional[str], external_id: Optional[str],
+                            meta_info: Optional[str]) -> Optional[str]:
+    """Upsert the (source, external_id) caller and return its row id.
+
+    Called on every ``/v1/chat/completions`` request that carries the
+    ``X-Caller-Meta-*`` headers — ``meta_info`` and ``last_seen`` are
+    refreshed each time so the row always reflects what the caller last told
+    us about itself (e.g. a Roblox player's current AccountAge/membership).
+    Returns None when the request isn't tagged (source or external_id
+    missing) so callers can skip message logging entirely.
+    """
+    if not source or not external_id:
+        return None
+    import datetime as _dt
+    with session_scope() as s:
+        row = (s.query(CallerIdentity)
+                .filter(CallerIdentity.source == source,
+                        CallerIdentity.external_id == external_id)
+                .first())
+        now = _dt.datetime.utcnow()
+        if row is None:
+            row = CallerIdentity(source=source, external_id=external_id,
+                                 meta_info=meta_info or "", last_seen=now)
+            s.add(row)
+        else:
+            row.meta_info = meta_info or row.meta_info
+            row.last_seen = now
+        s.flush()
+        return row.id
+
+
+def _log_caller_message(caller_identity_id: Optional[str], role: str, content: str) -> None:
+    """Append one turn to a caller's history. No-op if not caller-tagged or empty."""
+    if not caller_identity_id or not content:
+        return
+    with session_scope() as s:
+        s.add(CallerMessage(caller_identity_id=caller_identity_id, role=role, content=content))
+
+
 async def _run(kind: str, slug: str, user_input: str,
                prior: list[dict]) -> tuple[str, dict]:
     """Execute an agent or workflow to completion. Returns (text, usage)."""
@@ -287,7 +326,8 @@ def _sse_chunk(cid: str, model: str, *, role: Optional[str] = None,
 
 
 async def _stream(kind: str, slug: str, user_input: str, prior: list[dict],
-                  cid: str, model: str) -> AsyncGenerator[str, None]:
+                  cid: str, model: str,
+                  caller_identity_id: Optional[str] = None) -> AsyncGenerator[str, None]:
     """Run to completion, then emit the result as OpenAI SSE chunks.
 
     Agents/workflows resolve as a single logical answer, so we don't attempt
@@ -299,6 +339,8 @@ async def _stream(kind: str, slug: str, user_input: str, prior: list[dict],
         text, usage = await _run(kind, slug, user_input, prior)
     except Exception as exc:  # surface as content, never break the stream
         text, usage = f"[error] {exc}", {}
+
+    _log_caller_message(caller_identity_id, "assistant", text)
 
     step = 80
     for i in range(0, len(text), step):
@@ -439,7 +481,13 @@ def get_model(model_id: str, api_key: ApiKey = Depends(require_api_key)):
 
 
 @router.post("/v1/chat/completions")
-async def chat_completions(req: _ChatRequest, api_key: ApiKey = Depends(require_api_key)):
+async def chat_completions(
+    req: _ChatRequest,
+    api_key: ApiKey = Depends(require_api_key),
+    x_caller_meta_id: Optional[str] = Header(default=None, alias="X-Caller-Meta-Id"),
+    x_caller_meta_info: Optional[str] = Header(default=None, alias="X-Caller-Meta-Info"),
+    x_caller_meta_source: Optional[str] = Header(default=None, alias="X-Caller-Meta-Source"),
+):
     kind, slug = _parse_model(req.model)
     _check_scope(api_key, slug)
 
@@ -454,14 +502,20 @@ async def chat_completions(req: _ChatRequest, api_key: ApiKey = Depends(require_
     user_input, prior = _split_messages(req.messages)
     cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
+    caller_identity_id = _upsert_caller_identity(
+        x_caller_meta_source, x_caller_meta_id, x_caller_meta_info)
+    _log_caller_message(caller_identity_id, "user", user_input)
+
     if req.stream:
         return StreamingResponse(
-            _stream(kind, slug, user_input, prior, cid, req.model),
+            _stream(kind, slug, user_input, prior, cid, req.model,
+                    caller_identity_id=caller_identity_id),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     text, usage = await _run(kind, slug, user_input, prior)
+    _log_caller_message(caller_identity_id, "assistant", text)
     return {
         "id": cid,
         "object": "chat.completion",

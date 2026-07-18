@@ -722,6 +722,43 @@ class CrispalConversationSuggestion(Base):
     decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
+class CallerIdentity(Base):
+    """A caller external to the platform, identified by (source, external_id).
+
+    Populated by the ``/v1/chat/completions`` surface whenever a request
+    carries the ``X-Caller-Meta-*`` headers (see openai_compat.py) — e.g. a
+    Roblox player talking to an in-game NPC agent. Generic on purpose: any
+    caller kind (Roblox, a future game, a kiosk, ...) reuses the same table,
+    keyed by its own external_id, with ``meta_info`` holding whatever free-form
+    description that source provides (for Roblox: name/display name/account
+    age/membership/verified badge/locale as a JSON string)."""
+    __tablename__ = "caller_identities"
+    __table_args__ = (UniqueConstraint("source", "external_id", name="uq_caller_source_external_id"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    source: Mapped[str] = mapped_column(String, index=True)       # roblox | ...
+    external_id: Mapped[str] = mapped_column(String, index=True)  # e.g. Roblox UserId
+    meta_info: Mapped[str] = mapped_column(Text, default="")
+    first_seen: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    last_seen: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class CallerMessage(Base):
+    """One turn (user or assistant) in a caller's conversation history.
+
+    Written by ``/v1/chat/completions`` right after a caller-tagged request
+    resolves — one row for the caller's message, one for the agent's reply —
+    so ``list_caller_messages`` can play back the full history per caller."""
+    __tablename__ = "caller_messages"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    caller_identity_id: Mapped[str] = mapped_column(
+        String, ForeignKey("caller_identities.id"), index=True)
+    role: Mapped[str] = mapped_column(String)  # user | assistant
+    content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, index=True)
+
+
 class HumanQuestion(Base):
     """A question an agent couldn't resolve on its own, sent to the human via
     the sysadmin Telegram bot as a clickable link (mini-app: question text +
