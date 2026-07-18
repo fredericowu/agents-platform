@@ -785,6 +785,9 @@ async def _list_tools() -> list[Tool]:
                           "external_id='<UserId>'."),
              inputSchema={"type": "object", "properties": {
                  "source": {"type": "string", "description": "Filter by source, e.g. 'roblox'."},
+                 "meta_filter": {"type": "string",
+                                 "description": "JSON object matched via JSONB containment against "
+                                                "meta_info, e.g. '{\"membershipType\": \"Premium\"}'."},
              }}),
         Tool(name="list_caller_messages",
              description=("Fetch one caller's full message history (both what they sent and "
@@ -1587,6 +1590,8 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
             params = {}
             if args.get("source"):
                 params["source"] = args["source"]
+            if args.get("meta_filter"):
+                params["meta_filter"] = args["meta_filter"]
             r = await c.get(f"{BASE}/api/callers", params=params)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "list_caller_messages":

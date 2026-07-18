@@ -233,6 +233,20 @@ def _adhoc_target_id() -> str:
         return t.id
 
 
+def _parse_caller_meta_info(raw: Optional[str]) -> dict:
+    """``X-Caller-Meta-Info`` arrives as a JSON string (Roblox JSONEncode's
+    output) — parse it into a dict for the JSONB column. Callers that send a
+    non-JSON string aren't punished for it: it's kept under ``raw`` so
+    nothing is silently dropped."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {"raw": parsed}
+    except (json.JSONDecodeError, TypeError):
+        return {"raw": raw}
+
+
 def _upsert_caller_identity(source: Optional[str], external_id: Optional[str],
                             meta_info: Optional[str]) -> Optional[str]:
     """Upsert the (source, external_id) caller and return its row id.
@@ -247,6 +261,7 @@ def _upsert_caller_identity(source: Optional[str], external_id: Optional[str],
     if not source or not external_id:
         return None
     import datetime as _dt
+    parsed_meta = _parse_caller_meta_info(meta_info)
     with session_scope() as s:
         row = (s.query(CallerIdentity)
                 .filter(CallerIdentity.source == source,
@@ -255,10 +270,10 @@ def _upsert_caller_identity(source: Optional[str], external_id: Optional[str],
         now = _dt.datetime.utcnow()
         if row is None:
             row = CallerIdentity(source=source, external_id=external_id,
-                                 meta_info=meta_info or "", last_seen=now)
+                                 meta_info=parsed_meta, last_seen=now)
             s.add(row)
         else:
-            row.meta_info = meta_info or row.meta_info
+            row.meta_info = parsed_meta or row.meta_info
             row.last_seen = now
         s.flush()
         return row.id

@@ -287,6 +287,25 @@ def _apply_inline_migrations() -> None:
             if not gallery_cols["origin_chat_id"]["nullable"]:
                 conn.execute(text("ALTER TABLE gallery_blocks ALTER COLUMN origin_chat_id DROP NOT NULL"))
 
+    # caller_identities.meta_info: TEXT -> JSONB (queryable in place), + GIN index.
+    # Skipped on SQLite (no JSONB dialect type there; dev-only sqlite runs keep
+    # the plain-text column, which is fine since prod is always Postgres).
+    if "caller_identities" in insp.get_table_names() and not _is_sqlite:
+        with engine.begin() as conn:
+            cols = {c["name"]: c for c in inspect(conn).get_columns("caller_identities")}
+            if "jsonb" not in str(cols["meta_info"]["type"]).lower():
+                conn.execute(text("""
+                    ALTER TABLE caller_identities
+                    ALTER COLUMN meta_info TYPE JSONB
+                    USING (CASE WHEN meta_info IS NULL OR meta_info = ''
+                                THEN '{}' ELSE meta_info END)::jsonb
+                """))
+                conn.execute(text(
+                    "ALTER TABLE caller_identities ALTER COLUMN meta_info SET DEFAULT '{}'::jsonb"))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_caller_identities_meta_info_gin "
+                "ON caller_identities USING GIN (meta_info)"))
+
     # Backfill cli_sessions from existing runs.session_id values
     if "cli_sessions" in insp.get_table_names() and "runs" in insp.get_table_names():
         with engine.begin() as conn:

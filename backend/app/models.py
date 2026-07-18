@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -731,14 +732,19 @@ class CallerIdentity(Base):
     caller kind (Roblox, a future game, a kiosk, ...) reuses the same table,
     keyed by its own external_id, with ``meta_info`` holding whatever free-form
     description that source provides (for Roblox: name/display name/account
-    age/membership/verified badge/locale as a JSON string)."""
+    age/membership/verified badge/locale), stored as JSONB (not plain text) so
+    it's queryable in place — e.g. ``meta_info @> '{"membershipType": "Premium"}'``
+    or ``meta_info ->> 'locale_id'`` — and indexed via a GIN index below."""
     __tablename__ = "caller_identities"
-    __table_args__ = (UniqueConstraint("source", "external_id", name="uq_caller_source_external_id"),)
+    __table_args__ = (
+        UniqueConstraint("source", "external_id", name="uq_caller_source_external_id"),
+        Index("ix_caller_identities_meta_info_gin", "meta_info", postgresql_using="gin"),
+    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
     source: Mapped[str] = mapped_column(String, index=True)       # roblox | ...
     external_id: Mapped[str] = mapped_column(String, index=True)  # e.g. Roblox UserId
-    meta_info: Mapped[str] = mapped_column(Text, default="")
+    meta_info: Mapped[dict] = mapped_column(JSONB, default=dict)
     first_seen: Mapped[datetime] = mapped_column(DateTime, default=_now)
     last_seen: Mapped[datetime] = mapped_column(DateTime, default=_now)
 

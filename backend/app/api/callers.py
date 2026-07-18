@@ -15,6 +15,20 @@ from ..models import CallerIdentity, CallerMessage
 router = APIRouter(prefix="/api/callers", tags=["callers"])
 
 
+def _parse_meta_filter(raw: str | None) -> dict | None:
+    """``meta_filter`` is a JSON object string matched via Postgres JSONB
+    containment (``@>``) — e.g. ``{"membershipType": "Premium"}`` returns only
+    callers whose meta_info contains that key/value."""
+    if not raw:
+        return None
+    import json
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
 def _identity_out(row: CallerIdentity) -> dict:
     return {
         "id": row.id,
@@ -27,11 +41,17 @@ def _identity_out(row: CallerIdentity) -> dict:
 
 
 @router.get("")
-def list_callers(source: str | None = Query(None)) -> list[dict]:
+def list_callers(source: str | None = Query(None),
+                 meta_filter: str | None = Query(
+                     None, description='JSON object matched via JSONB containment, '
+                                       'e.g. {"membershipType": "Premium"}')) -> list[dict]:
     with session_scope() as s:
         q = s.query(CallerIdentity)
         if source:
             q = q.filter(CallerIdentity.source == source)
+        parsed_filter = _parse_meta_filter(meta_filter)
+        if parsed_filter:
+            q = q.filter(CallerIdentity.meta_info.contains(parsed_filter))
         rows = q.order_by(CallerIdentity.last_seen.desc()).all()
         return [_identity_out(r) for r in rows]
 
