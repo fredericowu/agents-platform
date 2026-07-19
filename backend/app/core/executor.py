@@ -301,9 +301,9 @@ def _agent_to_runtime(s: Session, agent: Agent) -> dict[str, Any]:
         params["extra_volumes"] = extra_volumes
     # share_network: join aw-sandbox's docker netns instead of the default bridge,
     # so 127.0.0.1 reaches awserv/redis/postgres/the agents-platform backend itself.
-    # Defaults ON (unlike other opt-in perms) per current rollout — flip to False
-    # per-agent via the "Share network" permission checkbox to opt a given agent out.
-    params["share_network"] = bool(permissions.get("share_network", True))
+    # Secure by default: an agent with no AgentConfig/permissions gets NO access —
+    # opt in per-agent via the "Share network" permission checkbox.
+    params["share_network"] = bool(permissions.get("share_network", False))
     # "Agentic Workspace Folder Access" — controls only whether the REAL repo is
     # bind-mounted into the container; it must NOT change the CLI's working dir.
     # The claude CLI keys conversation memory (session files under
@@ -317,8 +317,23 @@ def _agent_to_runtime(s: Session, agent: Agent) -> dict[str, Any]:
     # When access is ON the repo is bind-mounted at that path; when OFF docker_agent
     # mounts an empty writable tmpfs there instead (the dir still exists as cwd,
     # just without the repo). See CliLLM.mount_cwd / build_docker_argv.workdir.
-    params["cwd"] = _aw_base
-    params["mount_cwd"] = bool(permissions.get("workspace_access", True))
+    #
+    # "isolated_identity" is a SEPARATE, stronger opt-out from "workspace_access":
+    # turning workspace_access off still keeps cwd pinned to _aw_base, so the CLI's
+    # ~/.claude/projects/<encoded-cwd>/ session dir (and this project's auto-memory
+    # MEMORY.md under it) is the SAME shared one every other AW agent uses --
+    # ~/.claude itself is always mounted (creds), independent of the repo bind, so
+    # an agent can still pick up AW's memory/session history by cwd alone even with
+    # the repo unmounted. Public-facing personas (e.g. the aw-roblox Genie NPC) need
+    # zero awareness of AW at all, not just no filesystem access -- so this flag
+    # points cwd at a completely different, never-before-used path instead, which
+    # gets its own empty project dir with no CLAUDE.md/AGENTS.md and no memory bleed.
+    if permissions.get("isolated_identity"):
+        params["cwd"] = "/home/ubuntu"
+        params["mount_cwd"] = False
+    else:
+        params["cwd"] = _aw_base
+        params["mount_cwd"] = bool(permissions.get("workspace_access", False))
     # /opt is now the cwd, so drop any redundant --add-dir for it (keep e.g. /tmp).
     params["add_dirs"] = [d for d in (params.get("add_dirs") or []) if d != _aw_base]
     return {"provider": provider, "model_id": model_id, "model_slug": model_slug,

@@ -19,6 +19,7 @@ interface RemoteAgent {
   name: string;
   description: string;
   tunnels: TunnelSpec[];
+  auto_mount_fuse: boolean;
   connected: boolean;
   info: Record<string, unknown> | null;
   connected_at: number | null;
@@ -211,7 +212,10 @@ function TunnelsSection({ agent, onUpdated }: {
       const res = await fetch(`/api/remote-agents/${agent.id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: agent.name, description: agent.description, tunnels: rows }),
+        body: JSON.stringify({
+          name: agent.name, description: agent.description, tunnels: rows,
+          auto_mount_fuse: agent.auto_mount_fuse,
+        }),
       });
       onUpdated(await res.json());
     } finally {
@@ -252,6 +256,52 @@ function TunnelsSection({ agent, onUpdated }: {
   );
 }
 
+// ── Auto Mount FUSE section ──────────────────────────────────────────────────
+//
+// Whether src/services/remote_agent_fs_watcher.py should auto-mount this
+// profile's filesystem under mnt/<id>/ while it's connected. Saving PUTs the
+// whole agent (name/description/tunnels kept as-is) — the watcher picks up
+// the change on its next poll cycle (every 5s).
+
+function AutoMountSection({ agent, onUpdated }: {
+  agent: RemoteAgent;
+  onUpdated: (agent: RemoteAgent) => void;
+}) {
+  const [saving, setSaving] = useState(false);
+
+  async function toggle() {
+    setSaving(true);
+    try {
+      const res = await fetch(`/api/remote-agents/${agent.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: agent.name, description: agent.description, tunnels: agent.tunnels,
+          auto_mount_fuse: !agent.auto_mount_fuse,
+        }),
+      });
+      onUpdated(await res.json());
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="card" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <div className="section-label">Auto Mount FUSE</div>
+      <div style={{ fontSize: 11, color: "var(--muted)" }}>
+        Automatically mount this agent's filesystem under mnt/ while it's connected. Takes effect on the watcher's next poll cycle (~5s).
+      </div>
+      <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: saving ? "not-allowed" : "pointer" }}>
+        <input type="checkbox" checked={agent.auto_mount_fuse} disabled={saving} onChange={toggle} />
+        <span style={{ fontSize: 13, color: "var(--fg)" }}>
+          {agent.auto_mount_fuse ? "Enabled" : "Disabled"}
+        </span>
+      </label>
+    </div>
+  );
+}
+
 // ── Agent Info panel ─────────────────────────────────────────────────────────
 
 function AgentInfo({ agent, serverBase, onDelete, onUpdated }: {
@@ -266,6 +316,9 @@ function AgentInfo({ agent, serverBase, onDelete, onUpdated }: {
   const [editing, setEditing] = useState(false);
   const [editName, setEditName] = useState(agent.name);
   const [editDesc, setEditDesc] = useState(agent.description);
+  const [editId, setEditId] = useState(agent.id);
+  const [saving, setSaving] = useState(false);
+  const [editError, setEditError] = useState("");
 
   function copy() {
     copyText(launchCmd);
@@ -273,16 +326,40 @@ function AgentInfo({ agent, serverBase, onDelete, onUpdated }: {
     setTimeout(() => setCopied(false), 1500);
   }
 
+  function startEdit() {
+    setEditName(agent.name);
+    setEditDesc(agent.description);
+    setEditId(agent.id);
+    setEditError("");
+    setEditing(true);
+  }
+
   async function saveEdit() {
-    // Full replace — must carry the current tunnels along or this save
-    // (name/description only) would wipe them out.
-    const res = await fetch(`/api/remote-agents/${agent.id}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: editName, description: editDesc, tunnels: agent.tunnels }),
-    });
-    onUpdated(await res.json());
-    setEditing(false);
+    const newId = editId.trim();
+    setSaving(true);
+    setEditError("");
+    try {
+      // Full replace — must carry the current tunnels along or this save
+      // (name/description/id only) would wipe them out.
+      const res = await fetch(`/api/remote-agents/${agent.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...(newId !== agent.id ? { id: newId } : {}),
+          name: editName, description: editDesc, tunnels: agent.tunnels,
+          auto_mount_fuse: agent.auto_mount_fuse,
+        }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        setEditError(body.detail || "Failed to save");
+        return;
+      }
+      onUpdated(await res.json());
+      setEditing(false);
+    } finally {
+      setSaving(false);
+    }
   }
 
   return (
@@ -300,12 +377,28 @@ function AgentInfo({ agent, serverBase, onDelete, onUpdated }: {
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
           {editing ? (
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              <input value={editName} onChange={e => setEditName(e.target.value)} style={{ fontSize: 15, fontWeight: 700 }} />
-              <input value={editDesc} onChange={e => setEditDesc(e.target.value)} placeholder="Description" />
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <label style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                <span style={{ fontSize: 11, color: "var(--muted)" }}>Name</span>
+                <input value={editName} onChange={e => setEditName(e.target.value)} style={{ fontSize: 15, fontWeight: 700 }} disabled={saving} />
+              </label>
+              <label style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                <span style={{ fontSize: 11, color: "var(--muted)" }}>Description</span>
+                <input value={editDesc} onChange={e => setEditDesc(e.target.value)} placeholder="Description" disabled={saving} />
+              </label>
+              <label style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                <span style={{ fontSize: 11, color: "var(--muted)" }}>Profile Name (value machines connect with, --profile)</span>
+                <input value={editId} onChange={e => setEditId(e.target.value)} className="mono" style={{ fontSize: 12 }} disabled={saving} />
+              </label>
+              {editId.trim() !== agent.id && (
+                <div style={{ fontSize: 11, color: "var(--muted)" }}>
+                  Renaming breaks any already-connected machine until it's relaunched with the new name.
+                </div>
+              )}
+              {editError && <div style={{ fontSize: 11, color: "var(--danger)" }}>{editError}</div>}
               <div style={{ display: "flex", gap: 6 }}>
-                <button className="btn btn-primary" onClick={saveEdit}><Check size={13} />Save</button>
-                <button className="btn btn-ghost" onClick={() => setEditing(false)}><X size={13} />Cancel</button>
+                <button className="btn btn-primary" onClick={saveEdit} disabled={saving}><Check size={13} />{saving ? "Saving…" : "Save"}</button>
+                <button className="btn btn-ghost" onClick={() => setEditing(false)} disabled={saving}><X size={13} />Cancel</button>
               </div>
             </div>
           ) : (
@@ -317,7 +410,7 @@ function AgentInfo({ agent, serverBase, onDelete, onUpdated }: {
                   {agent.connected ? <Wifi size={10} /> : <WifiOff size={10} />}
                   {agent.connected ? "Connected" : "Offline"}
                 </span>
-                <button className="btn-icon" onClick={() => setEditing(true)} title="Edit"><Pencil size={13} /></button>
+                <button className="btn-icon" onClick={startEdit} title="Edit"><Pencil size={13} /></button>
                 <button className="btn-icon btn-danger" onClick={() => onDelete(agent.id)} title="Delete"><Trash2 size={13} /></button>
               </div>
             </>
@@ -338,11 +431,13 @@ function AgentInfo({ agent, serverBase, onDelete, onUpdated }: {
         </div>
       </div>
 
-      {/* Profile UUID */}
+      {/* Profile Name (the id clients connect with) — edited via the header's Edit above */}
       <div className="card" style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-        <div className="section-label">Profile UUID</div>
+        <div className="section-label">Profile Name</div>
         <code className="mono" style={{ fontSize: 12, color: "var(--muted)" }}>{agent.id}</code>
       </div>
+
+      <AutoMountSection agent={agent} onUpdated={onUpdated} />
 
       <TunnelsSection agent={agent} onUpdated={onUpdated} />
 
@@ -356,7 +451,7 @@ function AgentInfo({ agent, serverBase, onDelete, onUpdated }: {
           <InfoRow icon={<Cpu size={13} />}         label="CPUs"      value={info.cpus ? `${info.cpus as number} cores` : undefined} />
           <InfoRow icon={<MemoryStick size={13} />} label="RAM"       value={fmtBytes(info.ram_bytes)} />
           <InfoRow icon={<Tag size={13} />}         label="Version"   value={info.version as string} mono />
-          <InfoRow icon={<FolderOpen size={13} />}  label="Root dir"  value={(info.root_dir as string) || "C:\\ (unrestricted)"} mono />
+          <InfoRow icon={<FolderOpen size={13} />}  label="Root dir"  value={(info.root_dir as string) || ((info.os as string) === "windows" ? "C:\\ (unrestricted)" : "/ (unrestricted)")} mono />
           <InfoRow icon={<Clock size={13} />}       label="Connected" value={timeAgo(agent.connected_at)} />
         </div>
       )}
@@ -631,6 +726,7 @@ export default function RemoteAgents() {
               <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
                 {tab === "info" && (
                   <AgentInfo
+                    key={selectedAgent.id}
                     agent={selectedAgent}
                     serverBase={serverBase}
                     onDelete={onDelete}

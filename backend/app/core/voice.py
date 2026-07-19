@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import threading
+import time
 from typing import Optional
 
 import httpx
@@ -220,30 +221,42 @@ def _openai_transcribe(audio: bytes, filename: str, language: str = "") -> Optio
         log.warning("STT: no OpenAI API key configured (setting: openai_api_key / aw.json)")
         return None
 
-    files = {"file": (filename, io.BytesIO(audio), "application/octet-stream")}
     data = {"model": WHISPER_MODEL, "response_format": "verbose_json"}
     language_hint = normalize_stt_language(language)
     if language_hint:
         data["language"] = language_hint
 
-    try:
-        with httpx.Client(timeout=120.0) as client:
-            resp = client.post(
-                WHISPER_URL,
-                headers={"Authorization": f"Bearer {api_key}"},
-                files=files,
-                data=data,
-            )
-            if resp.status_code >= 300:
-                log.warning("Whisper returned %s: %s", resp.status_code, resp.text[:300])
+    # Retry on timeouts/connection errors only — a fresh BytesIO per attempt
+    # since the stream is consumed on send, and the request itself already
+    # failed once so there's nothing to lose from a couple more tries before
+    # falling back to local faster-whisper.
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        files = {"file": (filename, io.BytesIO(audio), "application/octet-stream")}
+        try:
+            with httpx.Client(timeout=120.0) as client:
+                resp = client.post(
+                    WHISPER_URL,
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    files=files,
+                    data=data,
+                )
+                if resp.status_code >= 300:
+                    log.warning("Whisper returned %s: %s", resp.status_code, resp.text[:300])
+                    return None
+                body = resp.json()
+                text = (body.get("text") or "").strip()
+                detected = normalize_stt_language(body.get("language") or "") or language_hint
+                return text, detected
+        except httpx.TimeoutException as exc:
+            log.warning("Whisper request timed out (attempt %d/%d): %s", attempt, max_attempts, exc)
+            if attempt == max_attempts:
                 return None
-            body = resp.json()
-            text = (body.get("text") or "").strip()
-            detected = normalize_stt_language(body.get("language") or "") or language_hint
-            return text, detected
-    except (httpx.HTTPError, ValueError) as exc:
-        log.exception("Whisper request failed: %s", exc)
-        return None
+            time.sleep(2 * attempt)
+        except (httpx.HTTPError, ValueError) as exc:
+            log.exception("Whisper request failed: %s", exc)
+            return None
+    return None
 
 
 def transcribe(audio: bytes, filename: str = "voice.oga", language: str = "") -> Optional[tuple[str, str]]:
