@@ -33,6 +33,7 @@ exercises.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -43,7 +44,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from ..db import session_scope
-from ..models import ApiKey, Agent, CallerIdentity, CallerMessage, Target, Workflow
+from ..models import ApiKey, Agent, CallerIdentity, CallerMessage, Run, Target, Workflow
 
 router = APIRouter(tags=["openai-compat"])
 
@@ -542,6 +543,87 @@ async def chat_completions(
             "finish_reason": "stop",
         }],
         "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Persistent-session chat — real CLI session continuity (--resume), no
+# history resending. For callers like the aw-roblox Genie NPC that want the
+# agent to remember the conversation the way a stateful chat session would,
+# instead of the OpenAI-style "resend the whole transcript every call" shape
+# above.
+# ---------------------------------------------------------------------------
+
+_SESSION_TARGET_LOCKS: dict[str, "asyncio.Lock"] = {}
+
+
+class _SessionChatRequest(BaseModel):
+    external_id: str
+    message: str
+    initiator_kind: str = "api"
+
+    model_config = {"extra": "allow"}
+
+
+@router.post("/v1/agents/{slug}/session_chat")
+async def session_chat(slug: str, req: _SessionChatRequest,
+                       api_key: ApiKey = Depends(require_api_key)):
+    """Persistent-session chat: one Target is auto-provisioned per
+    (agent slug, external_id) — same convention as the internal
+    ``/api/agents/{slug}/run_sync`` endpoint used by Watch/Glasses — and the
+    most recent CLI ``session_id`` recorded against that Target is resumed
+    automatically, so the CLI process itself remembers the conversation
+    server-side (``claude --resume``). The caller only ever sends the new
+    message, never the prior transcript.
+
+    Returns ``is_new_session: true`` on the very first call for a given
+    ``external_id`` so the caller knows to fold one-time context (a user
+    profile block, etc.) into that first message — every later call resumes
+    a CLI process that already has that context live in its own history and
+    shouldn't be sent it again.
+    """
+    _check_scope(api_key, slug)
+    with session_scope() as s:
+        agent = s.query(Agent).filter(Agent.slug == slug, Agent.deleted_at.is_(None)).first()
+        if not agent:
+            raise HTTPException(404, f"agent not found: {slug}")
+
+    target_slug = f"{slug}-{req.external_id}"
+    with session_scope() as s:
+        target = s.query(Target).filter(Target.slug == target_slug).first()
+        if target is None:
+            target = Target(slug=target_slug, name=f"{slug} / {req.external_id}",
+                            source_kind="external", source_ref=req.external_id)
+            s.add(target)
+            s.flush()
+            s.commit()
+        target_id = target.id
+
+    # Same "read latest session, then run" locking as run_sync — guards
+    # against two rapid-fire calls for the same external_id both reading the
+    # same stale session_id and forking the conversation into two branches.
+    lock = _SESSION_TARGET_LOCKS.setdefault(target_id, asyncio.Lock())
+    from ..core.executor import run_agent
+    async with lock:
+        with session_scope() as s:
+            session_id = (
+                s.query(Run.session_id)
+                .filter(Run.target_id == target_id, Run.session_id.isnot(None))
+                .order_by(Run.started_at.desc())
+                .limit(1)
+                .scalar()
+            )
+        is_new_session = session_id is None
+        result = await run_agent(
+            slug, req.message, target_id=target_id, session_id=session_id,
+            initiator_kind=req.initiator_kind, initiator_id=req.external_id,
+        )
+
+    return {
+        "reply": result.get("reply") or result.get("text") or "",
+        "run_id": result.get("run_id"),
+        "status": result.get("status"),
+        "is_new_session": is_new_session,
     }
 
 
