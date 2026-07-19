@@ -561,6 +561,15 @@ class _SessionChatRequest(BaseModel):
     external_id: str
     message: str
     initiator_kind: str = "api"
+    # Folded in front of ``message`` ONLY on this external_id's very first
+    # call (i.e. only when this endpoint itself determines is_new_session is
+    # true) -- never on later calls, since the resumed CLI session already
+    # has it live. Deliberately NOT the caller's job to decide "is this
+    # new" (a caller-side DB row can easily outlive/predate the actual
+    # agents-platform session -- e.g. a player who talked to the agent
+    # before this endpoint existed, or after an admin resets the session --
+    # this endpoint is the only accurate source for "is this session new").
+    context: Optional[str] = None
 
     model_config = {"extra": "allow"}
 
@@ -576,11 +585,13 @@ async def session_chat(slug: str, req: _SessionChatRequest,
     server-side (``claude --resume``). The caller only ever sends the new
     message, never the prior transcript.
 
-    Returns ``is_new_session: true`` on the very first call for a given
-    ``external_id`` so the caller knows to fold one-time context (a user
-    profile block, etc.) into that first message — every later call resumes
-    a CLI process that already has that context live in its own history and
-    shouldn't be sent it again.
+    ``context`` (optional) is folded in front of the message, but only when
+    THIS call turns out to be the first one ever for ``external_id`` — safe
+    for the caller to pass on every single call (e.g. the current Roblox
+    player profile), since whether it actually gets used is decided here
+    from the Target's own Run history, not from any state the caller tracks
+    itself. Also returned as ``is_new_session`` for callers that want to
+    know either way.
     """
     _check_scope(api_key, slug)
     with session_scope() as s:
@@ -614,8 +625,11 @@ async def session_chat(slug: str, req: _SessionChatRequest,
                 .scalar()
             )
         is_new_session = session_id is None
+        message = req.message
+        if is_new_session and req.context:
+            message = f"{req.context}\n\n[MENSAGEM DO JOGADOR]\n{req.message}"
         result = await run_agent(
-            slug, req.message, target_id=target_id, session_id=session_id,
+            slug, message, target_id=target_id, session_id=session_id,
             initiator_kind=req.initiator_kind, initiator_id=req.external_id,
         )
 
