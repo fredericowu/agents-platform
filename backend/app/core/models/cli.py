@@ -320,17 +320,34 @@ class CliLLM(BaseLLM):
             argv = self._build_argv(prompt, ws_token=None)  # no aw-connector wrapper
             stdout_target = asyncio.subprocess.PIPE  # read CLI stdout directly
 
+        stderr_chunks: list[bytes] = []
+        stderr_task = None
         if not attach_run_id:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=stdout_target,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
                 cwd=os.getcwd(), env={**os.environ},
                 limit=10 * 1024 * 1024,  # raise StreamReader cap for large init lines
             )
             if rid:
                 await _register(rid, proc)
+
+            # Drain `docker run`'s stderr into a bounded buffer instead of
+            # discarding it — needed below to explain a non-zero exit that
+            # produced zero CLI events (container never started).
+            async def _drain_stderr():
+                assert proc.stderr is not None
+                try:
+                    while True:
+                        chunk = await proc.stderr.read(4096)
+                        if not chunk:
+                            break
+                        stderr_chunks.append(chunk)
+                except Exception:
+                    pass
+            stderr_task = asyncio.create_task(_drain_stderr())
 
             # Redis mode: start background task consuming from the Stream into q
             if use_redis and q is not None:
@@ -363,6 +380,7 @@ class CliLLM(BaseLLM):
         tin = tout = 0
         cost = 0.0
         final_text = ""
+        received_events = 0
 
         try:
             while True:
@@ -387,6 +405,7 @@ class CliLLM(BaseLLM):
                     yield ChatChunk(delta=line + "\n")
                     continue
 
+                received_events += 1
                 et = evt.get("type")
                 if et == "system" and evt.get("subtype") == "init":
                     yield ChatChunk(delta="", finish=False, tokens_in=0, tokens_out=0, cost_usd=0.0)
@@ -545,8 +564,28 @@ class CliLLM(BaseLLM):
                     proc.kill()
                 if rid:
                     await _unregister(rid, proc)
+            if stderr_task is not None:
+                try:
+                    await asyncio.wait_for(stderr_task, timeout=2.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    stderr_task.cancel()
             if unregister_run is not None:
                 unregister_run(rid or "unknown")
+
+        # `docker run` exited non-zero and the CLI never emitted a single
+        # event (e.g. rc=125 — the container itself failed to start:
+        # name conflict, bad mount, resource still held by a prior run of
+        # the same session). Previously this fell through to the ordinary
+        # EOF/done-sentinel path and finalized as an empty "success" — no
+        # error, no tokens, no text. Raise instead so the executor's
+        # exception handler marks the Run as status=error with a reason.
+        rc = proc.returncode if proc is not None else 0
+        if rc not in (None, 0) and received_events == 0:
+            stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
+            msg = f"docker run failed (rc={rc}) before the CLI produced any output"
+            if stderr_text:
+                msg += f": {stderr_text[-4000:]}"
+            raise RuntimeError(msg)
 
         yield ChatChunk(delta="", finish=True, tokens_in=tin, tokens_out=tout, cost_usd=cost)
 
