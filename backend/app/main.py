@@ -17,6 +17,86 @@ from .db import init_db
 from .seed import seed_all
 
 
+def _otel_resource_attrs() -> dict:
+    return {
+        "service.name": "agents-platform",
+        "service.version": "0.1.0",
+        "deployment.environment": os.environ.get("AW_ENV", "production"),
+    }
+
+
+def _setup_otel() -> None:
+    """Wire up OpenTelemetry → SigNoz when OTEL_ENABLED=1.
+
+    Mirrors agentic-workspace's src/api/app.py setup, but with
+    service.name="agents-platform" so the two services are distinguishable
+    in SigNoz. Uses the ASGI middleware approach (not FastAPIInstrumentor)
+    to coexist with ddtrace if it's ever enabled here too.
+    """
+    try:
+        from opentelemetry import trace
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+        endpoint = os.environ.get(
+            "OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"
+        )
+        resource = Resource.create(_otel_resource_attrs())
+        provider = TracerProvider(resource=resource)
+        exporter = OTLPSpanExporter(endpoint=f"{endpoint}/v1/traces")
+        provider.add_span_processor(BatchSpanProcessor(exporter))
+        trace.set_tracer_provider(provider)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("OTel setup failed: %s", exc)
+
+
+def _add_otel_middleware(app: FastAPI) -> None:
+    """Add the ASGI tracing middleware to an existing FastAPI app."""
+    try:
+        from opentelemetry.instrumentation.asgi import OpenTelemetryMiddleware
+        app.add_middleware(OpenTelemetryMiddleware)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("OTel middleware setup failed: %s", exc)
+
+
+def _setup_otel_logs() -> None:
+    """Ship every `logging.getLogger(...)` record to SigNoz as an OTLP log."""
+    import logging
+
+    try:
+        from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+        from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+
+        endpoint = os.environ.get(
+            "OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"
+        )
+        resource = Resource.create(_otel_resource_attrs())
+        provider = LoggerProvider(resource=resource)
+        exporter = OTLPLogExporter(endpoint=f"{endpoint}/v1/logs")
+        provider.add_log_record_processor(BatchLogRecordProcessor(exporter))
+
+        handler = LoggingHandler(level=logging.INFO, logger_provider=provider)
+        root = logging.getLogger()
+        root.addHandler(handler)
+        # Root defaults to WARNING; without lowering it, INFO-level app logs
+        # never reach the handler above regardless of its own level.
+        if root.level == 0 or root.level > logging.INFO:
+            root.setLevel(logging.INFO)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("OTel log export setup failed: %s", exc)
+
+
+if os.environ.get("OTEL_ENABLED") == "1":
+    _setup_otel()
+    _setup_otel_logs()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -69,6 +149,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Agents Platform", version="0.1.0", lifespan=lifespan)
+
+if os.environ.get("OTEL_ENABLED") == "1":
+    _add_otel_middleware(app)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins + ["*"],  # dev: permissive

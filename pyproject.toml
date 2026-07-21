@@ -44,6 +44,10 @@ dependencies = [
   "jsonschema>=4.23",
   # Redis Streams — durable event transport for CLI agent runs
   "redis[asyncio]>=5.0",
+  # OpenTelemetry — traces/logs to SigNoz when OTEL_ENABLED=1 (see backend/app/main.py)
+  "opentelemetry-sdk==1.40.0",
+  "opentelemetry-exporter-otlp-proto-http==1.40.0",
+  "opentelemetry-instrumentation-asgi==0.61b0",
 ]
 
 [project.optional-dependencies]
