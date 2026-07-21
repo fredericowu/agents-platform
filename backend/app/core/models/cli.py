@@ -323,6 +323,24 @@ class CliLLM(BaseLLM):
         stderr_chunks: list[bytes] = []
         stderr_task = None
         if not attach_run_id:
+            # The container name is deterministic (aw-run-<resume_run_id or run_id>)
+            # so a RESUMED session reuses the SAME name across every turn (see
+            # container_name_for_run). `docker kill` in kill_run() (e.g. /abort)
+            # returns as soon as the SIGKILL is issued — it does not wait for
+            # dockerd's async --rm cleanup to actually remove the container. If
+            # the next turn's `docker run --name aw-run-<id>` races that cleanup,
+            # it fails immediately with "Conflict... already in use" and the
+            # session is stuck until the stale container is removed by hand.
+            # Force-remove any leftover container under this name before every
+            # run so a lagging removal never blocks the next turn.
+            _resume_id = self.resume_run_id or self.run_id
+            if _resume_id:
+                from ..tools.docker_agent import container_name_for_run
+                _cleanup = await asyncio.create_subprocess_exec(
+                    "docker", "rm", "-f", container_name_for_run(_resume_id),
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                await _cleanup.wait()
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.DEVNULL,
