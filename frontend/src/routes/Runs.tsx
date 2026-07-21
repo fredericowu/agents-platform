@@ -102,10 +102,10 @@ export default function Runs() {
                        data-testid="runs-roots-only" />
                 <span className="text-muted">roots only</span>
               </label>
-              {runs.some(r => r.status === "running") && (
+              {runs.some(r => r.status === "running" || r.status === "queued") && (
                 <button className="btn btn-danger" data-testid="runs-cancel-all"
                         onClick={async () => {
-                          if (!confirm("Cancel every running flow and all its child runs?")) return;
+                          if (!confirm("Cancel every running/queued flow and all its child runs?")) return;
                           try {
                             const res = await api.cancelAllRuns();
                             await load();
@@ -202,7 +202,7 @@ export default function Runs() {
                 <td className="py-2 pr-2 text-muted">{r.tokens_in}/{r.tokens_out}</td>
                 <td className="py-2 pr-2 text-muted">{new Date(r.started_at).toLocaleString()}</td>
                 <td className="py-2 pr-2">
-                  {r.status === "running" && (
+                  {(r.status === "running" || r.status === "queued") && (
                     <button className="btn btn-danger text-xs py-1"
                             data-testid={`runs-cancel-${r.id.slice(0,8)}`}
                             onClick={async () => {

@@ -1817,15 +1817,18 @@ async def recover_orphaned_runs() -> None:
     with session_scope() as s:
         orphans = [
             (r.id, r.source_slug, (r.input or {}).get("input", ""),
-             r.target_id, r.session_id, r.kind)
-            for r in s.query(Run).filter(Run.status == "running").all()
+             r.target_id, r.session_id, r.kind, r.status)
+            for r in s.query(Run).filter(Run.status.in_(("running", "queued"))).all()
         ]
     if not orphans:
         return
 
     reattaching = cancelled = 0
-    for run_id, slug, user_input, target_id, session_id, kind in orphans:
-        if slug and kind == "agent":
+    for run_id, slug, user_input, target_id, session_id, kind, status in orphans:
+        # "queued" rows were still waiting on the session lock and never got
+        # far enough to launch a docker CLI container — nothing to reattach
+        # to, just cancel like any other never-started run.
+        if slug and kind == "agent" and status == "running":
             # Never cancel here — hand off to a task that waits for the stream.
             reattaching += 1
             asyncio.create_task(
@@ -1835,7 +1838,7 @@ async def recover_orphaned_runs() -> None:
         else:
             with session_scope() as s:
                 r = s.query(Run).filter(Run.id == run_id).first()
-                if r and r.status == "running":
+                if r and r.status in ("running", "queued"):
                     r.status = "cancelled"
                     r.error = "server restarted — run interrupted"
                     r.ended_at = datetime.utcnow()
@@ -2194,7 +2197,14 @@ def start_agent_run_bg(agent_slug: str, user_input: str, *,
         _run_input = {"input": user_input}
         if notion_task_id:
             _run_input["notion_task_id"] = notion_task_id
-        r = Run(kind="agent", target_slug=_run_target_slug, status="running",
+        # A run resuming a session_id may have to sit behind the per-session
+        # lock (_acquire_session_lock) before it actually starts — surface
+        # that as "queued" rather than lying with "running" the instant it's
+        # dispatched. Runs with no session_id never contend for that lock, so
+        # they go straight to "running". _on_state_change (below) flips
+        # queued -> running the moment the lock is actually acquired.
+        _initial_status = "queued" if session_id else "running"
+        r = Run(kind="agent", target_slug=_run_target_slug, status=_initial_status,
                 input=_run_input,
                 initiator_kind=initiator_kind,
                 initiator_id=initiator_id,
@@ -2211,13 +2221,40 @@ def start_agent_run_bg(agent_slug: str, user_input: str, *,
         from .events import _run_to_ws_dict
         _start_ws_data = _run_to_ws_dict(r)
 
-    # WS broadcast — push "running" state immediately
+    # WS broadcast — push the initial state ("queued" or "running") immediately
     try:
         from .events import ws_broadcast
         loop = asyncio.get_running_loop()
         loop.create_task(ws_broadcast("run_update", _start_ws_data))
     except Exception:
         pass
+
+    def _on_state_change(state: str) -> None:
+        """run_agent's on_state hook (see its docstring): "waiting" means we're
+        still parked behind the session lock — the row is already "queued", so
+        nothing to do. "processing" means the lock was just acquired and the
+        CLI turn is actually starting — flip the DB row + broadcast so the UI
+        stops showing this run as merely queued."""
+        if state != "processing":
+            return
+        try:
+            with session_scope() as fs:
+                row = fs.query(Run).filter(Run.id == rid).first()
+                if row is None or row.status != "queued":
+                    return
+                row.status = "running"
+                fs.flush()
+                from .events import _run_to_ws_dict as _to_ws
+                data = _to_ws(row)
+        except Exception:
+            _exec_log.warning("on_state queued->running flip failed for run %s",
+                              rid, exc_info=True)
+            return
+        try:
+            from .events import ws_broadcast as _wsb
+            asyncio.get_running_loop().create_task(_wsb("run_update", data))
+        except Exception:
+            pass
 
     async def _go():
         try:
@@ -2227,7 +2264,8 @@ def start_agent_run_bg(agent_slug: str, user_input: str, *,
                             session_id=session_id,
                             target_id=target_id,
                             notion_task_id=notion_task_id,
-                            raw_cli_prompt=raw_cli_prompt)
+                            raw_cli_prompt=raw_cli_prompt,
+                            on_state=_on_state_change if session_id else None)
         finally:
             await bus.publish(rid, "done", {})
             await bus.close(rid)

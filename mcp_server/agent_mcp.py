@@ -707,6 +707,23 @@ async def _list_tools() -> list[Tool]:
                           "properties": {"session_id": {"type": "string",
                               "description": "This session's claude CLI session_id (from $AW_SESSION_ID)."}},
                           "required": ["session_id"]}),
+        Tool(name="rename_session",
+             description=("Rename the CURRENT conversation's CLI session — same effect as "
+                          "Telegram's `/rename`, just callable as a tool (e.g. from the "
+                          "Apple Watch app, which has no /rename command). Unlike "
+                          "clear_session/compact_session this applies IMMEDIATELY (it's just "
+                          "a label on the CliSession row, not a mid-turn CLI action) and the "
+                          "name persists everywhere that session is shown — Telegram, watch, "
+                          "list_sessions/list_bots, etc. Call this when the user asks to "
+                          "'rename the session' / 'renomeia a sessão' / 'dá um nome pra essa "
+                          "conversa'. You need your own session_id — get it with "
+                          "`echo $AW_SESSION_ID` (Bash tool) if you don't already have it."),
+             inputSchema={"type": "object",
+                          "properties": {"session_id": {"type": "string",
+                              "description": "This session's claude CLI session_id (from $AW_SESSION_ID)."},
+                              "name": {"type": "string",
+                              "description": "New display name for the session. Empty string clears it back to unnamed."}},
+                          "required": ["session_id", "name"]}),
 
         # ----- legacy alias -----
         Tool(name="get_run",
@@ -1580,6 +1597,12 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
             command = "clear" if name == "clear_session" else "compact"
             r = await c.post(f"{BASE}/api/sessions/{sid}/pending-command",
                              json={"command": command})
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "rename_session":
+            sid = (args.get("session_id") or "").strip()
+            if not sid:
+                return _err(400, "session_id is required — get it with `echo $AW_SESSION_ID`.")
+            r = await c.patch(f"{BASE}/api/sessions/{sid}", json={"name": args.get("name", "")})
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "cancel_all_runs":
             r = await c.post(f"{BASE}/api/runs/cancel_all")

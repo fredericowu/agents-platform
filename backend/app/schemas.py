@@ -1,14 +1,28 @@
 """Pydantic schemas for API."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 
 class _Base(BaseModel):
     model_config = ConfigDict(from_attributes=True)
+
+    # DB datetime columns are stored naive (see models.py `_now()` ->
+    # datetime.utcnow()), but the values are always UTC. Pydantic v2 renders
+    # a naive datetime as e.g. "2026-07-20T14:04:53" with no offset, which
+    # JS `new Date(...)` then misinterprets as *local* time on the client,
+    # shifting the displayed time by the browser's UTC offset. Stamp an
+    # explicit UTC marker on the way out so every timestamp in every
+    # response is unambiguous; the frontend's bare `.toLocaleString()`
+    # calls then correctly convert to the browser's local timezone.
+    @field_serializer("*", when_used="json")
+    def _serialize_naive_datetimes_as_utc(self, value: Any) -> Any:
+        if isinstance(value, datetime) and value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc).isoformat()
+        return value
 
 
 # ----- models -----

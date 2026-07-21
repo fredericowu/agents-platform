@@ -1925,7 +1925,7 @@ import json as _json_mod
 import secrets as _secrets_mod
 import time as _time_mod
 
-_APPROVAL_TIMEOUT_S = 300  # 5 min
+_APPROVAL_TIMEOUT_S = 43200  # 12h
 _SCOPE_TTL: dict[str, int] = {"one_shot": 0, "10min": 600, "60min": 3600}
 # Minimum token validity window. The scope TTL controls how long a *grant* is
 # reused; the token itself still has to survive the round-trip to the Lambda.
@@ -2224,7 +2224,43 @@ def create_approval_request(body: ApprovalRequest, s: Session = Depends(get_sess
         except Exception:
             log.exception("approval: failed to send keyboard to chat %s", chat_id)
 
+    # This route is a sync `def`, so FastAPI runs it in a worker thread with no
+    # running event loop — asyncio.create_task() here would raise "no running
+    # event loop" (same bug as the kanban callback fix, see
+    # memory/kanban-approve-button-no-running-event-loop-fix-2026-07-12.md).
+    # Route through _MAIN_LOOP instead, same cross-thread pattern used
+    # elsewhere in this file.
+    if _MAIN_LOOP is not None:
+        asyncio.run_coroutine_threadsafe(_expire_approval_after(request_id), _MAIN_LOOP)
+    else:
+        log.warning("approval: _MAIN_LOOP not set, request %s will never auto-expire its message", request_id)
+
     return ApprovalStatus(request_id=request_id, status="pending")
+
+
+async def _expire_approval_after(request_id: str) -> None:
+    """Edit the Telegram message (strip buttons) once a request's timeout elapses.
+
+    `get_approval_status` only flips a stale entry's status to "expired" the
+    next time someone polls it — if the caller already gave up polling by
+    then, nothing ever touches the Telegram message and the buttons stay
+    live-looking forever (tapping one just answers a callback toast, the
+    message itself never visibly changes). Scheduled once per request right
+    after it's created so the message gets cleaned up even with no caller
+    left polling.
+    """
+    await asyncio.sleep(_APPROVAL_TIMEOUT_S)
+    entry = _pending_approvals.get(request_id)
+    if not entry or entry["status"] != "pending":
+        return
+    entry["status"] = "expired"
+    is_agent_run = entry.get("request_type") == "agent_run"
+    noun = "Execução" if is_agent_run else "Segredo"
+    secret_html = html.escape(str(entry.get("secret_name") or ""))
+    for chat_id, msg_id in entry.get("message_ids", {}).items():
+        _edit_message_text(entry["bot_token"], str(chat_id), msg_id,
+                           f"⌛ {noun} <code>{secret_html}</code> expirad{'a' if is_agent_run else 'o'} "
+                           f"(sem resposta a tempo).")
 
 
 @router.get("/approval/status/{request_id}", response_model=ApprovalStatus)
@@ -2619,12 +2655,45 @@ def _handle_kanban_callback(cq_id: str, cq_data: str, chat_id: str,
 
 def _crispal_upstream() -> dict:
     """The Crispal store's own MCP endpoint (URL + bearer token), read from
-    AW's shared config so credentials live in exactly one place."""
+    AW's shared config so credentials live in exactly one place.
+
+    Key is 'crispal-wordpress-production' — the plain 'crispal' key stopped
+    existing on 2026-07-11 when the WordPress MCP config split into prod/dev
+    (see docs/knowledge_base/memory/crispal-wordpress-mcp-split-*.md). This
+    function kept looking up the old key, so every call raised a silent
+    KeyError, surfaced to Frederico as "send failed" on every Enviar/Editar
+    tap since that date (confirmed 2026-07-20: no successful 'sent'/'edited'
+    row in crispal_conversation_suggestions after 2026-07-07)."""
     import json as _json
     base = os.environ.get("AW_BASE_DIR", "/opt/agentic-workspace")
     with open(os.path.join(base, "src", "config", "mcp.json")) as f:
         cfg = _json.load(f)
-    return cfg["mcpServers"]["crispal"]
+    return cfg["mcpServers"]["crispal-wordpress-production"]
+
+
+def _crispal_call_with_retry(upstream: dict, payload: dict, *, attempts: int = 3,
+                              timeout: float = 30.0) -> dict:
+    """POST a JSON-RPC call to the Crispal upstream, retrying transient
+    failures (timeouts, connection errors, 5xx) with exponential backoff
+    (1s, 2s, 4s...). Does NOT retry a well-formed JSON-RPC error response —
+    that's a real application error (e.g. Meta's 24h messaging window), not
+    a transient one, and retrying it would just resend the same message."""
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            r = httpx.post(upstream["url"], json=payload,
+                            headers={"Accept": "application/json, text/event-stream",
+                                     **upstream.get("headers", {})},
+                            timeout=timeout)
+            if r.status_code >= 500:
+                raise httpx.HTTPStatusError(
+                    f"{r.status_code} from crispal upstream", request=r.request, response=r)
+            return r.json()
+        except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError) as exc:
+            last_exc = exc
+            if attempt < attempts - 1:
+                _time.sleep(2 ** attempt)
+    raise RuntimeError(f"crispal upstream unreachable after {attempts} attempts: {last_exc}")
 
 
 def _crispal_send_whatsapp_message(to: str, message: str) -> None:
@@ -2671,11 +2740,7 @@ def _crispal_send_message(platform: str, recipient_id: str, message: str, messag
             "message": message, "message_type": message_type,
         }},
     }
-    r = httpx.post(upstream["url"], json=payload,
-                    headers={"Accept": "application/json, text/event-stream",
-                             **upstream.get("headers", {})},
-                    timeout=30)
-    body = r.json()
+    body = _crispal_call_with_retry(upstream, payload)
     if "error" in body:
         raise RuntimeError(f"crispal social_send_message error: {body['error']}")
 

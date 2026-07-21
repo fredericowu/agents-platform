@@ -22,6 +22,10 @@ export function StatusBadge({ status }: { status: string }) {
     success: "badge-success",
     error: "badge-error",
     running: "badge-running",
+    // Dispatched but still parked behind the per-session_id lock
+    // (core/executor.py _acquire_session_lock) — not yet actually executing.
+    // Muted/yellow, deliberately distinct from the pulsing blue "running".
+    queued: "badge-queued",
     pending: "badge-pending",
     cancelled: "badge-warn",
   }[status as string] ?? "badge";

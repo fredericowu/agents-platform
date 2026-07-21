@@ -85,6 +85,9 @@ input[type="checkbox"], input[type="radio"] {
 .badge-info    { background: rgba(88,166,255,0.15);  color: theme('colors.accent'); }
 .badge-pending { background: theme('colors.bg.3'); color: theme('colors.muted'); }
 .badge-running { background: rgba(88,166,255,0.15); color: theme('colors.accent'); animation: pulse 1.2s infinite; }
+/* Dispatched but still waiting on the per-session_id lock — muted amber,
+   deliberately not the pulsing blue "running" look. */
+.badge-queued  { background: rgba(240,192,0,0.12);   color: theme('colors.warn'); }
 
 @keyframes pulse {
   0%, 100% { opacity: 1; } 50% { opacity: 0.5; }

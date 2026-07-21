@@ -550,12 +550,14 @@ async def cancel_all(s: Session = Depends(get_session)):
     from ..core.models.cli import kill_run
 
     # Roots first — cancelling them cascades to descendants via the orchestrator.
+    # Includes "queued" roots (dispatched but still parked behind the
+    # per-session lock) so they don't survive a "cancel all running" sweep.
     roots = (s.query(Run)
-              .filter(Run.status == "running", Run.parent_run_id.is_(None))
+              .filter(Run.status.in_(("running", "queued")), Run.parent_run_id.is_(None))
               .all())
-    # Also collect any orphan running children (parent not running for some reason)
+    # Also collect any orphan running/queued children (parent not running for some reason)
     orphans = (s.query(Run)
-                 .filter(Run.status == "running", Run.parent_run_id.isnot(None))
+                 .filter(Run.status.in_(("running", "queued")), Run.parent_run_id.isnot(None))
                  .all())
 
     marked_ids: list[str] = []

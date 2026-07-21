@@ -198,7 +198,11 @@ class Run(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
     kind: Mapped[str] = mapped_column(String)            # agent|workflow|playground|eval
     target_slug: Mapped[str] = mapped_column(String, index=True)
-    status: Mapped[str] = mapped_column(String, default="pending")  # pending|running|success|error|cancelled
+    status: Mapped[str] = mapped_column(String, default="pending")  # pending|queued|running|success|error|cancelled
+    # "queued" = dispatched but blocked waiting on the per-session_id lock in
+    # core/executor.py (_acquire_session_lock) — flips to "running" once the
+    # lock is acquired and the CLI turn actually starts (see
+    # start_agent_run_bg's on_state callback).
     input: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     output: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
