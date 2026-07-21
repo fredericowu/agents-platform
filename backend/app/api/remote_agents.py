@@ -11,9 +11,15 @@ app.core.remote_agents_db (no raw SQL).
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
-import asyncio, base64, hashlib, json, secrets as _sec, time, uuid as _uuid, os
+import asyncio, base64, hashlib, json, logging, secrets as _sec, time, uuid as _uuid, os
 
 from ..core.remote_agents_db import ConfigRow, RemoteAgentRow, init_db, now_epoch, session_scope
+
+# Records forwarded here go through the root logger's OTel handler (see
+# app.main._setup_otel_logs) straight into SigNoz, tagged with
+# remote_agent=<client_id> for filtering — no separate instrumentation
+# needed on the remote machine itself.
+_remote_log = logging.getLogger("remote_agent")
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -206,6 +212,10 @@ async def client_ws(ws: WebSocket, client_id: str):
                     fut.set_result(msg)
             elif kind == "pong":
                 pass
+            elif kind == "log":
+                level = getattr(logging, str(msg.get("level", "INFO")).upper(), logging.INFO)
+                _remote_log.log(level, "[%s] %s", client_id, msg.get("message", ""),
+                                 extra={"remote_agent": client_id})
 
     except (WebSocketDisconnect, Exception):
         pass
