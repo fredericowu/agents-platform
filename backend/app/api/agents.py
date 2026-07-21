@@ -472,6 +472,16 @@ class RunSyncInput(BaseModel):
     # id to hand back until after the first run.
     external_id: str
     initiator_kind: str = "agent_run"
+    # Exact conversation to resume. The Watch carousel has MULTIPLE independent
+    # sessions ("faces") sharing one external_id; the legacy latest-for-target
+    # lookup below collapses them all into whichever conversation ran last
+    # (Frederico 2026-07-21, "todas as faces ficam com a mesma sessão"). When
+    # the caller knows which session a message belongs to, it passes it here
+    # and the run resumes exactly that conversation. An id this target has
+    # never run (e.g. awserv's local placeholder uuid for a brand-new session)
+    # falls through to a FRESH session — the caller learns the real id from
+    # the run and re-keys (awserv broadcasts `session_resolved`).
+    session_id: str | None = None
 
 
 def _verify_internal_secret(x_internal_secret: str = Header(default="")) -> None:
@@ -517,13 +527,28 @@ async def run_agent_sync_ep(slug: str, body: RunSyncInput,
     lock = _RUN_SYNC_TARGET_LOCKS.setdefault(target.id, asyncio.Lock())
     from ..core.executor import run_agent
     async with lock:
-        session_id = (
-            s.query(Run.session_id)
-            .filter(Run.target_id == target.id, Run.session_id.isnot(None))
-            .order_by(Run.started_at.desc())
-            .limit(1)
-            .scalar()
-        )
+        if body.session_id:
+            # Per-face routing: resume exactly the requested conversation —
+            # but only if this target has actually run under that id before.
+            # An unknown id (awserv placeholder for a "new" session, or a
+            # stale/foreign pointer) must NOT be blindly resumed (the CLI
+            # would fail on a nonexistent transcript) — mint a fresh session
+            # instead; the caller re-keys from the run's real session id.
+            known = (
+                s.query(Run.id)
+                .filter(Run.target_id == target.id, Run.session_id == body.session_id)
+                .limit(1)
+                .scalar()
+            )
+            session_id = body.session_id if known else None
+        else:
+            session_id = (
+                s.query(Run.session_id)
+                .filter(Run.target_id == target.id, Run.session_id.isnot(None))
+                .order_by(Run.started_at.desc())
+                .limit(1)
+                .scalar()
+            )
         result = await run_agent(
             slug, body.input, target_id=target.id, session_id=session_id,
             initiator_kind=body.initiator_kind, initiator_id=body.external_id,
