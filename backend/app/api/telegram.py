@@ -1711,6 +1711,7 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
                 session_id=session_id,
                 initiator_kind="telegram",
                 initiator_id=f"{bot.id}:{chat_id}",
+                source_device="telegram",
                 on_state=_set_btn_state,
                 proc_msg_id=str(proc_msg_id) if proc_msg_id else None,
             )

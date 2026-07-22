@@ -482,6 +482,10 @@ class RunSyncInput(BaseModel):
     # falls through to a FRESH session — the caller learns the real id from
     # the run and re-keys (awserv broadcasts `session_resolved`).
     session_id: str | None = None
+    # Originating device/channel (e.g. "watch", "iphone", "meta"/glasses) —
+    # forwarded to run_agent so it lands in the docker CLI container as
+    # AW_SOURCE_DEVICE. Optional — omit for channels that don't track a device.
+    source_device: str | None = None
 
 
 def _verify_internal_secret(x_internal_secret: str = Header(default="")) -> None:
@@ -552,6 +556,7 @@ async def run_agent_sync_ep(slug: str, body: RunSyncInput,
         result = await run_agent(
             slug, body.input, target_id=target.id, session_id=session_id,
             initiator_kind=body.initiator_kind, initiator_id=body.external_id,
+            source_device=body.source_device,
         )
     return {
         "reply": result.get("reply") or result.get("text", ""),

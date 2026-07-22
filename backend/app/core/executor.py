@@ -1011,6 +1011,7 @@ async def run_agent(
     extra_messages: list[dict] | None = None,
     session_id: str | None = None,
     notion_task_id: str | None = None,
+    source_device: str | None = None,
     attach: bool = False,
     skip_auto_compact: bool = False,
     raw_cli_prompt: bool = False,
@@ -1036,7 +1037,8 @@ async def run_agent(
         run_id=run_id, event_run_id=event_run_id, parent_run_id=parent_run_id,
         initiator_kind=initiator_kind, initiator_id=initiator_id,
         node_id=node_id, target_id=target_id, extra_messages=extra_messages,
-        session_id=session_id, notion_task_id=notion_task_id, attach=attach,
+        session_id=session_id, notion_task_id=notion_task_id,
+        source_device=source_device, attach=attach,
         skip_auto_compact=skip_auto_compact, raw_cli_prompt=raw_cli_prompt,
         proc_msg_id=proc_msg_id,
     )
@@ -1070,6 +1072,7 @@ async def _run_agent_impl(
     extra_messages: list[dict] | None = None,
     session_id: str | None = None,
     notion_task_id: str | None = None,
+    source_device: str | None = None,
     attach: bool = False,
     skip_auto_compact: bool = False,
     raw_cli_prompt: bool = False,
@@ -1083,6 +1086,10 @@ async def _run_agent_impl(
                     instead of launching a new one (platform-restart recovery).
     ``skip_auto_compact`` internal — set on the nested "/compact" call itself
                     so it doesn't try to trigger another compaction of itself.
+    ``source_device`` originating device/channel (e.g. "watch", "iphone",
+                    "meta"/glasses, "telegram") — injected into the docker CLI
+                    container as the ``AW_SOURCE_DEVICE`` env var so the agent
+                    can read it directly instead of parsing the prompt header.
     ``raw_cli_prompt`` pass ``user_input`` to the CLI verbatim — no system
                     prompt, no [SYSTEM]/[USER] framing. Required for CLI slash
                     commands ("/compact"), which the claude CLI only recognises
@@ -1392,6 +1399,8 @@ async def _run_agent_impl(
             runtime["params"]["attach_run_id"] = run_id
         if notion_task_id:
             runtime["params"]["notion_task_id"] = notion_task_id
+        if source_device:
+            runtime["params"]["source_device"] = source_device
         if session_id:
             runtime["params"]["session_id"] = session_id
             # Reuse the original run's isolated cwd so --resume can find the session file.

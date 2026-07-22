@@ -107,6 +107,7 @@ class CliLLM(BaseLLM):
         session_id: str | None = None,
         resume_run_id: str | None = None,
         notion_task_id: str | None = None,
+        source_device: str | None = None,
         extra_volumes: list[str] | None = None,
         share_network: bool = False,
         mount_cwd: bool = True,
@@ -134,6 +135,7 @@ class CliLLM(BaseLLM):
         self.session_id = session_id
         self.resume_run_id = resume_run_id
         self.notion_task_id = notion_task_id
+        self.source_device = source_device
         self.extra_volumes = list(extra_volumes or [])
         self.share_network = share_network
         # When set, astream() does NOT launch a container — it re-attaches to the
@@ -195,6 +197,12 @@ class CliLLM(BaseLLM):
         # clear_session/compact_session MCP tools without extra plumbing.
         if self.session_id:
             _extra_env["AW_SESSION_ID"] = self.session_id
+        # AW_SOURCE_DEVICE: which physical/virtual channel originated this turn
+        # (e.g. "watch", "iphone", "meta"/glasses, "telegram") — lets an agent
+        # tailor its reply (see the aw-apple-watch skill) without parsing the
+        # "/aw-apple-watch\nCONTEXT:\n- source: <device>" prompt header itself.
+        if self.source_device:
+            _extra_env["AW_SOURCE_DEVICE"] = self.source_device
         # Codex's aw-gateway MCP server (defined in the shared $CODEX_HOME/
         # config.toml, not the per-run mcp_codex.toml profile — codex's -p/
         # --profile flag does not layer the mcp_servers table, only the base
