@@ -3771,18 +3771,25 @@ def report_notify(body: ReportNotify, s: Session = Depends(get_session)):
     chat_id = admin_ids[0]
 
     sent = 0
+    failed = 0
     try:
-        _tg(bot.token, "sendMessage", chat_id=chat_id, parse_mode="Markdown",
-            text=f"📊 *{body.title}*")
+        _tg(bot.token, "sendMessage", chat_id=chat_id, parse_mode="HTML",
+            text=f"📊 <b>{_md_to_html(body.title)}</b>")
         sent += 1
-        for chunk in _chunk_text(body.text):
-            _tg(bot.token, "sendMessage", chat_id=chat_id, parse_mode="Markdown", text=chunk)
-            sent += 1
     except Exception:
-        log.exception("report notify: send failed")
+        log.exception("report notify: title send failed")
         raise HTTPException(502, "failed to deliver report to Telegram")
 
-    return {"ok": True, "sent": sent}
+    for chunk in _chunk_text(body.text):
+        try:
+            _tg(bot.token, "sendMessage", chat_id=chat_id, parse_mode="HTML",
+                text=_md_to_html(chunk))
+            sent += 1
+        except Exception:
+            log.exception("report notify: chunk send failed")
+            failed += 1
+
+    return {"ok": sent > 0, "sent": sent, "failed": failed}
 
 
 class TelegramInject(BaseModel):
