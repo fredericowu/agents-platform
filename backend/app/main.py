@@ -48,6 +48,16 @@ def _setup_otel() -> None:
         exporter = OTLPSpanExporter(endpoint=f"{endpoint}/v1/traces")
         provider.add_span_processor(BatchSpanProcessor(exporter))
         trace.set_tracer_provider(provider)
+
+        # Outbound HTTP client spans — this service calls the Anthropic API
+        # for every agent run and delivers every Telegram reply, so without
+        # this those two calls (the most important ones in the whole system)
+        # were completely invisible in tracing. Both libraries instrumented
+        # since the codebase uses httpx in some places and requests in others.
+        from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+        from opentelemetry.instrumentation.requests import RequestsInstrumentor
+        HTTPXClientInstrumentor().instrument()
+        RequestsInstrumentor().instrument()
     except Exception as exc:
         import logging
         logging.getLogger(__name__).warning("OTel setup failed: %s", exc)
