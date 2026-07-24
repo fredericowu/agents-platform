@@ -192,13 +192,18 @@ def build_docker_argv(
                "--add-host=host.docker.internal:host-gateway"]
 
     if warm_mode:
-        assert agent_id, "warm_mode requires agent_id (stable container name is aw-warm-<agent_id>)"
+        assert agent_id, "warm_mode requires agent_id"
+        assert session_id, ("warm_mode requires session_id — one warm container per SESSION, "
+                            "not per agent (2026-07-24 redesign): stable name is "
+                            "aw-warm-<agent_id>-<session_id>")
         # Stable name (not per-run) — a dispatch reuses this container across
-        # many turns/runs. Labeled with the epoch hash so a later dispatch can
-        # tell, without any extra process, whether it's still safe to reuse.
-        argv.extend(["--name", f"aw-warm-{agent_id}"])
+        # many turns/runs OF THE SAME SESSION. Labeled with the epoch hash so
+        # a later dispatch can tell, without any extra process, whether it's
+        # still safe to reuse.
+        argv.extend(["--name", f"aw-warm-{agent_id}-{session_id}"])
         argv.extend(["--label", "aw.warm=1"])
         argv.extend(["--label", f"aw.agent_id={agent_id}"])
+        argv.extend(["--label", f"aw.session_id={session_id}"])
         argv.extend(["--label", f"aw.epoch={warm_epoch_hash or ''}"])
         argv.extend(["--label", f"aw.warm_token={warm_token or ''}"])
     elif run_id:
@@ -365,6 +370,12 @@ def build_docker_argv(
         argv.extend(["--entrypoint", "/usr/local/bin/aw-warm-wrapper"])
         argv.append(image)
         claude_argv = [spec["bin"], "--input-format", "stream-json", *spec["default_extra"]]
+        # --resume <session_id> — MISSING before this fix (2026-07-24 QA
+        # finding): warm spawn never passed it, so even a single resumed
+        # session started with blank history in a warm container. Always set
+        # under the per-session redesign since session_id == the container's
+        # own key (asserted non-empty above).
+        claude_argv.extend(["--resume", session_id])
         if model and spec["model_flag"]:
             claude_argv.extend([spec["model_flag"], model])
         add_dir_flag = spec.get("add_dir_flag")

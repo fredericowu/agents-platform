@@ -225,38 +225,66 @@ WARM_TOKEN_TTL_S = 86400  # generous — a stale mapping just means the LAST
                           # always overwrites it before the next MCP call.
 
 
-async def set_warm_token_run(token: str, run_id: str) -> None:
-    """Bind a warm container's stable `X-Aw-Warm-Token` to the run_id of the
-    turn CURRENTLY being dispatched to it. Written by warm_pool before every
-    turn (see warm_pool.dispatch_turn callers in cli.py) — replaces the
-    per-run `X-Aw-Caller-Run-Id` header, which is baked into the container's
-    frozen mcp.json at spawn time and can't change per turn under a
-    long-lived warm container. The mcp-gateway (src/mcp/gateway.py) resolves
-    `X-Aw-Warm-Token` through this mapping to learn which run is calling it
-    right now."""
+async def set_warm_token_run(token: str, run_id: str, *,
+                             notion_task_id: str | None = None,
+                             source_device: str | None = None) -> None:
+    """Bind a warm container's stable `X-Aw-Warm-Token` to the CURRENT turn's
+    identity: not just its run_id, but also notion_task_id/source_device —
+    the same per-run values the ephemeral path bakes in as Docker `-e` env
+    vars but which a long-lived warm container can't receive that way (see
+    warm_pool.py's module docstring). Written by warm_pool before every turn
+    (see warm_pool.dispatch_turn callers in cli.py) — replaces the per-run
+    `X-Aw-Caller-Run-Id` header, which is baked into the container's frozen
+    mcp.json at spawn time and can't change per turn. Stored as a small JSON
+    blob (not a bare run_id string) so the mcp-gateway (src/mcp/gateway.py)
+    can restore the equivalent of `X-Aw-Context-Notion-Task-Id`/
+    `X-Aw-Context-Source-Device` for the MCP-header path, not just caller
+    identity."""
     r = await get_client()
     if r is None:
         return
+    payload = json.dumps({
+        "run_id": run_id,
+        "notion_task_id": notion_task_id or "",
+        "source_device": source_device or "",
+    })
     try:
-        await r.set(_warm_token_key(token), run_id, ex=WARM_TOKEN_TTL_S)
+        await r.set(_warm_token_key(token), payload, ex=WARM_TOKEN_TTL_S)
     except Exception as e:
         log.warning("set_warm_token_run failed token=%s: %s", token, e)
         await reset_client()
 
 
-async def get_run_for_warm_token(token: str) -> str | None:
-    """Resolve a warm container's `X-Aw-Warm-Token` to the run_id currently
-    dispatched to it. Returns None if unmapped/Redis unavailable — callers
+async def get_warm_context(token: str) -> dict | None:
+    """Resolve a warm container's `X-Aw-Warm-Token` to the full context of
+    the turn currently dispatched to it: {"run_id", "notion_task_id",
+    "source_device"}. Returns None if unmapped/Redis unavailable — callers
     must treat that as "no caller identity", same as no header at all."""
     r = await get_client()
     if r is None:
         return None
     try:
-        return await r.get(_warm_token_key(token))
+        raw = await r.get(_warm_token_key(token))
     except Exception as e:
-        log.warning("get_run_for_warm_token failed token=%s: %s", token, e)
+        log.warning("get_warm_context failed token=%s: %s", token, e)
         await reset_client()
         return None
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        # Back-compat: an older bare run_id string written before this blob
+        # format existed.
+        return {"run_id": raw, "notion_task_id": "", "source_device": ""}
+
+
+async def get_run_for_warm_token(token: str) -> str | None:
+    """Resolve a warm container's `X-Aw-Warm-Token` to just the run_id
+    currently dispatched to it — thin wrapper over `get_warm_context` for
+    callers that only need caller identity, not the full turn context."""
+    ctx = await get_warm_context(token)
+    return ctx.get("run_id") if ctx else None
 
 
 def _finished_channel(run_id: str) -> str:

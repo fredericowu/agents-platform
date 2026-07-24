@@ -18,6 +18,13 @@ moment one is seen, this also publishes that stream's "done" sentinel
 for exactly that — finalises the run normally. The relay process itself
 never exits between turns; only the wrapper's drain/TTL logic ends it.
 
+Under the per-session warm-pool redesign (2026-07-24), the container's own
+session_id is known BEFORE spawn (it's the container's key —
+`aw-warm-<agent_id>-<session_id>`), so it's baked in as a plain static
+`AW_SESSION_ID` env var at `docker run` time (see docker_agent.py's warm_mode
+branch / cli.py's `_warm_get_or_create`) — this relay no longer needs to
+parse it out of claude's `system`/`init` event turn-by-turn.
+
 Usage: aw-warm-relay.py <rundir>   (reads claude's stdout on its own stdin)
 """
 from __future__ import annotations

@@ -142,12 +142,33 @@ async def kill_run(run_id: str) -> int:
                   "%s (live registry)", run_id, _container_name)
     else:
         _container_run_id = run_id
+        _warm_container_name: str | None = None
         try:
             from ...db import session_scope
-            from ...models import Run as _Run
+            from ...models import Run as _Run, Agent as _Agent
+            from .. import warm_pool
 
             with session_scope() as _s:
                 _row = _s.query(_Run).filter(_Run.id == run_id).first()
+                # Warm-mode resolution: a warm container's stable name
+                # (aw-warm-<agent_id>-<session_id>) is NEVER derivable from
+                # container_name_for_run() below — that always returns the
+                # ephemeral aw-run-<id> shape, so a run recovered after a
+                # restart (which wipes _RUN_CONTAINER_NAMES) used to always
+                # be targeted at a container name that never existed for a
+                # warm-mode run. Deterministic under the per-session redesign:
+                # Run.session_id + the run's agent (via source_slug) give the
+                # exact warm container name with no registry needed. Same
+                # documented blind spot as today's ephemeral fallback below:
+                # Run.session_id isn't written until a run FINISHES, so an
+                # in-flight run recovered mid-turn still can't be resolved
+                # this way — not new, not fixed here.
+                if _row and _row.session_id and _row.source_slug and warm_pool.enabled():
+                    _agent = _s.query(_Agent).filter(_Agent.slug == _row.source_slug).first()
+                    if _agent:
+                        _candidate = warm_pool.warm_container_name(_agent.id, _row.session_id)
+                        if await warm_pool.is_running(_candidate):
+                            _warm_container_name = _candidate
                 if _row and _row.session_id:
                     _anchor = (
                         _s.query(_Run)
@@ -164,16 +185,23 @@ async def kill_run(run_id: str) -> int:
                 "container on a resumed session)", run_id,
             )
 
-        from ..tools.docker_agent import container_name_for_run
-        _container_name = container_name_for_run(_container_run_id)
-        if _container_run_id != run_id:
-            log.info("kill_run: run %s not in the live registry — DB anchor "
-                      "lookup resolved container %s", run_id, _container_name)
+        if _warm_container_name:
+            _container_name = _warm_container_name
+            log.info("kill_run: run %s not in the live registry — resolved to "
+                      "its agent's warm container %s (AP_WARM_CONTAINER "
+                      "enabled and that container is running)",
+                      run_id, _container_name)
         else:
-            log.warning("kill_run: run %s not in the live registry and no DB "
-                        "session anchor found — targeting its own id as the "
-                        "container name, may miss the real container: %s",
-                        run_id, _container_name)
+            from ..tools.docker_agent import container_name_for_run
+            _container_name = container_name_for_run(_container_run_id)
+            if _container_run_id != run_id:
+                log.info("kill_run: run %s not in the live registry — DB anchor "
+                          "lookup resolved container %s", run_id, _container_name)
+            else:
+                log.warning("kill_run: run %s not in the live registry and no DB "
+                            "session anchor found — targeting its own id as the "
+                            "container name, may miss the real container: %s",
+                            run_id, _container_name)
 
     proc = await asyncio.create_subprocess_exec(
         "docker", "kill", _container_name,
@@ -357,11 +385,13 @@ class CliLLM(BaseLLM):
             workdir=self.cwd,
         )
 
-    async def _warm_get_or_create(self, prompt: str) -> tuple[str, str]:
-        """Resolve (spawning if needed) this agent's warm container. See
-        core/warm_pool.py for the full design. Only called when
-        `warm_pool.enabled()` is True (AP_WARM_CONTAINER=1) and cli=="claude"
-        — see the `warm_mode` gate in `_astream_once`.
+    async def _warm_get_or_create(self, prompt: str, session_id: str) -> tuple[str, str]:
+        """Resolve (spawning if needed) this SESSION's warm container. See
+        core/warm_pool.py for the full design — one container per
+        (agent_id, session_id), not per agent. Only called when
+        `warm_pool.enabled()` is True (AP_WARM_CONTAINER=1), cli=="claude",
+        and a session_id is already known — see the `warm_mode` gate and the
+        promotion-after-first-turn call site in `_astream_once`.
         """
         from .. import warm_pool
         from ..tools.docker_agent import build_docker_argv, REGISTRY, IMAGE_PREFIX
@@ -369,6 +399,8 @@ class CliLLM(BaseLLM):
         agent_id = self.agent_id
         if not agent_id:
             raise RuntimeError("warm mode requires agent_id")
+        if not session_id:
+            raise RuntimeError("warm mode requires session_id")
 
         image = f"{REGISTRY}/{IMAGE_PREFIX}-claude:latest"
         mounts: list[str] = list(self.add_dirs)
@@ -430,12 +462,30 @@ class CliLLM(BaseLLM):
                 creds=self.docker_creds, add_dirs=self.add_dirs, env_file=None,
                 forward_env=False, model=self.model, extra_args=extra, tag="latest",
                 image_override=None, mcp_config_dir=warm_mcp_dir, agent_id=agent_id,
-                target_id=self.target_id, extra_docker_env={"AW_REDIS_URL": _redis_url},
+                target_id=self.target_id, session_id=session_id,
+                # BASH_ENV carries the ONLY per-turn plumbing (NOTION_TASK_ID/
+                # AW_SOURCE_DEVICE) — dispatch_turn() rewrites the file it
+                # points at before every turn, so `bash -c` invocations from
+                # the CLI's own Bash tool pick up the CURRENT turn's values
+                # with zero change to any shipped agent contract
+                # (telegram.py:2770, aw-apple-watch skill). AW_SESSION_ID is
+                # instead a STATIC env var here: under the per-session
+                # redesign session_id is the container's own key, known at
+                # spawn time, and constant for its whole life — no need for
+                # the in-container relay to parse it out of claude's init
+                # event turn-by-turn (see warm_pool.dispatch_turn's docstring).
+                extra_docker_env={
+                    "AW_REDIS_URL": _redis_url,
+                    "BASH_ENV": "/home/ubuntu/.aw-warm/turn_env",
+                    "AW_SESSION_ID": session_id,
+                },
                 extra_volumes=self.extra_volumes or None, share_network=self.share_network,
                 workdir=self.cwd, warm_mode=True, warm_epoch_hash=epoch, warm_token=token,
             )
 
-        return await warm_pool.get_or_create(agent_id=agent_id, epoch_hash=epoch_hash, build_argv=_build_argv)
+        return await warm_pool.get_or_create(
+            agent_id=agent_id, session_id=session_id, epoch_hash=epoch_hash, build_argv=_build_argv,
+        )
 
     async def astream(self, messages: list[dict], **params: Any) -> AsyncIterator[ChatChunk]:
         """Thin retry wrapper around `_astream_once`. Handles exactly one
@@ -599,16 +649,24 @@ class CliLLM(BaseLLM):
         use_redis = (not use_ws) and os.environ.get("AP_CLI_REDIS_STREAM", "1") != "0"
         # Opt-in persistent "warm container" mode (AP_WARM_CONTAINER=1, claude
         # only — see core/warm_pool.py). Default OFF: `warm_pool.enabled()` is
-        # the ONLY new branch point in this whole method: everything else in
-        # this function runs byte-for-byte as before whenever it's False.
+        # the primary new branch point in this whole method. Per-session
+        # redesign (2026-07-24): also requires self.session_id — turn 1 of any
+        # session has no session_id yet (freshly minted by the CLI itself), so
+        # it naturally always falls through to the ephemeral branches below,
+        # matching the promotion-after-first-turn policy with zero extra
+        # special-casing. Any failure inside the warm branch below falls back
+        # to ephemeral for THIS turn (warm_mode flips to False) — warm is an
+        # accelerant, never a hard dependency.
         from .. import warm_pool
-        warm_mode = (not attach_run_id) and self.cli == "claude" and warm_pool.enabled()
+        warm_mode = (not attach_run_id) and self.cli == "claude" and bool(self.session_id) and warm_pool.enabled()
 
         q = None
         proc = None
         monitor_task = None
         register_run = unregister_run = None
         done_event = asyncio.Event()
+        argv: list[str] | None = None
+        stdout_target = None
 
         if attach_run_id:
             from ..redis_streams import replay_stream_into_queue
@@ -618,47 +676,98 @@ class CliLLM(BaseLLM):
                 name=f"redis-replay-{attach_run_id}",
             )
         elif warm_mode:
-            from .. import redis_streams
-            q = asyncio.Queue()
-            _warm_name, _warm_token = await self._warm_get_or_create(prompt)
-            if rid:
-                # Same data-only hook the ephemeral path uses (see
-                # `_RUN_CONTAINER_NAMES` module docstring) — /abort's kill_run
-                # needs zero changes to also work against a warm container: it
-                # SIGKILLs the whole thing, destroying its warm state by
-                # design, and the next turn on this agent just cold-starts a
-                # fresh one. NEVER used by the graceful drain path (see
-                # warm_pool.drain()) — that's a `docker exec ... touch
-                # /aw/drain` flag file, no signals, mechanically unrelated.
-                _RUN_CONTAINER_NAMES[rid] = _warm_name
-            await redis_streams.set_warm_token_run(_warm_token, rid or "unknown")
-            asyncio.create_task(
-                redis_streams.consume_stream_into_queue(rid or "unknown", q),
-                name=f"warm-consumer-{rid}",
-            )
-            await warm_pool.dispatch_turn(name=_warm_name, run_id=rid or "unknown", prompt=prompt)
-        elif use_ws:
-            ws_token = secrets.token_hex(32)
-            from ..ws_agent_registry import register_run, unregister_run
-            q = register_run(rid or "unknown", ws_token)
-            argv = self._build_argv(prompt, ws_token=ws_token)
-            stdout_target = asyncio.subprocess.DEVNULL  # events arrive via WS
-        elif use_redis:
-            # Container publishes directly to Redis Stream via aw-connector-redis.
-            # We consume via XREADGROUP into an asyncio.Queue (same interface as WS mode).
-            _redis_url = os.environ.get("AP_REDIS_URL", "redis://127.0.0.1:6379/0")
-            q = asyncio.Queue()
-            # share_network containers join aw-sandbox's netns, so 127.0.0.1 already
-            # reaches redis there — only the isolated-bridge containers need the alias.
-            if self.share_network:
-                argv = self._build_argv(prompt, redis_url=_redis_url)
+            try:
+                from .. import redis_streams
+                q = asyncio.Queue()
+                _warm_name, _warm_token = await self._warm_get_or_create(prompt, self.session_id)
+                if rid:
+                    # Same data-only hook the ephemeral path uses (see
+                    # `_RUN_CONTAINER_NAMES` module docstring) — /abort's kill_run
+                    # needs zero changes to also work against a warm container: it
+                    # SIGKILLs the whole thing, destroying its warm state by
+                    # design, and the next turn on this session just cold-starts a
+                    # fresh one. NEVER used by the graceful drain path (see
+                    # warm_pool.drain()) — that's a `docker exec ... touch
+                    # /aw/drain` flag file, no signals, mechanically unrelated.
+                    _RUN_CONTAINER_NAMES[rid] = _warm_name
+                await redis_streams.set_warm_token_run(
+                    _warm_token, rid or "unknown",
+                    notion_task_id=self.notion_task_id, source_device=self.source_device,
+                )
+                asyncio.create_task(
+                    redis_streams.consume_stream_into_queue(rid or "unknown", q),
+                    name=f"warm-consumer-{rid}",
+                )
+                # In-band execution-context fallback (2026-07-24, verified against
+                # a real warm container): BASH_ENV/turn_env (see
+                # warm_pool.dispatch_turn) is NOT reliable on its own — the CLI's
+                # Bash tool was confirmed to invoke commands via `/bin/sh` (dash
+                # in the agent image), which does not source BASH_ENV at all
+                # (that's a bash-only mechanism for non-interactive shells; dash
+                # ignores it unconditionally). `echo $NOTION_TASK_ID` inside the
+                # Bash tool came back empty in that test even though `docker exec
+                # ... bash -c '...'` against the same container picked it up
+                # correctly — proving the gap is which shell the tool spawns, not
+                # the turn_env file itself. Reusing the SAME [SYSTEM]/[USER]
+                # framing this function already builds `prompt` from (no new
+                # marker syntax, per the architect's fallback design) makes the
+                # model read the current turn's values directly out of the turn
+                # text, independent of whichever shell a Bash command runs under.
+                # turn_env/BASH_ENV stays in place as a harmless best-effort
+                # (may work for agent-authored `bash -c`/`#!/bin/bash` scripts,
+                # or a future CLI version that shells out via bash). AW_SESSION_ID
+                # needs none of this — it's a plain static `-e` env var now (see
+                # `_warm_get_or_create`), not something the CLI has to read out of
+                # a per-turn-rewritten file at all.
+                _warm_prompt = prompt
+                if self.notion_task_id or self.source_device:
+                    _ctx_parts = []
+                    if self.notion_task_id:
+                        _ctx_parts.append(f"NOTION_TASK_ID={self.notion_task_id}")
+                    if self.source_device:
+                        _ctx_parts.append(f"AW_SOURCE_DEVICE={self.source_device}")
+                    _warm_prompt = (
+                        "[SYSTEM]\nExecution context for this turn: " + " ".join(_ctx_parts) + ". "
+                        "$NOTION_TASK_ID/$AW_SOURCE_DEVICE may read empty via the Bash tool in "
+                        "warm-container mode — use the values above instead if so.\n\n" + prompt
+                    )
+                await warm_pool.dispatch_turn(
+                    name=_warm_name, run_id=rid or "unknown", prompt=_warm_prompt,
+                    notion_task_id=self.notion_task_id, source_device=self.source_device,
+                )
+            except Exception:
+                log.warning(
+                    "cli warm dispatch failed for agent=%s session=%s — falling back to "
+                    "ephemeral for this turn", self.agent_id, self.session_id, exc_info=True,
+                )
+                warm_mode = False
+                q = None
+                if rid:
+                    _RUN_CONTAINER_NAMES.pop(rid, None)
+
+        if not attach_run_id and not warm_mode:
+            if use_ws:
+                ws_token = secrets.token_hex(32)
+                from ..ws_agent_registry import register_run, unregister_run
+                q = register_run(rid or "unknown", ws_token)
+                argv = self._build_argv(prompt, ws_token=ws_token)
+                stdout_target = asyncio.subprocess.DEVNULL  # events arrive via WS
+            elif use_redis:
+                # Container publishes directly to Redis Stream via aw-connector-redis.
+                # We consume via XREADGROUP into an asyncio.Queue (same interface as WS mode).
+                _redis_url = os.environ.get("AP_REDIS_URL", "redis://127.0.0.1:6379/0")
+                q = asyncio.Queue()
+                # share_network containers join aw-sandbox's netns, so 127.0.0.1 already
+                # reaches redis there — only the isolated-bridge containers need the alias.
+                if self.share_network:
+                    argv = self._build_argv(prompt, redis_url=_redis_url)
+                else:
+                    argv = self._build_argv(prompt, redis_url=_redis_url.replace(
+                        "127.0.0.1", "host.docker.internal"))  # container sees host via this alias
+                stdout_target = asyncio.subprocess.DEVNULL
             else:
-                argv = self._build_argv(prompt, redis_url=_redis_url.replace(
-                    "127.0.0.1", "host.docker.internal"))  # container sees host via this alias
-            stdout_target = asyncio.subprocess.DEVNULL
-        else:
-            argv = self._build_argv(prompt, ws_token=None)  # no aw-connector wrapper
-            stdout_target = asyncio.subprocess.PIPE  # read CLI stdout directly
+                argv = self._build_argv(prompt, ws_token=None)  # no aw-connector wrapper
+                stdout_target = asyncio.subprocess.PIPE  # read CLI stdout directly
 
         stderr_chunks: list[bytes] = []
         stderr_task = None
@@ -771,6 +880,12 @@ class CliLLM(BaseLLM):
         final_text = ""
         received_events = 0
         _first_byte_seen = False
+        # Captured off the CLI's own system/init event — the only place a
+        # FRESH session's id is ever known (self.session_id is None for a
+        # session's first turn). Feeds promotion-after-first-turn below: once
+        # this turn succeeds, a warm container for (agent_id, this session_id)
+        # gets pre-spawned in the background so turn 2+ is warm.
+        _captured_session_id: str | None = None
         from ..redis_streams import CONNECTOR_TIMING_PREFIX
 
         try:
@@ -818,6 +933,7 @@ class CliLLM(BaseLLM):
                 received_events += 1
                 et = evt.get("type")
                 if et == "system" and evt.get("subtype") == "init":
+                    _captured_session_id = evt.get("session_id") or _captured_session_id
                     yield ChatChunk(delta="", finish=False, tokens_in=0, tokens_out=0, cost_usd=0.0)
                     yield _meta_chunk("system.init", {
                         "session_id": evt.get("session_id"),
@@ -1035,7 +1151,36 @@ class CliLLM(BaseLLM):
                 msg += f": {stderr_text[-4000:]}"
             raise RuntimeError(msg)
 
+        # Promotion-after-first-turn (see warm_pool.py's module docstring):
+        # this turn just ran ephemeral and succeeded — pre-spawn THIS
+        # session's warm container in the background so turn 2+ is warm.
+        # Fire-and-forget: never blocks or affects this turn's own result.
+        # Skipped when warm_mode/attach_run_id (a warm or replayed turn needs
+        # no promotion) or when no session_id is known yet (shouldn't happen
+        # here since a successful claude turn always emits system/init, but
+        # fails safe — no promotion rather than a crash).
+        if not attach_run_id and not warm_mode and self.cli == "claude" and warm_pool.enabled():
+            _promote_sid = self.session_id or _captured_session_id
+            if _promote_sid:
+                asyncio.create_task(
+                    self._warm_promote(_promote_sid), name=f"warm-promote-{_promote_sid}",
+                )
+
         yield ChatChunk(delta="", finish=True, tokens_in=tin, tokens_out=tout, cost_usd=cost)
+
+    async def _warm_promote(self, session_id: str) -> None:
+        """Background pre-spawn of this session's warm container, fired once
+        an ephemeral turn on it completes successfully (promotion-after-
+        first-turn — see warm_pool.py's module docstring). Swallows every
+        failure: this is purely an accelerant for the NEXT turn, never
+        load-bearing for the turn that triggered it."""
+        try:
+            await self._warm_get_or_create("", session_id)
+        except Exception:
+            log.warning(
+                "warm_pool: background promotion failed for agent=%s session=%s",
+                self.agent_id, session_id, exc_info=True,
+            )
 
 
 def _meta_chunk(kind: str, payload: dict) -> ChatChunk:
