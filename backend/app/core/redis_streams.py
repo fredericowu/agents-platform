@@ -27,6 +27,15 @@ from typing import AsyncIterator
 
 log = logging.getLogger("ap.redis_streams")
 
+# Sentinel prefix for forwarding aw-connector-redis's own timing markers
+# (XADD field "type": "connector.timing", payload in "meta") through the same
+# str-only asyncio.Queue used for real CLI stdout lines, without them being
+# mistaken for one. cli.py's astream() strips this prefix and yields a
+# `_meta_chunk("connector.timing", ...)` instead of trying to JSON-parse the
+# payload as a CLI event. NUL-prefixed so it can never collide with a real
+# CLI JSON line (which always starts with `{`).
+CONNECTOR_TIMING_PREFIX = "\x00connector.timing\x00"
+
 _client = None
 _lock = asyncio.Lock()
 
@@ -192,6 +201,11 @@ async def consume_stream_into_queue(run_id: str, queue: asyncio.Queue,
                     if fields.get("done"):
                         await queue.put(None)
                         return
+                    if fields.get("type") == "connector.timing":
+                        _meta = fields.get("meta", "")
+                        if _meta:
+                            await queue.put(CONNECTOR_TIMING_PREFIX + _meta)
+                        continue
                     # Accept both the connector's {type: stdout, line} format and
                     # the WS-copy {line} format — forward any entry carrying a line.
                     line = fields.get("line", "")
@@ -200,6 +214,49 @@ async def consume_stream_into_queue(run_id: str, queue: asyncio.Queue,
     except Exception as e:
         log.warning("consume_stream_into_queue fatal run=%s: %s", run_id, e)
         await queue.put(None)
+
+
+def _warm_token_key(token: str) -> str:
+    return f"warm_token:{token}:run_id"
+
+
+WARM_TOKEN_TTL_S = 86400  # generous — a stale mapping just means the LAST
+                          # turn dispatched to that token; a fresh dispatch
+                          # always overwrites it before the next MCP call.
+
+
+async def set_warm_token_run(token: str, run_id: str) -> None:
+    """Bind a warm container's stable `X-Aw-Warm-Token` to the run_id of the
+    turn CURRENTLY being dispatched to it. Written by warm_pool before every
+    turn (see warm_pool.dispatch_turn callers in cli.py) — replaces the
+    per-run `X-Aw-Caller-Run-Id` header, which is baked into the container's
+    frozen mcp.json at spawn time and can't change per turn under a
+    long-lived warm container. The mcp-gateway (src/mcp/gateway.py) resolves
+    `X-Aw-Warm-Token` through this mapping to learn which run is calling it
+    right now."""
+    r = await get_client()
+    if r is None:
+        return
+    try:
+        await r.set(_warm_token_key(token), run_id, ex=WARM_TOKEN_TTL_S)
+    except Exception as e:
+        log.warning("set_warm_token_run failed token=%s: %s", token, e)
+        await reset_client()
+
+
+async def get_run_for_warm_token(token: str) -> str | None:
+    """Resolve a warm container's `X-Aw-Warm-Token` to the run_id currently
+    dispatched to it. Returns None if unmapped/Redis unavailable — callers
+    must treat that as "no caller identity", same as no header at all."""
+    r = await get_client()
+    if r is None:
+        return None
+    try:
+        return await r.get(_warm_token_key(token))
+    except Exception as e:
+        log.warning("get_run_for_warm_token failed token=%s: %s", token, e)
+        await reset_client()
+        return None
 
 
 def _finished_channel(run_id: str) -> str:

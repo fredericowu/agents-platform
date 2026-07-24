@@ -201,6 +201,17 @@ async def lifespan(app: FastAPI):
         _asyncio.create_task(run_session_event_listener(_on_session_event))
     except Exception as e:
         print(f"[main] session event listener skipped: {e}")
+    # Warm-container reconcile sweep (AP_WARM_CONTAINER=1 only — no-op
+    # otherwise, not even a docker ps call). One-time on boot: adopt any
+    # warm container whose epoch still matches its agent's current config,
+    # drain everything else (agent deleted/reconfigured while we were down,
+    # crash orphans, ...). See core/warm_pool.py.
+    try:
+        from .core import warm_pool
+        if warm_pool.enabled():
+            await warm_pool.reconcile_on_boot(warm_pool.current_epoch_for_agent)
+    except Exception as e:
+        print(f"[main] warm-pool reconcile skipped: {e}")
     yield
 
 

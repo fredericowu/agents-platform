@@ -20,11 +20,13 @@ import asyncio
 import json
 import os
 import sys
+import time
 
 import redis.asyncio as redis
 
 
 async def run() -> None:
+    _t_connector_start = time.time()
     run_id = os.environ.get("AW_RUN_ID", "unknown")
     redis_url = os.environ.get("AW_REDIS_URL", "redis://host.docker.internal:6379/0")
     cli_args = sys.argv[1:]
@@ -35,22 +37,64 @@ async def run() -> None:
 
     stream_key = f"run:{run_id}:events"
 
-    try:
-        r = redis.from_url(redis_url, socket_connect_timeout=10, socket_timeout=10)
-        await r.ping()
-    except Exception as e:
-        print(f"aw-connector-redis: cannot connect to Redis at {redis_url} ({e})",
-              file=sys.stderr)
-        sys.exit(1)
+    async def _connect_redis() -> "redis.Redis":
+        _r = redis.from_url(redis_url, socket_connect_timeout=10, socket_timeout=10)
+        await _r.ping()
+        return _r
 
-    proc = await asyncio.create_subprocess_exec(
-        *cli_args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        limit=10 * 1024 * 1024,
+    async def _spawn_cli() -> asyncio.subprocess.Process:
+        return await asyncio.create_subprocess_exec(
+            *cli_args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=10 * 1024 * 1024,
+        )
+
+    # Redis connect and CLI spawn are independent — do them concurrently
+    # instead of connect-then-spawn. Shaves the smaller of the two off
+    # container_wait (see cold-start ADR under Target
+    # agent-docker-coldstart-review).
+    _r_result, _proc_result = await asyncio.gather(
+        _connect_redis(), _spawn_cli(), return_exceptions=True,
     )
+    if isinstance(_r_result, BaseException):
+        print(f"aw-connector-redis: cannot connect to Redis at {redis_url} ({_r_result})",
+              file=sys.stderr)
+        if not isinstance(_proc_result, BaseException):
+            _proc_result.kill()
+        sys.exit(1)
+    if isinstance(_proc_result, BaseException):
+        print(f"aw-connector-redis: failed to spawn CLI ({_proc_result})", file=sys.stderr)
+        await _r_result.aclose()
+        sys.exit(1)
+    r: "redis.Redis" = _r_result
+    proc: asyncio.subprocess.Process = _proc_result
+
+    # Timing marker: from the connector's own clock, how long redis-connect +
+    # cli-spawn took (this + the CLI's own boot-to-first-line below is the
+    # in-container slice of the host-observed `agent.container_wait` span).
+    # Best-effort — never let telemetry block/crash the actual run.
+    #
+    # IMPORTANT: uses the "meta" field, NOT "line" — redis_streams.py's
+    # consume_stream_into_queue() forwards ANY entry with a non-empty "line"
+    # field straight into the CLI event queue (it doesn't filter on "type"),
+    # so a timing payload under "line" would get fed to cli.py's JSON parser
+    # as if it were a real CLI stdout line and corrupt the event stream.
+    _t_ready = time.time()
+    try:
+        await r.xadd(stream_key, {"type": "connector.timing", "meta": json.dumps({
+            "phase": "connect_and_spawn",
+            "connector_start_epoch": _t_connector_start,
+            "ready_epoch": _t_ready,
+            "duration_s": round(_t_ready - _t_connector_start, 4),
+        })}, maxlen=50_000, approximate=True)
+    except Exception:
+        pass
+
+    _first_line_seen = False
 
     async def publish_stream(stream: asyncio.StreamReader | None, source: str) -> None:
+        nonlocal _first_line_seen
         if stream is None:
             return
         while True:
@@ -60,6 +104,18 @@ async def run() -> None:
             line = raw.decode("utf-8", errors="replace").rstrip("\n")
             if not line:
                 continue
+            if not _first_line_seen:
+                _first_line_seen = True
+                _t_first_line = time.time()
+                try:
+                    await r.xadd(stream_key, {"type": "connector.timing", "meta": json.dumps({
+                        "phase": "spawn_to_first_line",
+                        "ready_epoch": _t_ready,
+                        "first_line_epoch": _t_first_line,
+                        "duration_s": round(_t_first_line - _t_ready, 4),
+                    })}, maxlen=50_000, approximate=True)
+                except Exception:
+                    pass
             if source == "stderr":
                 line = json.dumps({"type": "cli.stderr", "text": line[:20000]})
             try:

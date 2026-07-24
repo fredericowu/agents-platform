@@ -1339,6 +1339,10 @@ async def _run_agent_impl(
     _t_llm_invoke: float | None = None
     _t_container_started: float | None = None
     _t_cli_first_byte: float | None = None
+    # aw-connector-redis's own self-timed sub-phases of container_wait
+    # (decompose it into "dockerd overhead" vs. "connector's own work").
+    _connector_connect_spawn_s: float | None = None
+    _connector_cli_boot_s: float | None = None
     _t_system_init: float | None = None
     _t_first_token: float | None = None
     _t_finalizing: float | None = None
@@ -1503,6 +1507,13 @@ async def _run_agent_impl(
                             _t_container_started = _time.perf_counter()
                         elif meta_kind == "cli.first_byte" and _t_cli_first_byte is None:
                             _t_cli_first_byte = _time.perf_counter()
+                        elif meta_kind == "connector.timing" and meta_payload:
+                            _phase = meta_payload.get("phase")
+                            _dur = meta_payload.get("duration_s")
+                            if _phase == "connect_and_spawn" and _connector_connect_spawn_s is None:
+                                _connector_connect_spawn_s = _dur
+                            elif _phase == "spawn_to_first_line" and _connector_cli_boot_s is None:
+                                _connector_cli_boot_s = _dur
                         # Persist session_id from system.init so callers can resume later.
                         if meta_kind == "system.init" and meta_payload and run_id:
                             if _t_system_init is None:
@@ -1716,6 +1727,13 @@ async def _run_agent_impl(
         _timing["container_create_s"] = _t_container_started - _t_llm_invoke
     if _t_container_started is not None and _t_cli_first_byte is not None:
         _timing["container_wait_s"] = _t_cli_first_byte - _t_container_started
+    # Sub-spans of container_wait_s, self-reported by aw-connector-redis's own
+    # clock (not derived from our perf_counter timestamps, so no host/container
+    # clock-skew assumption needed — see connector.timing meta chunks above).
+    if _connector_connect_spawn_s is not None:
+        _timing["connector_connect_spawn_s"] = _connector_connect_spawn_s
+    if _connector_cli_boot_s is not None:
+        _timing["connector_cli_boot_s"] = _connector_cli_boot_s
     if _t_cli_first_byte is not None and _t_system_init is not None:
         _timing["cli_boot_s"] = _t_system_init - _t_cli_first_byte
     if _t_llm_invoke is not None and _t_first_token is not None:

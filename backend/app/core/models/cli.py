@@ -357,6 +357,86 @@ class CliLLM(BaseLLM):
             workdir=self.cwd,
         )
 
+    async def _warm_get_or_create(self, prompt: str) -> tuple[str, str]:
+        """Resolve (spawning if needed) this agent's warm container. See
+        core/warm_pool.py for the full design. Only called when
+        `warm_pool.enabled()` is True (AP_WARM_CONTAINER=1) and cli=="claude"
+        — see the `warm_mode` gate in `_astream_once`.
+        """
+        from .. import warm_pool
+        from ..tools.docker_agent import build_docker_argv, REGISTRY, IMAGE_PREFIX
+
+        agent_id = self.agent_id
+        if not agent_id:
+            raise RuntimeError("warm mode requires agent_id")
+
+        image = f"{REGISTRY}/{IMAGE_PREFIX}-claude:latest"
+        mounts: list[str] = list(self.add_dirs)
+        if self.cwd and self.mount_cwd:
+            mounts.append(self.cwd)
+        # Everything frozen at spawn time — see warm_pool.compute_epoch_hash's
+        # docstring. mcp_config_hash covers the resolved mcp.json (including
+        # the gateway bearer token baked in by _inject_gateway_token) by
+        # hashing the SAME per-agent static config file docker_mcp_config_dir
+        # already points at (written once by _write_agent_mcp_config) — no
+        # extra I/O beyond what the ephemeral path already resolves today.
+        epoch_hash = warm_pool.compute_epoch_hash(
+            system_prompt=self.append_system_prompt,
+            model=self.model,
+            tools=[*self.allowed_tools, *(f"!{t}" for t in self.disallowed_tools)],
+            mounts=mounts,
+            mcp_config_hash=warm_pool.hash_file(self.docker_mcp_config_dir),
+            image=image,
+            gateway_config_hash=None,
+        )
+
+        def _build_argv(name: str, epoch: str, token: str) -> list[str]:
+            # Warm-specific mcp config dir (X-Aw-Warm-Token header instead of
+            # the per-run X-Aw-Caller-Run-Id — see write_warm_mcp_config's
+            # docstring for why a long-lived container can't use the latter).
+            # Written once here, at spawn time, not per turn.
+            warm_mcp_dir = self.docker_mcp_config_dir
+            if self.docker_mcp_config_dir:
+                try:
+                    from ...db import session_scope
+                    from ...models import Agent as _Agent
+                    from ...api.agents import write_warm_mcp_config
+                    with session_scope() as _s:
+                        _agent_row = _s.query(_Agent).filter(_Agent.id == agent_id).first()
+                        if _agent_row:
+                            warm_mcp_dir = write_warm_mcp_config(_agent_row, token, _s) or self.docker_mcp_config_dir
+                except Exception:
+                    log.warning(
+                        "warm_pool: failed to write warm mcp config for agent %s — "
+                        "falling back to the static per-agent config (no "
+                        "caller-identity header, run_agent_async/return_to_caller_agent "
+                        "won't resolve for this warm container)", agent_id, exc_info=True,
+                    )
+            extra: list[str] = []
+            if self.allowed_tools:
+                extra += ["--allowed-tools", ",".join(self.allowed_tools)]
+            if self.disallowed_tools:
+                extra += ["--disallowed-tools", ",".join(self.disallowed_tools)]
+            if self.bare:
+                extra.append("--bare")
+            if self.append_system_prompt:
+                extra += ["--append-system-prompt", self.append_system_prompt]
+            extra += self.extra_args
+            _redis_url = os.environ.get("AP_REDIS_URL", "redis://127.0.0.1:6379/0")
+            if not self.share_network:
+                _redis_url = _redis_url.replace("127.0.0.1", "host.docker.internal")
+            return build_docker_argv(
+                cli="claude", prompt="", mounts=mounts, skills=False, mcp=False,
+                creds=self.docker_creds, add_dirs=self.add_dirs, env_file=None,
+                forward_env=False, model=self.model, extra_args=extra, tag="latest",
+                image_override=None, mcp_config_dir=warm_mcp_dir, agent_id=agent_id,
+                target_id=self.target_id, extra_docker_env={"AW_REDIS_URL": _redis_url},
+                extra_volumes=self.extra_volumes or None, share_network=self.share_network,
+                workdir=self.cwd, warm_mode=True, warm_epoch_hash=epoch, warm_token=token,
+            )
+
+        return await warm_pool.get_or_create(agent_id=agent_id, epoch_hash=epoch_hash, build_argv=_build_argv)
+
     async def astream(self, messages: list[dict], **params: Any) -> AsyncIterator[ChatChunk]:
         """Thin retry wrapper around `_astream_once`. Handles exactly one
         failure shape: the container-name collision described on the launch
@@ -517,6 +597,12 @@ class CliLLM(BaseLLM):
         # platform restart. Set AP_CLI_REDIS_STREAM=0 to fall back to reading the
         # container's stdout directly (no restart durability).
         use_redis = (not use_ws) and os.environ.get("AP_CLI_REDIS_STREAM", "1") != "0"
+        # Opt-in persistent "warm container" mode (AP_WARM_CONTAINER=1, claude
+        # only — see core/warm_pool.py). Default OFF: `warm_pool.enabled()` is
+        # the ONLY new branch point in this whole method: everything else in
+        # this function runs byte-for-byte as before whenever it's False.
+        from .. import warm_pool
+        warm_mode = (not attach_run_id) and self.cli == "claude" and warm_pool.enabled()
 
         q = None
         proc = None
@@ -531,6 +617,26 @@ class CliLLM(BaseLLM):
                 replay_stream_into_queue(attach_run_id, q),
                 name=f"redis-replay-{attach_run_id}",
             )
+        elif warm_mode:
+            from .. import redis_streams
+            q = asyncio.Queue()
+            _warm_name, _warm_token = await self._warm_get_or_create(prompt)
+            if rid:
+                # Same data-only hook the ephemeral path uses (see
+                # `_RUN_CONTAINER_NAMES` module docstring) — /abort's kill_run
+                # needs zero changes to also work against a warm container: it
+                # SIGKILLs the whole thing, destroying its warm state by
+                # design, and the next turn on this agent just cold-starts a
+                # fresh one. NEVER used by the graceful drain path (see
+                # warm_pool.drain()) — that's a `docker exec ... touch
+                # /aw/drain` flag file, no signals, mechanically unrelated.
+                _RUN_CONTAINER_NAMES[rid] = _warm_name
+            await redis_streams.set_warm_token_run(_warm_token, rid or "unknown")
+            asyncio.create_task(
+                redis_streams.consume_stream_into_queue(rid or "unknown", q),
+                name=f"warm-consumer-{rid}",
+            )
+            await warm_pool.dispatch_turn(name=_warm_name, run_id=rid or "unknown", prompt=prompt)
         elif use_ws:
             ws_token = secrets.token_hex(32)
             from ..ws_agent_registry import register_run, unregister_run
@@ -558,7 +664,7 @@ class CliLLM(BaseLLM):
         stderr_task = None
         _held_container_lock: asyncio.Lock | None = None
         _container_name: str | None = None
-        if not attach_run_id:
+        if not attach_run_id and not warm_mode:
             # The container name is deterministic (aw-run-<resume_run_id or run_id>)
             # so a RESUMED session reuses the SAME name across every turn (see
             # container_name_for_run) — that's what lets kill_run()/`/abort`
@@ -652,7 +758,7 @@ class CliLLM(BaseLLM):
 
         # Unified line source: yields each raw CLI JSON line, or None when done.
         async def _next_line() -> str | None:
-            if attach_run_id or use_ws or use_redis:
+            if attach_run_id or use_ws or use_redis or warm_mode:
                 return await asyncio.wait_for(q.get(), timeout=self.timeout_s)
             assert proc.stdout is not None
             raw = await asyncio.wait_for(proc.stdout.readline(), timeout=self.timeout_s)
@@ -665,6 +771,7 @@ class CliLLM(BaseLLM):
         final_text = ""
         received_events = 0
         _first_byte_seen = False
+        from ..redis_streams import CONNECTOR_TIMING_PREFIX
 
         try:
             while True:
@@ -679,6 +786,17 @@ class CliLLM(BaseLLM):
                 if line is None:  # done sentinel (WS) or stdout EOF (direct)
                     done_event.set()
                     break
+
+                # aw-connector-redis's own timing markers (connect+spawn,
+                # spawn→first-line) arrive prefixed — surface them but don't
+                # let them count as the CLI's real first byte below.
+                if line.startswith(CONNECTOR_TIMING_PREFIX):
+                    try:
+                        _payload = json.loads(line[len(CONNECTOR_TIMING_PREFIX):])
+                    except json.JSONDecodeError:
+                        continue
+                    yield _meta_chunk("connector.timing", _payload)
+                    continue
 
                 # Timing breakdown for agent.docker_ready: first raw line of
                 # any kind (not yet parsed/typed) marks the CLI process as

@@ -119,6 +119,14 @@ def container_name_for_run(run_id: str) -> str:
     return f"aw-run-{run_id}"
 
 
+# Warm-container mode (AP_WARM_CONTAINER=1, claude CLI only — see
+# backend/app/core/warm_pool.py) mounts these two scripts read-only into the
+# container instead of running the CLI directly as the container command.
+_WARM_SHARED_DIR = BASE_DIR / "repos" / "agents-platform" / "agent-images" / "shared"
+WARM_WRAPPER_HOST_PATH = _WARM_SHARED_DIR / "aw-warm-wrapper"
+WARM_RELAY_HOST_PATH = _WARM_SHARED_DIR / "aw-warm-relay.py"
+
+
 def parse_mount(raw: str) -> tuple[str, str]:
     """Parse --mount value into (host_path, container_path).
     Accepts 'host_path' or 'host_path:container_path'.
@@ -159,25 +167,44 @@ def build_docker_argv(
     share_network: bool = False,
     workdir: str | None = None,
     workdir_tmpfs: bool = False,
+    warm_mode: bool = False,
+    warm_epoch_hash: str | None = None,
+    warm_token: str | None = None,
 ) -> list[str]:
     spec = CLI_SPECS[cli]
     image = image_override or f"{REGISTRY}/{IMAGE_PREFIX}-{cli}:{tag}"
+
+    # Warm mode (AP_WARM_CONTAINER=1, claude only — see backend/app/core/
+    # warm_pool.py): the container is DETACHED and long-lived, not --rm/-i.
+    # Turns are fed in later via `docker exec` against the FIFO the wrapper
+    # script sets up, never via this `docker run`'s own stdin.
+    run_flags = ["-d"] if warm_mode else ["--rm", "-i"]
 
     if share_network:
         # Join aw-sandbox's network namespace directly — 127.0.0.1 then reaches
         # every service that shares that netns (awserv, redis, postgres, the
         # agents-platform backend itself). Docker forbids combining a container
         # network mode with --add-host, so that flag is dropped in this branch.
-        argv: list[str] = ["docker", "run", "--rm", "-i",
+        argv: list[str] = ["docker", "run", *run_flags,
                            "--network", "container:aw-sandbox"]
     else:
-        argv = ["docker", "run", "--rm", "-i",
+        argv = ["docker", "run", *run_flags,
                "--add-host=host.docker.internal:host-gateway"]
 
-    # Deterministic container name from run_id lets /runs/:id/cancel target it
-    # with `docker kill` even when it has no locally-tracked subprocess handle
-    # (e.g. a run recovered after an agents-platform restart — see cli.py kill_run).
-    if run_id:
+    if warm_mode:
+        assert agent_id, "warm_mode requires agent_id (stable container name is aw-warm-<agent_id>)"
+        # Stable name (not per-run) — a dispatch reuses this container across
+        # many turns/runs. Labeled with the epoch hash so a later dispatch can
+        # tell, without any extra process, whether it's still safe to reuse.
+        argv.extend(["--name", f"aw-warm-{agent_id}"])
+        argv.extend(["--label", "aw.warm=1"])
+        argv.extend(["--label", f"aw.agent_id={agent_id}"])
+        argv.extend(["--label", f"aw.epoch={warm_epoch_hash or ''}"])
+        argv.extend(["--label", f"aw.warm_token={warm_token or ''}"])
+    elif run_id:
+        # Deterministic container name from run_id lets /runs/:id/cancel target it
+        # with `docker kill` even when it has no locally-tracked subprocess handle
+        # (e.g. a run recovered after an agents-platform restart — see cli.py kill_run).
         argv.extend(["--name", container_name_for_run(run_id)])
 
     # ── Volume mounts ──────────────────────────────────────────────────────────
@@ -319,6 +346,38 @@ def build_docker_argv(
     if extra_docker_env:
         for key, val in extra_docker_env.items():
             argv.extend(["-e", f"{key}={val}"])
+
+    if warm_mode:
+        # No per-turn prompt yet — the container starts one long-lived claude
+        # process (fed later, turn by turn, over a FIFO via `docker exec`) so
+        # the CLI command here is the WRAPPER script, not the CLI itself.
+        # --entrypoint must precede the image name, so this whole branch
+        # short-circuits before the ordinary `argv.append(image)` below.
+        assert cli == "claude", "warm_mode is only supported for the claude CLI"
+        # Mounted into /usr/local/bin/ (like the baked-in aw-connector*
+        # scripts) rather than a fresh /aw/ path — bind-mounting individual
+        # files into a not-yet-existing directory creates that directory as
+        # root, and the image runs as USER ubuntu (see agent-images/claude/
+        # Dockerfile), so a root-owned /aw/ would block mkfifo etc. The
+        # wrapper itself creates its runtime dir under $HOME (owned by ubuntu).
+        argv.extend(["-v", f"{WARM_WRAPPER_HOST_PATH}:/usr/local/bin/aw-warm-wrapper:ro"])
+        argv.extend(["-v", f"{WARM_RELAY_HOST_PATH}:/usr/local/bin/aw-warm-relay.py:ro"])
+        argv.extend(["--entrypoint", "/usr/local/bin/aw-warm-wrapper"])
+        argv.append(image)
+        claude_argv = [spec["bin"], "--input-format", "stream-json", *spec["default_extra"]]
+        if model and spec["model_flag"]:
+            claude_argv.extend([spec["model_flag"], model])
+        add_dir_flag = spec.get("add_dir_flag")
+        if add_dir_flag:
+            for d in add_dir_mounts:
+                claude_argv.extend([add_dir_flag, d])
+        if mcp_config_dir and (Path(mcp_config_dir) / "mcp.json").exists():
+            claude_argv.extend(["--mcp-config", "/agent-config/mcp.json"])
+        claude_argv.extend(extra_args)
+        # CMD becomes the wrapper's "$@" — the entrypoint above is already
+        # the wrapper itself, so no need to name it again here.
+        argv.extend(claude_argv)
+        return argv
 
     # ── Image ──────────────────────────────────────────────────────────────────
     argv.append(image)

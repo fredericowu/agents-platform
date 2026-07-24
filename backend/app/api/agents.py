@@ -161,6 +161,37 @@ def write_run_mcp_config(agent: Agent, run_id: str, s: Session,
     return str(run_dir)
 
 
+def write_warm_mcp_config(agent: Agent, warm_token: str, s: Session) -> str | None:
+    """Warm-container variant of `write_run_mcp_config`: same servers, but
+    the caller-identity header is `X-Aw-Warm-Token: <warm_token>` instead of
+    `X-Aw-Caller-Run-Id: <run_id>`.
+
+    Written ONCE, at warm container spawn time (see
+    `backend/app/core/warm_pool.py`), not per turn — a warm container's
+    mcp.json is frozen for its whole lifetime, so it can never carry the
+    per-turn run_id the ephemeral path uses. `warm_token` is a stable id
+    generated once per container; the mcp-gateway (src/mcp/gateway.py)
+    resolves it to whichever run_id is CURRENT via a Redis mapping that
+    `warm_pool.dispatch_turn()` rewrites before every turn (see
+    `redis_streams.set_warm_token_run`).
+
+    Written to its own `warm/{agent.id}/` subdirectory (distinct from both
+    the shared per-agent dir and the per-run `runs/{run_id}/` dirs) since a
+    warm container's config outlives any single run.
+
+    Returns the directory path if servers were configured, else None (caller
+    should fall back to the static per-agent dir with no caller-identity
+    header at all).
+    """
+    servers = _resolve_agent_mcp_servers(agent, s)
+    if not servers:
+        return None
+    warm_dir = _AGENTS_DATA_DIR / agent.id / "warm"
+    extra_headers = {"X-Aw-Warm-Token": warm_token}
+    _write_mcp_config_files(warm_dir, servers, extra_headers=extra_headers)
+    return str(warm_dir)
+
+
 @router.get("/_resettable")
 def list_resettable_agents():
     """Slugs that have seed defaults — used by the UI to decide where to show

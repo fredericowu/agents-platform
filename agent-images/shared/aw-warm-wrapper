@@ -1,0 +1,87 @@
+#!/bin/sh
+# aw-warm-wrapper — entrypoint for a persistent ("warm") claude container.
+#
+# Spawns ONE long-lived `claude --input-format stream-json --output-format
+# stream-json` process, fed multiple turns over a FIFO (mkfifo + opening it
+# read-write on an extra fd so it never sees EOF between docker-exec
+# writers — see the hand-validated PoC this is built from, memory file
+# project_persistent_claude_container_streamjson.md). Its stdout goes
+# through a second FIFO into aw-warm-relay.py, which publishes each turn to
+# the run's Redis Stream (same schema aw-connector-redis uses) so
+# agents-platform's existing consumer needs zero changes.
+#
+# Usage (set by docker_agent.py's warm_mode branch):
+#   aw-warm-wrapper <claude-binary-and-flags...>
+#
+# Runtime files live under $RUNDIR ($HOME-relative, NOT /aw/ — bind-mounting
+# individual files into a not-yet-existing /aw/ would create it root-owned,
+# and this image runs as USER ubuntu, see agent-images/claude/Dockerfile):
+#   $RUNDIR/fifo_in         — claude's stdin (turns fed in via `docker exec`)
+#   $RUNDIR/fifo_out        — claude's stdout, read by the relay
+#   $RUNDIR/current_run_id  — written by warm_pool.dispatch_turn() BEFORE
+#                             each turn's prompt, so the relay tags the next
+#                             lines it reads with the right run_id
+#   $RUNDIR/drain           — touched by warm_pool.drain() (`docker exec
+#                             <name> touch /aw/drain` from the host) — see
+#                             the poll loop below for how this is consumed
+#   $RUNDIR/ready           — touched once claude is spawned; warm_pool
+#                             polls for this after creating a fresh container
+set -e
+
+RUNDIR="$HOME/.aw-warm"
+mkdir -p "$RUNDIR"
+FIFO_IN="$RUNDIR/fifo_in"
+FIFO_OUT="$RUNDIR/fifo_out"
+rm -f "$FIFO_IN" "$FIFO_OUT" "$RUNDIR/drain" "$RUNDIR/ready"
+mkfifo "$FIFO_IN" "$FIFO_OUT"
+
+# Open both FIFOs read-write on their own fds. For fifo_in this is the trick
+# that keeps claude from seeing EOF between separate `docker exec` writers
+# (each exec is a distinct process that opens-writes-closes the FIFO on the
+# host side). For fifo_out it means the relay momentarily not reading never
+# blocks/SIGPIPEs claude's stdout writes.
+exec 3<>"$FIFO_IN"
+exec 4<>"$FIFO_OUT"
+
+"$@" <&3 >"$FIFO_OUT" 2>"$RUNDIR/claude_err.log" &
+CLAUDE_PID=$!
+echo "$CLAUDE_PID" > "$RUNDIR/claude.pid"
+
+python3 /usr/local/bin/aw-warm-relay.py "$RUNDIR" <&4 &
+RELAY_PID=$!
+
+touch "$RUNDIR/ready"
+echo "aw-warm-wrapper: ready, claude pid=$CLAUDE_PID relay pid=$RELAY_PID" >&2
+
+# 6h TTL backstop (design constraint: enforced INSIDE the container so it's a
+# zero-actor safety net that works even if all the epoch-hash/ownership
+# tracking on the agents-platform side fails completely). A direct kill of
+# OUR OWN child process — not `docker kill`/`docker stop` from the outside,
+# so this is unrelated to (and must never be confused with) the graceful
+# drain path below or with kill_run (cli.py:84, the actual abort mechanism).
+( sleep 21600; kill "$CLAUDE_PID" 2>/dev/null || true ) &
+TTL_WATCHER_PID=$!
+
+# Graceful drain: poll (~15s, matching the idle-tick cadence in the design)
+# for $RUNDIR/drain and, once seen, close OUR copy of fd 3 — the write end
+# of claude's stdin. claude only notices on its NEXT stdin read, which only
+# happens once it's done streaming whatever turn it's currently mid-way
+# through (this CLI's turn loop is read-one-line -> respond -> read-next-
+# line), so this can never truncate an in-flight turn — an uncapped wait by
+# construction, not by an explicit timeout. No signal is ever sent to
+# claude here; this must stay mechanically separate from kill_run's SIGKILL
+# `docker kill` (see warm_pool.drain()'s docstring) — do not "simplify" this
+# into a `docker stop`/`docker kill`/`kill -TERM` later.
+while kill -0 "$CLAUDE_PID" 2>/dev/null; do
+    if [ -f "$RUNDIR/drain" ]; then
+        echo "aw-warm-wrapper: drain flag seen — closing stdin, claude exits after its current turn (if any)" >&2
+        exec 3<&-
+        break
+    fi
+    sleep 15
+done
+
+wait "$CLAUDE_PID" 2>/dev/null || true
+kill "$TTL_WATCHER_PID" 2>/dev/null || true
+kill "$RELAY_PID" 2>/dev/null || true
+exit 0

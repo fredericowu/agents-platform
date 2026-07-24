@@ -2052,6 +2052,9 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
             container_create_s = timing.get("container_create_s")  # llm_invoke → container spawned
             container_wait_s   = timing.get("container_wait_s")    # spawned → first raw CLI byte
             cli_boot_s         = timing.get("cli_boot_s")          # first byte → system.init
+            # aw-connector-redis's self-reported sub-phases of container_wait_s.
+            connector_connect_spawn_s = timing.get("connector_connect_spawn_s")  # redis connect + cli spawn (parallel)
+            connector_cli_boot_s      = timing.get("connector_cli_boot_s")       # cli spawned → its first output line
 
             # ── End-to-end trace (SigNoz Traces, not just this log line) ────
             # All children of `_root_span` (the `with lock, _span(...)` above),
@@ -2093,9 +2096,36 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
                                        wall_anchor_perf, wall_anchor_epoch, parent=_docker_span)
                             _t_cursor += container_create_s
                         if container_wait_s is not None:
-                            _emit_span("agent.container_wait", _t_cursor,
+                            _wait_span = _emit_span("agent.container_wait", _t_cursor,
                                        _t_cursor + container_wait_s,
                                        wall_anchor_perf, wall_anchor_epoch, parent=_docker_span)
+                            # Further split container_wait using aw-connector-redis's
+                            # own self-timed numbers: whatever's left over after its
+                            # two reported phases is dockerd itself (container
+                            # create/start) — happens before the connector script
+                            # inside the container even starts running.
+                            if _wait_span is not None:
+                                _wc = _t_cursor
+                                _reported = (connector_connect_spawn_s or 0.0) + \
+                                            (connector_cli_boot_s or 0.0)
+                                _dockerd_s = container_wait_s - _reported
+                                if _dockerd_s > 0.001:
+                                    _emit_span("agent.dockerd_overhead", _wc,
+                                               _wc + _dockerd_s,
+                                               wall_anchor_perf, wall_anchor_epoch,
+                                               parent=_wait_span)
+                                    _wc += _dockerd_s
+                                if connector_connect_spawn_s is not None:
+                                    _emit_span("agent.connector_connect_spawn", _wc,
+                                               _wc + connector_connect_spawn_s,
+                                               wall_anchor_perf, wall_anchor_epoch,
+                                               parent=_wait_span)
+                                    _wc += connector_connect_spawn_s
+                                if connector_cli_boot_s is not None:
+                                    _emit_span("agent.connector_cli_boot", _wc,
+                                               _wc + connector_cli_boot_s,
+                                               wall_anchor_perf, wall_anchor_epoch,
+                                               parent=_wait_span)
                             _t_cursor += container_wait_s
                         if cli_boot_s is not None:
                             _emit_span("agent.cli_boot", _t_cursor,
