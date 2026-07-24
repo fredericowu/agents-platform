@@ -34,6 +34,17 @@ current_run_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("cur
 _PROCS: dict[str, set[asyncio.subprocess.Process]] = {}
 _PROCS_LOCK = asyncio.Lock()
 
+# run_id -> the ACTUAL docker container name currently launched for it. This
+# is the ground truth for "what container is running right now for this
+# run_id" — populated the instant `_astream_once()` computes the name (before
+# `docker run`), cleared when that call's `finally:` block tears down. kill_run()
+# checks this FIRST, before falling back to any DB-derived guess: a run's own
+# container name can't be reconstructed reliably from the DB while it's still
+# in flight (`Run.session_id` isn't written until the run finishes — see
+# 2026-07-23 fix, bot aw-17 — so a session-anchor lookup keyed off the row
+# being cancelled is blind at the exact moment /abort needs it most).
+_RUN_CONTAINER_NAMES: dict[str, str] = {}
+
 
 async def _register(run_id: str, proc: asyncio.subprocess.Process) -> None:
     async with _PROCS_LOCK:
@@ -45,6 +56,29 @@ async def _unregister(run_id: str, proc: asyncio.subprocess.Process) -> None:
         _PROCS.get(run_id, set()).discard(proc)
         if run_id in _PROCS and not _PROCS[run_id]:
             del _PROCS[run_id]
+
+
+# container_name -> lock serializing every astream() call that would launch
+# `docker run --name <that name>`. The name is deterministic per session
+# (aw-run-<resume_run_id or run_id>), so two turns of the SAME session firing
+# concurrently (duplicate webhook delivery, a flow wakeup racing a live turn,
+# etc.) used to both pass the `docker rm -f` guard and then race each other
+# on `docker run` — the loser died instantly with "Conflict... already in
+# use" and the run was marked status=error with zero output (see 2026-07-22
+# incident). Holding this lock across the whole cleanup→run→wait→unregister
+# span turns that race into a queue: the second turn simply waits for the
+# first turn's container to be gone before it gets its shot at the name.
+_CONTAINER_LOCKS: dict[str, asyncio.Lock] = {}
+_CONTAINER_LOCKS_LOCK = asyncio.Lock()
+
+
+async def _container_lock(name: str) -> asyncio.Lock:
+    async with _CONTAINER_LOCKS_LOCK:
+        lock = _CONTAINER_LOCKS.get(name)
+        if lock is None:
+            lock = asyncio.Lock()
+            _CONTAINER_LOCKS[name] = lock
+        return lock
 
 
 async def kill_run(run_id: str) -> int:
@@ -59,7 +93,39 @@ async def kill_run(run_id: str) -> int:
     straight to SIGKILL. Always issues `docker kill` by container name, since
     a run recovered after an AP restart (Redis-stream survival) has no local
     subprocess handle but is still reachable by its deterministic name.
-    Returns the count of processes/containers signalled."""
+    Returns the count of processes/containers signalled.
+
+    IMPORTANT — container-name resolution (fix 2026-07-23, bot aw-17): a
+    RESUMED session's container is named after the SESSION'S ANCHOR run
+    (`container_name_for_run(resume_run_id)`, resolved in executor.py as the
+    *first* run to ever use that session_id — see the `resume_run_id`
+    assignment in `run_agent()`), never the current turn's own `run_id`. Every
+    caller here (this file's callers all pass a turn's own row id) used to
+    call `docker kill aw-run-<that turn's id>` — a name that never existed
+    for any turn after the session's first — so `/abort` silently no-opped
+    against the REAL running container (nonzero exit from `docker kill`,
+    swallowed, no error surfaced) while the DB row still flipped to
+    'cancelled'/'success' as if the kill had worked.
+
+    Resolution order:
+    1. `_RUN_CONTAINER_NAMES[run_id]` — the container name `_astream_once()`
+       ACTUALLY launched for this run_id, recorded live in this process. This
+       is ground truth and is what /abort needs: the real, currently-running
+       container, identified directly rather than reconstructed. Preferred
+       because `Run.session_id` in the DB is only written once a run
+       *finishes* (see executor.py's `Run(...)` insert vs. the later
+       `_r.session_id = _sid` update) — so a DB-only lookup is blind for the
+       exact case /abort exists for: a run still in flight right now.
+    2. DB session-anchor lookup — best-effort fallback for a run that isn't
+       tracked in this process (recovered after an AP restart). Won't help
+       for an in-flight run for the reason above, but is harmless to try.
+
+    Also force-removes the container right after killing it (`docker rm -f`)
+    instead of leaving dockerd's async `--rm` cleanup to catch up on its own
+    — abort must stop things NOW, not "eventually once dockerd gets to it"
+    (that lag, up to several minutes under load, is what caused every
+    following turn of the session to fail with a name conflict).
+    """
     async with _PROCS_LOCK:
         procs = list(_PROCS.get(run_id, set()))
     n = 0
@@ -70,13 +136,57 @@ async def kill_run(run_id: str) -> int:
         except ProcessLookupError:
             pass
 
-    from ..tools.docker_agent import container_name_for_run
+    _container_name = _RUN_CONTAINER_NAMES.get(run_id)
+    if _container_name:
+        log.info("kill_run: run %s resolved to its actually-running container "
+                  "%s (live registry)", run_id, _container_name)
+    else:
+        _container_run_id = run_id
+        try:
+            from ...db import session_scope
+            from ...models import Run as _Run
+
+            with session_scope() as _s:
+                _row = _s.query(_Run).filter(_Run.id == run_id).first()
+                if _row and _row.session_id:
+                    _anchor = (
+                        _s.query(_Run)
+                        .filter(_Run.session_id == _row.session_id)
+                        .order_by(_Run.started_at.asc())
+                        .first()
+                    )
+                    if _anchor:
+                        _container_run_id = _anchor.id
+        except Exception:
+            log.exception(
+                "kill_run: anchor-run lookup failed for %s — falling back to "
+                "its own id for the container name (may miss the real "
+                "container on a resumed session)", run_id,
+            )
+
+        from ..tools.docker_agent import container_name_for_run
+        _container_name = container_name_for_run(_container_run_id)
+        if _container_run_id != run_id:
+            log.info("kill_run: run %s not in the live registry — DB anchor "
+                      "lookup resolved container %s", run_id, _container_name)
+        else:
+            log.warning("kill_run: run %s not in the live registry and no DB "
+                        "session anchor found — targeting its own id as the "
+                        "container name, may miss the real container: %s",
+                        run_id, _container_name)
+
     proc = await asyncio.create_subprocess_exec(
-        "docker", "kill", container_name_for_run(run_id),
+        "docker", "kill", _container_name,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
     )
     if await proc.wait() == 0:
         n += 1
+
+    _rm = await asyncio.create_subprocess_exec(
+        "docker", "rm", "-f", _container_name,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    await _rm.wait()
     return n
 
 
@@ -248,6 +358,122 @@ class CliLLM(BaseLLM):
         )
 
     async def astream(self, messages: list[dict], **params: Any) -> AsyncIterator[ChatChunk]:
+        """Thin retry wrapper around `_astream_once`. Handles exactly one
+        failure shape: the container-name collision described on the launch
+        site in `_astream_once` (docker run --name aw-run-<id> raced the
+        previous turn's async --rm removal). Nothing is yielded from
+        `_astream_once` before that specific RuntimeError can occur (the raise
+        happens after the whole read loop drains, gated on `received_events ==
+        0`), so re-running it here from scratch is always safe — no partial
+        output was ever handed to the caller. Any other exception, or a
+        conflict on the retry attempt itself, propagates as-is: this is a
+        single free retry for a known-transient race, not a general
+        resilience mechanism.
+
+        IMPORTANT: only force-removes the blocking container when `docker
+        inspect` shows it's already dead (Exited/Dead/Created) — i.e. a true
+        leftover from an async --rm that hadn't landed yet. If it's genuinely
+        `running`, that's a DIFFERENT live turn of the same session (e.g. a
+        Watch/Glasses-injected turn overlapping a phone-Telegram turn — see
+        the 2026-07-22 incident where this forced-removed a still-executing
+        sibling and destroyed its in-progress work). In that case we just
+        raise: failing fast beats killing someone else's live run. The real
+        fix for that overlap is serializing at the dispatch layer (the
+        `_chat_lock` now held around `/inject` too), not here.
+        """
+        yielded = 0
+        try:
+            async for chunk in self._astream_once(messages, **params):
+                yielded += 1
+                yield chunk
+            return
+        except RuntimeError as e:
+            _msg = str(e)
+            if yielded or self.attach_run_id or "already in use" not in _msg:
+                log.info(
+                    "cli astream retry skipped (yielded=%d attach_run_id=%s "
+                    "conflict_msg=%s) — reraising as-is: %s",
+                    yielded, self.attach_run_id, "already in use" in _msg, _msg,
+                )
+                raise
+
+        _resume_id = self.resume_run_id or self.run_id
+        if not _resume_id:
+            log.warning("cli astream: name-conflict retry has no resume_id/run_id "
+                        "to derive a container name from — reraising as-is: %s", _msg)
+            raise RuntimeError(_msg)
+        from ..tools.docker_agent import container_name_for_run
+        _container_name = container_name_for_run(_resume_id)
+
+        # A single `docker inspect` snapshot here used to decide "live sibling,
+        # fail fast" vs "dead, force-remove". That was wrong for the common
+        # case: `_CONTAINER_LOCKS` (see `_container_lock()`) already serializes
+        # every launch under this name WITHIN THIS PROCESS, so nothing else in
+        # this process could have legitimately started a new `docker run
+        # --name <this>` while we held that lock — meaning a still-"Running"
+        # container we collide with immediately after releasing our own lock
+        # can only be OUR OWN just-finished container, mid `--rm` teardown,
+        # not a genuine sibling. dockerd's async removal is usually ~1-2s (see
+        # the `_held_container_lock` release poll above) but was observed to
+        # take 3+ MINUTES in a real incident (2026-07-23, bot aw-17) under
+        # load — the finally-block's ~2s poll budget gave up long before that,
+        # and this snapshot then misread the still-lingering container as a
+        # live sibling, permanently failing every subsequent turn until
+        # dockerd finally finished on its own. Poll for a much longer bounded
+        # window here (worst-case adds latency to one Telegram reply, which
+        # beats an error that keeps recurring turn after turn — "deveria ter
+        # enfileirado ao invés de dar erro").
+        #
+        # Cross-process collisions (a container from BEFORE an AP restart, or
+        # the attach_run_id path bypassing the lock — see the module docstring
+        # above) are the only way this is a genuine live sibling; those are
+        # rare and still correctly fail-fast once this window is exhausted.
+        _CONFLICT_POLL_ATTEMPTS = 15
+        _CONFLICT_POLL_INTERVAL_S = 2
+        _still_running = True
+        for _attempt in range(_CONFLICT_POLL_ATTEMPTS):
+            _inspect = await asyncio.create_subprocess_exec(
+                "docker", "inspect", "-f", "{{.State.Running}}", _container_name,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            )
+            _out, _ = await _inspect.communicate()
+            if _inspect.returncode != 0 or _out.strip() != b"true":
+                _still_running = False
+                if _attempt:
+                    log.info(
+                        "cli container %s finished tearing down after ~%ds of "
+                        "conflict-retry polling (was misread as live at first "
+                        "snapshot) — removing and retrying",
+                        _container_name, _attempt * _CONFLICT_POLL_INTERVAL_S,
+                    )
+                break
+            await asyncio.sleep(_CONFLICT_POLL_INTERVAL_S)
+
+        if _still_running:
+            # Still running after the full window — genuinely a live sibling
+            # (or dockerd is pathologically stuck). Do not kill it. Fail fast;
+            # the caller (executor) surfaces this as a normal run error
+            # instead of silently destroying real work.
+            log.warning(
+                "cli container name collision against a container (%s) still "
+                "reporting Running=true after %ds of polling — treating as a "
+                "LIVE sibling, not killing it, failing this turn: %s",
+                _container_name, _CONFLICT_POLL_ATTEMPTS * _CONFLICT_POLL_INTERVAL_S, _msg,
+            )
+            raise RuntimeError(_msg)
+
+        log.warning("cli container name collision against a dead/stale "
+                    "container (%s) — removing and retrying once: %s",
+                    _container_name, _msg)
+        _rm = await asyncio.create_subprocess_exec(
+            "docker", "rm", "-f", _container_name,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await _rm.wait()
+        async for chunk in self._astream_once(messages, **params):
+            yield chunk
+
+    async def _astream_once(self, messages: list[dict], **params: Any) -> AsyncIterator[ChatChunk]:
         parts: list[str] = []
         for m in messages:
             r = m.get("role", "user")
@@ -330,35 +556,66 @@ class CliLLM(BaseLLM):
 
         stderr_chunks: list[bytes] = []
         stderr_task = None
+        _held_container_lock: asyncio.Lock | None = None
+        _container_name: str | None = None
         if not attach_run_id:
             # The container name is deterministic (aw-run-<resume_run_id or run_id>)
             # so a RESUMED session reuses the SAME name across every turn (see
-            # container_name_for_run). `docker kill` in kill_run() (e.g. /abort)
-            # returns as soon as the SIGKILL is issued — it does not wait for
-            # dockerd's async --rm cleanup to actually remove the container. If
-            # the next turn's `docker run --name aw-run-<id>` races that cleanup,
-            # it fails immediately with "Conflict... already in use" and the
-            # session is stuck until the stale container is removed by hand.
-            # Force-remove any leftover container under this name before every
-            # run so a lagging removal never blocks the next turn.
+            # container_name_for_run) — that's what lets kill_run()/`/abort`
+            # `docker kill` it by name with no live process handle, even after
+            # an AP restart. It also means two launches under the same name can
+            # collide ("Conflict... already in use"): dockerd removes the
+            # previous turn's `--rm` container asynchronously, so a back-to-back
+            # turn can start before that removal lands. Deliberately NOT
+            # pre-checking (`docker rm -f` / `docker inspect`) here — that would
+            # tax every single turn with real latency to defend against a
+            # collision that's rare. Launch straight away; the retry wrapper
+            # (astream(), below) reacts only if this specific launch actually
+            # collides.
             _resume_id = self.resume_run_id or self.run_id
-            if _resume_id:
-                from ..tools.docker_agent import container_name_for_run
-                _cleanup = await asyncio.create_subprocess_exec(
-                    "docker", "rm", "-f", container_name_for_run(_resume_id),
-                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            try:
+                if _resume_id:
+                    from ..tools.docker_agent import container_name_for_run
+                    _container_name = container_name_for_run(_resume_id)
+                    # Serialize every astream() call targeting this container name.
+                    # Without this, two turns of the SAME session firing concurrently
+                    # (duplicate webhook delivery, a flow wakeup racing a live turn)
+                    # could both race each other on `docker run --name` — the loser
+                    # died instantly with "Conflict... already in use", surfacing as
+                    # a status=error run with zero output. Holding the lock across
+                    # run→wait below (released in the `finally:` block below) turns
+                    # that race into a queue.
+                    _held_container_lock = await _container_lock(_container_name)
+                    await _held_container_lock.acquire()
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=stdout_target,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=os.getcwd(), env={**os.environ},
+                    limit=10 * 1024 * 1024,  # raise StreamReader cap for large init lines
                 )
-                await _cleanup.wait()
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=stdout_target,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=os.getcwd(), env={**os.environ},
-                limit=10 * 1024 * 1024,  # raise StreamReader cap for large init lines
-            )
+            except BaseException:
+                # Anything here blew up before the main try/finally below took
+                # over lock ownership — release here or the next turn of this
+                # session deadlocks forever waiting on a lock nobody will free.
+                if _held_container_lock is not None:
+                    _held_container_lock.release()
+                raise
+            # Timing breakdown for agent.docker_ready: this marks the moment
+            # the host process for the container actually exists, separating
+            # "container create/start" from the CLI's own boot time below.
+            yield _meta_chunk("container.started", {})
             if rid:
                 await _register(rid, proc)
+                if _container_name:
+                    # Ground truth for kill_run(): the container name THIS
+                    # run_id actually launched, so /abort can target it
+                    # directly instead of reconstructing it from the DB (see
+                    # kill_run()'s docstring — Run.session_id isn't written
+                    # until the run finishes, so a DB lookup is blind for an
+                    # in-flight run, exactly when /abort needs it most).
+                    _RUN_CONTAINER_NAMES[rid] = _container_name
 
             # Drain `docker run`'s stderr into a bounded buffer instead of
             # discarding it — needed below to explain a non-zero exit that
@@ -407,6 +664,7 @@ class CliLLM(BaseLLM):
         cost = 0.0
         final_text = ""
         received_events = 0
+        _first_byte_seen = False
 
         try:
             while True:
@@ -421,6 +679,14 @@ class CliLLM(BaseLLM):
                 if line is None:  # done sentinel (WS) or stdout EOF (direct)
                     done_event.set()
                     break
+
+                # Timing breakdown for agent.docker_ready: first raw line of
+                # any kind (not yet parsed/typed) marks the CLI process as
+                # alive — splits "container create/start" (above) from
+                # "CLI boot to system.init" (below) instead of one opaque span.
+                if not _first_byte_seen:
+                    _first_byte_seen = True
+                    yield _meta_chunk("cli.first_byte", {})
 
                 # Process the raw CLI JSON line exactly like the old stdout path
                 if not line.strip():
@@ -597,6 +863,44 @@ class CliLLM(BaseLLM):
                     stderr_task.cancel()
             if unregister_run is not None:
                 unregister_run(rid or "unknown")
+            if _held_container_lock is not None:
+                # `docker run --rm` exiting (proc.wait() above) only means the
+                # CLI process is dead — dockerd removes the container itself
+                # asynchronously, a beat later. Releasing the lock right here
+                # (as this used to do) let the very next queued turn of this
+                # SAME session launch `docker run --name <same>` into that gap
+                # and lose the race — surfacing as a user-visible "Conflict...
+                # already in use" error instead of just quietly running next.
+                # Poll briefly for the name to actually free up before handing
+                # the lock to the next waiter; this only delays a turn that's
+                # already queued behind another one, never the happy path of
+                # an unrelated session's very first launch.
+                if _container_name:
+                    _waited = 0
+                    for _waited in range(20):  # ~2s budget, 100ms steps
+                        _chk = await asyncio.create_subprocess_exec(
+                            "docker", "inspect", _container_name,
+                            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        if await _chk.wait() != 0:
+                            break  # gone
+                        await asyncio.sleep(0.1)
+                    else:
+                        log.warning(
+                            "cli container %s still present ~2s after its run "
+                            "exited — releasing the lock anyway, next queued "
+                            "turn of this session may hit a name conflict",
+                            _container_name,
+                        )
+                    if _waited:
+                        log.info(
+                            "cli container %s took ~%dms to actually disappear "
+                            "after exit (held lock for the next queued turn)",
+                            _container_name, _waited * 100,
+                        )
+                if rid:
+                    _RUN_CONTAINER_NAMES.pop(rid, None)
+                _held_container_lock.release()
 
         # `docker run` exited non-zero and the CLI never emitted a single
         # event (e.g. rc=125 — the container itself failed to start:

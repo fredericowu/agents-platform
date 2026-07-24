@@ -561,14 +561,14 @@ class _SessionChatRequest(BaseModel):
     external_id: str
     message: str
     initiator_kind: str = "api"
-    # Folded in front of ``message`` ONLY on this external_id's very first
-    # call (i.e. only when this endpoint itself determines is_new_session is
-    # true) -- never on later calls, since the resumed CLI session already
-    # has it live. Deliberately NOT the caller's job to decide "is this
-    # new" (a caller-side DB row can easily outlive/predate the actual
-    # agents-platform session -- e.g. a player who talked to the agent
-    # before this endpoint existed, or after an admin resets the session --
-    # this endpoint is the only accurate source for "is this session new").
+    # Folded in front of ``message`` on EVERY call, not just the first one --
+    # a resumed CLI session remembers the conversation, but not reliably
+    # who the caller currently is (compaction/long threads can drop it, and
+    # the caller-side profile can change between calls -- e.g. a Roblox
+    # player's display name/membership). Safe for the caller to pass on
+    # every single call (e.g. the current Roblox player profile); this
+    # endpoint just re-injects it in front of each new message so the agent
+    # is never left guessing who it's talking to.
     context: Optional[str] = None
 
     model_config = {"extra": "allow"}
@@ -585,13 +585,12 @@ async def session_chat(slug: str, req: _SessionChatRequest,
     server-side (``claude --resume``). The caller only ever sends the new
     message, never the prior transcript.
 
-    ``context`` (optional) is folded in front of the message, but only when
-    THIS call turns out to be the first one ever for ``external_id`` — safe
-    for the caller to pass on every single call (e.g. the current Roblox
-    player profile), since whether it actually gets used is decided here
-    from the Target's own Run history, not from any state the caller tracks
-    itself. Also returned as ``is_new_session`` for callers that want to
-    know either way.
+    ``context`` (optional) is folded in front of the message on every call --
+    safe for the caller to pass on every single call (e.g. the current
+    Roblox player profile), so the agent always knows who it's talking to
+    even deep into a long resumed session. ``is_new_session`` is still
+    returned for callers that want to know whether this was the target's
+    first-ever call.
     """
     _check_scope(api_key, slug)
     with session_scope() as s:
@@ -626,7 +625,7 @@ async def session_chat(slug: str, req: _SessionChatRequest,
             )
         is_new_session = session_id is None
         message = req.message
-        if is_new_session and req.context:
+        if req.context:
             message = f"{req.context}\n\n[MENSAGEM DO JOGADOR]\n{req.message}"
         result = await run_agent(
             slug, message, target_id=target_id, session_id=session_id,

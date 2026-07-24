@@ -110,7 +110,6 @@ async def _broadcast_ui(event: dict):
 
 @router.websocket("/ws/client/{client_id}")
 async def client_ws(ws: WebSocket, client_id: str):
-    await ws.accept()
     # Normalize whatever identifier the client actually connected with (its
     # registered name OR its DB UUID — clients SHOULD always use the UUID
     # going forward, but this resolves either way) to the RemoteAgentRow's
@@ -118,10 +117,45 @@ async def client_ws(ws: WebSocket, client_id: str):
     # regardless of which one the client process was launched with. See
     # `_resolve_row_id` for why this matters.
     client_id = _resolve_row_id(client_id)
+
+    # This endpoint is reachable anonymously (it's on the public path list in
+    # Caddy — no forward_auth cookie gate), so id/name alone must not be
+    # enough to register as a given profile. Require the per-profile secret
+    # `?token=` query param, minted in RemoteAgentRow.token, and reject
+    # before accept() so an attacker who only knows/guesses a profile's
+    # id/name can't hijack its slot in `connected_clients` and receive the
+    # exec/fs commands AW intends for the real machine.
+    token = ws.query_params.get("token", "")
+    with session_scope() as s:
+        row = s.get(RemoteAgentRow, client_id)
+        row_token = row.token if row else None
+    token_ok = bool(row_token) and _sec.compare_digest(token, row_token)
+    if not token_ok:
+        # AW_REMOTE_AGENT_GRACE_AUTH=1 is a temporary rollout switch: existing
+        # clients haven't been redeployed with a token yet, so rejecting them
+        # outright would drop every connected machine the moment this ships.
+        # With it set, a tokenless/mismatched connect is still let through
+        # (loudly logged) while each machine is redeployed with its real
+        # token one at a time; turn it back off once every profile has
+        # reconnected using the token form (see `connected via` in the log
+        # line below, or GET /api/remote-agents to check `token_verified`
+        # per client — this flag is the ONLY thing standing between the
+        # current state and the pre-fix no-auth behavior, so it must not be
+        # left on).
+        if os.environ.get("AW_REMOTE_AGENT_GRACE_AUTH") == "1":
+            _remote_log.warning(
+                "remote agent connect ACCEPTED WITHOUT VALID TOKEN (grace mode): client_id=%s", client_id)
+        else:
+            _remote_log.warning("remote agent connect rejected (bad/missing token): client_id=%s", client_id)
+            await ws.close(code=4403)
+            return
+
+    await ws.accept()
     connected_clients[client_id] = {
         "ws": ws,
         "info": {},
         "connected_at": int(time.time()),
+        "token_verified": token_ok,
     }
     try:
         # First message: handshake with system info
@@ -267,9 +301,11 @@ def _agent_with_status(row: RemoteAgentRow) -> dict:
         "created_at": row.created_at,
         "tunnels": tunnels,
         "auto_mount_fuse": row.auto_mount_fuse,
+        "token": row.token,
         "connected": conn_data is not None,
         "info": conn_data["info"] if conn_data else None,
         "connected_at": conn_data["connected_at"] if conn_data else None,
+        "token_verified": conn_data.get("token_verified") if conn_data else None,
     }
 
 
@@ -630,6 +666,7 @@ async def create_remote_agent(body: RemoteAgentBody):
                              description=body.description,
                              tunnels=json.dumps([t.model_dump() for t in body.tunnels]),
                              auto_mount_fuse=body.auto_mount_fuse,
+                             token=_sec.token_urlsafe(32),
                              created_at=now_epoch())
         s.add(row)
         s.flush()
@@ -667,6 +704,7 @@ async def update_remote_agent(agent_id: str, body: RemoteAgentBody):
                 id=new_id, name=body.name, description=body.description,
                 tunnels=json.dumps([t.model_dump() for t in body.tunnels]),
                 auto_mount_fuse=body.auto_mount_fuse, created_at=row.created_at,
+                token=row.token or _sec.token_urlsafe(32),
             )
             s.delete(s.get(RemoteAgentRow, agent_id))
             s.flush()

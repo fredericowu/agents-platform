@@ -29,7 +29,7 @@ import time
 import urllib.request
 import urllib.error
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 UPDATE_CHECK_INTERVAL = 300  # seconds, matches the Windows client's 5 min poll
 UPDATE_CHECK_TIMEOUT = 30
@@ -463,10 +463,20 @@ async def _update_loop(base_url: str, script_path: str) -> None:
             log.warning("update loop error: %s", e)
 
 
-async def connect_and_serve(profile_id: str, ws_url: str) -> None:
+async def connect_and_serve(profile_id: str, ws_url: str, token: str) -> None:
     import websockets
+    from urllib.parse import quote
 
+    # token is optional here (server-side rollout note in remote_agents.py):
+    # during the transition, already-running/auto-updated clients that
+    # haven't been given a token yet still connect the old way (no query
+    # param) against a server running in grace mode; once each machine is
+    # relaunched with --token, it switches to the authenticated form. Once
+    # every profile has reconnected with a token, grace mode is turned off
+    # server-side and the old (tokenless) form stops working entirely.
     url = f"{ws_url}/ws/client/{profile_id}"
+    if token:
+        url += f"?token={quote(token)}"
     backoff = 2.0
 
     while True:
@@ -527,10 +537,10 @@ def _ws_to_http(ws_url: str) -> str:
     return ws_url
 
 
-async def _run(profile_id: str, ws_url: str, no_update: bool) -> None:
+async def _run(profile_id: str, ws_url: str, token: str, no_update: bool) -> None:
     base_url = _ws_to_http(ws_url)
     script_path = os.path.abspath(__file__)
-    tasks = [asyncio.create_task(connect_and_serve(profile_id, ws_url))]
+    tasks = [asyncio.create_task(connect_and_serve(profile_id, ws_url, token))]
     if not no_update:
         tasks.append(asyncio.create_task(_update_loop(base_url, script_path)))
     try:
@@ -545,6 +555,11 @@ def main():
     global SHARE_ROOT, LIVE_TRAFFIC
     parser = argparse.ArgumentParser(description="AW Remote Agent — Linux client")
     parser.add_argument("--id", required=True, help="Profile UUID from agents-platform")
+    parser.add_argument("--token", default="",
+                        help="Per-profile connection secret from the Remote Agents UI "
+                             "(RemoteAgentRow.token). Optional only during the grace-mode "
+                             "rollout window — the server will require it once grace mode "
+                             "is turned off.")
     parser.add_argument("--url", default="ws://localhost:10005",
                         help="WebSocket base URL of agents-platform (default: ws://localhost:10005)")
     parser.add_argument("--no-update", action="store_true",
@@ -572,7 +587,7 @@ def main():
     if args.foreground:
         log.info("Foreground/live session — press Ctrl+C to disconnect and exit.")
     try:
-        asyncio.run(_run(args.id, args.url, no_update))
+        asyncio.run(_run(args.id, args.url, args.token, no_update))
     except SystemExit:
         raise
     except KeyboardInterrupt:

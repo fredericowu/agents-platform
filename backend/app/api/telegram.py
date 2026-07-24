@@ -34,6 +34,73 @@ from ..models import (Agent, CrispalConversationSuggestion, CrispalSuggestionFee
 
 log = logging.getLogger("ap.telegram")
 
+# ---------------------------------------------------------------------------
+# End-to-end tracing (telegram webhook → agent run → delivery)
+# ---------------------------------------------------------------------------
+# main.py's _setup_otel() already installs a TracerProvider exporting to
+# SigNoz when OTEL_ENABLED=1 — we just need a tracer. trace.get_tracer()
+# returns a harmless no-op tracer if no provider was ever set (OTEL disabled
+# or opentelemetry not installed), so this is safe to call unconditionally
+# and never needs its own try/except.
+_OTEL_ENABLED = os.environ.get("OTEL_ENABLED") == "1"
+
+
+def _tg_tracer():
+    from opentelemetry import trace
+    return trace.get_tracer("agents-platform.telegram")
+
+
+def _span(name: str, **attrs):
+    """Live span context manager — wraps a block that's about to run.
+
+    No-op (plain nullcontext) when OTEL_ENABLED=0 so callers never need to
+    branch on it themselves.
+    """
+    import contextlib
+    if not _OTEL_ENABLED:
+        return contextlib.nullcontext()
+    tracer = _tg_tracer()
+    cm = tracer.start_as_current_span(name)
+
+    @contextlib.contextmanager
+    def _wrapped():
+        with cm as span:
+            for k, v in attrs.items():
+                if v is not None:
+                    span.set_attribute(k, v)
+            yield span
+    return _wrapped()
+
+
+def _emit_span(name: str, t_start: float | None, t_end: float | None,
+               wall_anchor_perf: float, wall_anchor_epoch: float,
+               parent=None, **attrs):
+    """Emit a span for a (t_start, t_end) window that already happened,
+    measured in `time.perf_counter()` seconds. Converts to epoch nanoseconds
+    via the given (perf, epoch) anchor pair taken from the same process —
+    perf_counter has no absolute meaning on its own, so SigNoz needs this to
+    place the span on the real timeline.
+
+    Parents under `parent` (another span object) if given, otherwise under
+    whatever span is "current" at call time (e.g. the request's root span).
+    Returns the created span (so callers can parent further children under
+    it), or None when OTEL is disabled or either timestamp is missing.
+    """
+    if not _OTEL_ENABLED or t_start is None or t_end is None:
+        return None
+    from opentelemetry import trace as _otrace
+    tracer = _tg_tracer()
+    start_ns = int((wall_anchor_epoch + (t_start - wall_anchor_perf)) * 1e9)
+    end_ns = max(start_ns, int((wall_anchor_epoch + (t_end - wall_anchor_perf)) * 1e9))
+    ctx = _otrace.set_span_in_context(parent) if parent is not None else None
+    span = tracer.start_span(name, context=ctx, start_time=start_ns)
+    for k, v in attrs.items():
+        if v is not None:
+            span.set_attribute(k, v)
+    span.end(end_time=end_ns)
+    return span
+
+
 # Main asyncio event loop — captured on first webhook request so _dispatch
 # (which runs in a thread) can schedule coroutines on it instead of creating
 # a new event loop via asyncio.run() (cross-loop asyncio.Queue breaks WS streaming).
@@ -1141,13 +1208,27 @@ def _mark_message_dispatched(inbound_id: str | None) -> None:
 
 
 def _chat_worker(key: tuple[str, str], q: "queue.Queue[tuple]") -> None:
-    """Drain one chat's queue forever, in FIFO order, one dispatch at a time."""
+    """Drain one chat's queue forever, in FIFO order, one item at a time.
+
+    Two item shapes share this queue (and therefore the same strict arrival
+    order) so ANY source dispatching into a (bot, chat) session — a real
+    Telegram webhook message or a Watch/Glasses `/inject` call — is
+    guaranteed to never run concurrently with another turn of the same
+    session:
+      - a Telegram-dispatch tuple: (*dispatch_args, inbound_id) -> _dispatch()
+      - a plain 1-tuple of a callable: (fn,) -> fn() — used by callers that
+        need to run arbitrary queued work on this chat's turn (e.g. /inject),
+        not shaped like a webhook dispatch.
+    """
     while True:
         item = q.get()
-        *dispatch_args, inbound_id = item
-        _mark_message_dispatched(inbound_id)
         try:
-            _dispatch(*dispatch_args)
+            if len(item) == 1 and callable(item[0]):
+                item[0]()
+            else:
+                *dispatch_args, inbound_id = item
+                _mark_message_dispatched(inbound_id)
+                _dispatch(*dispatch_args)
         except Exception:
             log.exception("tg chat worker: dispatch failed for %s", key)
         finally:
@@ -1188,6 +1269,25 @@ def _send_processing_ack(token: str, chat_id: str, run_id: str,
     return msg_id, web_app, progress_url, state
 
 
+def _get_or_create_chat_queue(key: tuple[str, str]) -> "queue.Queue[tuple]":
+    """Return this (bot, chat)'s FIFO queue, spinning up its single drain
+    worker thread on first use. Shared by every source that dispatches into
+    a chat session — _enqueue_dispatch (Telegram webhook) and /inject
+    (Watch/Glasses) both put items on the SAME queue instance for a given
+    key, which is what makes their ordering (and mutual exclusion) real
+    across sources instead of per-source."""
+    with _CHAT_QUEUES_META:
+        q = _CHAT_QUEUES.get(key)
+        if q is None:
+            q = queue.Queue()
+            _CHAT_QUEUES[key] = q
+            threading.Thread(
+                target=_chat_worker, args=(key, q), daemon=True,
+                name=f"tg-chatq-{key[0]}-{key[1]}",
+            ).start()
+        return q
+
+
 def _enqueue_dispatch(bot: TelegramBot, chat_id: str, user_id: str,
                       text: str, is_voice: bool, inbound_lang: str,
                       inbound_id: str | None = None,
@@ -1210,16 +1310,7 @@ def _enqueue_dispatch(bot: TelegramBot, chat_id: str, user_id: str,
     instant even when this chat's worker is busy; _dispatch then reuses that
     bubble and run id instead of creating its own.
     """
-    key = (bot.id, chat_id)
-    with _CHAT_QUEUES_META:
-        q = _CHAT_QUEUES.get(key)
-        if q is None:
-            q = queue.Queue()
-            _CHAT_QUEUES[key] = q
-            threading.Thread(
-                target=_chat_worker, args=(key, q), daemon=True,
-                name=f"tg-chatq-{bot.id}-{chat_id}",
-            ).start()
+    q = _get_or_create_chat_queue((bot.id, chat_id))
     q.put((bot, chat_id, user_id, text, is_voice, inbound_lang, _time.perf_counter(),
            pre_run_id, ack_future, inbound_id))
 
@@ -1502,6 +1593,44 @@ def finalize_progress_bubble(run_id: str, status: str | None = None) -> None:
         log.debug("finalize progress bubble failed for run %s", run_id, exc_info=True)
 
 
+async def deliver_foreign_session_event(session_id: str, data: dict) -> None:
+    """Cross-channel fan-out: a reply was just delivered on ``session_id`` by
+    a channel OTHER than Telegram (today: the Meta Display / Watch pinned-face
+    path). If any Telegram chat is currently bound to this same session_id
+    (same session pinned on both sides), let it know so a user flipping
+    between Watch and Telegram sees both directions without re-asking.
+
+    Registered as the handler for ``core.redis_streams.run_session_event_listener``
+    at process startup (see main.py's lifespan). Telegram-originated events are
+    filtered out by the caller (source == "telegram") before reaching here —
+    this function must never re-deliver a chat's own reply back to itself.
+    """
+    text = (data or {}).get("text") or ""
+    if not text or not session_id:
+        return
+    with session_scope() as s:
+        rows = (s.query(TelegramSession)
+                .filter(TelegramSession.session_id == session_id)
+                .all())
+        targets = [(r.bot_id, r.chat_id) for r in rows]
+        if not targets:
+            return
+        tokens = {b.id: b.token for b in
+                  s.query(TelegramBot).filter(TelegramBot.id.in_({t[0] for t in targets})).all()}
+
+    source = (data or {}).get("source") or "another device"
+    prefix = "⌚ " if source == "meta" else f"[{source}] "
+    for bot_id, chat_id in targets:
+        token = tokens.get(bot_id)
+        if not token:
+            continue
+        try:
+            await asyncio.to_thread(_deliver_reply, token, chat_id, prefix + text, False, "")
+        except Exception:
+            log.warning("deliver_foreign_session_event: send failed bot=%s chat=%s",
+                        bot_id, chat_id, exc_info=True)
+
+
 async def deliver_recovered_run(run_id: str, output_text: str) -> None:
     """Deliver a recovered run's reply to its originating Telegram chat.
 
@@ -1565,6 +1694,8 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
               pre_run_id: str | None = None,
               ack_future: "_cf.Future | None" = None) -> None:
     t_dispatch = _time.perf_counter()
+    wall_anchor_perf = t_dispatch
+    wall_anchor_epoch = _time.time()
     token = bot.token
     agent_slug = _get_agent_slug_for_chat(bot, bot.id, chat_id)
 
@@ -1601,7 +1732,9 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
     # for a given (bot, chat), in arrival order. The per-chat lock is kept as an
     # uncontended belt-and-suspenders guard against any future direct caller.
     lock = _chat_lock(bot.id, chat_id)
-    with lock:
+    with lock, _span("telegram.dispatch", **{
+        "bot.id": bot.id, "chat.id": chat_id, "agent.slug": agent_slug,
+    }) as _root_span:
         t_session_start = _time.perf_counter()
         # Ensure target + session. Any exception here happened before the progress
         # button's terminal-state finally block exists (below) — without this guard
@@ -1640,6 +1773,8 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
         # webhook() may have already generated it (pre_run_id) — the progress
         # button it sent points at that id, so we must run under the same one.
         run_id = pre_run_id or str(uuid4())
+        if _root_span is not None:
+            _root_span.set_attribute("run.id", run_id)
         ap_url = os.environ.get("AP_PUBLIC_URL", "https://agents-platform.app.aw.tekflox.com")
         # Mini App progress view (faithful port of the AW WorkspaceAgent view).
         progress_url = f"{ap_url}/api/telegram/progress/{run_id}"
@@ -1700,6 +1835,16 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
 
         final_state = "error"  # button label fallback if we never reach success
         t_agent_start = _time.perf_counter()
+        timing: dict = {}  # overwritten at `timing = result.get("timing", {})` on
+        # the normal completion path below. Must exist before that point too:
+        # `except Exception as e:` (which also sets `timing = {}`) does NOT
+        # catch `asyncio.CancelledError` — a BaseException, not an Exception —
+        # and a run getting cancelled (e.g. via /abort while `_dispatch` is
+        # still awaiting it) is exactly the realistic way to hit that gap.
+        # Without this pre-init, `finally:`'s `timing.get(...)` raised
+        # UnboundLocalError, which then skipped the terminal-state button
+        # flip below it — the exact "stuck on 'Processing...'" symptom
+        # reported after abort (2026-07-23, bot aw-17).
         try:
             from ..core.executor import run_agent
 
@@ -1856,8 +2001,16 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
                 # reply (shared Redis gate with deliver_recovered_run).
                 try:
                     if _MAIN_LOOP is not None:
-                        from ..core.redis_streams import mark_delivered
+                        from ..core.redis_streams import mark_delivered, publish_session_event
                         asyncio.run_coroutine_threadsafe(mark_delivered(run_id), _MAIN_LOOP)
+                        # Let any OTHER channel pinned to this same session (e.g. a
+                        # Meta Display/Watch face) know a reply landed here — this
+                        # chat already delivered normally above; this is purely for
+                        # cross-channel awareness, never a second Telegram send.
+                        if session_id:
+                            asyncio.run_coroutine_threadsafe(
+                                publish_session_event(session_id, "telegram", output_text, run_id),
+                                _MAIN_LOOP)
                 except Exception:
                     pass
             elif status not in ("success", "completed"):
@@ -1894,6 +2047,71 @@ def _dispatch(bot: TelegramBot, chat_id: str, user_id: str,
             docker_ready_s  = timing.get("docker_ready_s")   # webhook → system.init
             first_token_s   = timing.get("first_token_s")    # webhook → first token
             llm_total_s     = timing.get("llm_total_s")      # llm_invoke → finalizing
+            # Sub-phases of docker_ready_s (None on the attach/reattach-after-
+            # restart path, or any run that errored before reaching that point).
+            container_create_s = timing.get("container_create_s")  # llm_invoke → container spawned
+            container_wait_s   = timing.get("container_wait_s")    # spawned → first raw CLI byte
+            cli_boot_s         = timing.get("cli_boot_s")          # first byte → system.init
+
+            # ── End-to-end trace (SigNoz Traces, not just this log line) ────
+            # All children of `_root_span` (the `with lock, _span(...)` above),
+            # so one Telegram message = one trace with a waterfall of every
+            # stage. Built retrospectively from the timestamps we already
+            # collected above/in `timing` — cheaper and far less risky than
+            # threading live OTel context through every retry/thread hop in
+            # this function, at the cost of ~ms-level placement accuracy.
+            _t_agent_done_v    = t_agent_done if 't_agent_done' in dir() else _t
+            _t_deliver_start_v = t_deliver_start if 't_deliver_start' in dir() else _t
+            _t_deliver_done_v  = t_deliver_done if 't_deliver_done' in dir() else _t
+            _emit_span("queue.wait", t_enqueue, t_dispatch,
+                       wall_anchor_perf, wall_anchor_epoch)
+            _emit_span("session.setup", t_session_start, t_session_done,
+                       wall_anchor_perf, wall_anchor_epoch)
+            _emit_span("progress_button.send", t_button_start, t_button_done,
+                       wall_anchor_perf, wall_anchor_epoch)
+            _agent_span = _emit_span(
+                "agent.run", t_agent_start, _t_agent_done_v,
+                wall_anchor_perf, wall_anchor_epoch,
+                **{"run.status": final_state})
+            if _agent_span is not None:
+                # Sub-phases anchor on t_agent_start (when we asked the executor
+                # to run) rather than its own internal t_llm_invoke clock, which
+                # we don't have here — introduces a small (sub-second) skew.
+                if docker_ready_s is not None:
+                    _docker_span = _emit_span("agent.docker_ready", t_agent_start,
+                               t_agent_start + docker_ready_s,
+                               wall_anchor_perf, wall_anchor_epoch, parent=_agent_span)
+                    # Breaks the single opaque docker_ready number into: container
+                    # create/start, wait for the CLI process to produce any output,
+                    # and the CLI's own boot up to its system.init handshake — so we
+                    # can tell which one to actually go optimize.
+                    if _docker_span is not None:
+                        _t_cursor = t_agent_start
+                        if container_create_s is not None:
+                            _emit_span("agent.container_create", _t_cursor,
+                                       _t_cursor + container_create_s,
+                                       wall_anchor_perf, wall_anchor_epoch, parent=_docker_span)
+                            _t_cursor += container_create_s
+                        if container_wait_s is not None:
+                            _emit_span("agent.container_wait", _t_cursor,
+                                       _t_cursor + container_wait_s,
+                                       wall_anchor_perf, wall_anchor_epoch, parent=_docker_span)
+                            _t_cursor += container_wait_s
+                        if cli_boot_s is not None:
+                            _emit_span("agent.cli_boot", _t_cursor,
+                                       _t_cursor + cli_boot_s,
+                                       wall_anchor_perf, wall_anchor_epoch, parent=_docker_span)
+                if first_token_s is not None:
+                    _emit_span("agent.first_token_wait", t_agent_start,
+                               t_agent_start + first_token_s,
+                               wall_anchor_perf, wall_anchor_epoch, parent=_agent_span)
+                if llm_total_s is not None and docker_ready_s is not None:
+                    _t_llm_start = t_agent_start + docker_ready_s
+                    _emit_span("agent.llm_generation", _t_llm_start,
+                               _t_llm_start + llm_total_s,
+                               wall_anchor_perf, wall_anchor_epoch, parent=_agent_span)
+            _emit_span("deliver.reply", _t_deliver_start_v, _t_deliver_done_v,
+                       wall_anchor_perf, wall_anchor_epoch)
 
             log.info(
                 "[TIMING] bot=%s chat=%s run=%s | "
@@ -2838,6 +3056,57 @@ def _validate_secret(secret: str, header_value: str) -> bool:
     return hmac.compare_digest(secret, header_value or "")
 
 
+async def _kill_chat_session_container(s: Session, bot_id: str, chat_id: str) -> None:
+    """Kill the container for this chat's CURRENT session directly, using the
+    same naming rule the launch side uses — instead of trying to reverse it
+    from whichever Run row happens to be getting cancelled.
+
+    `TelegramSession.session_id` (this table) is the chat's durable "which
+    conversation are we continuing" pointer: it's written once a run
+    finishes and read again right before the NEXT run starts (see
+    `_save_session_id` / the `session_id=` passed into `run_agent()` below in
+    this file). Crucially, unlike `Run.session_id` on the row being aborted —
+    which is only populated once THAT run finishes, i.e. never for a run
+    that's still in flight — this value is already correct and stable for
+    the whole duration of the in-flight run, because it was read to LAUNCH
+    it and nothing updates it again until that run itself completes.
+
+    executor.py's `run_agent()` resolves `resume_run_id` (what the container
+    name is actually built from — `container_name_for_run(resume_run_id)`)
+    as the OLDEST Run row sharing this same session_id. Mirroring that lookup
+    here gives the exact container name without any reconstruction gap.
+    """
+    row = (s.query(TelegramSession)
+           .filter(TelegramSession.bot_id == bot_id,
+                   TelegramSession.chat_id == chat_id)
+           .first())
+    if not row or not row.session_id:
+        return
+    anchor = (s.query(Run)
+              .filter(Run.session_id == row.session_id)
+              .order_by(Run.started_at.asc())
+              .first())
+    if not anchor:
+        return
+    from ..core.tools.docker_agent import container_name_for_run
+    container_name = container_name_for_run(anchor.id)
+    log.info("abort: killing chat %s:%s session %s container %s directly",
+              bot_id, chat_id, row.session_id, container_name)
+    try:
+        _kill = await asyncio.create_subprocess_exec(
+            "docker", "kill", container_name,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await _kill.wait()
+        _rm = await asyncio.create_subprocess_exec(
+            "docker", "rm", "-f", container_name,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await _rm.wait()
+    except Exception:
+        log.exception("abort: direct container kill failed for %s", container_name)
+
+
 async def _abort_chat_runs(s: Session, bot_id: str, chat_id: str) -> int:
     """Cancel any in-flight run(s) for this chat (+ descendants), killing the
     live CLI subprocess. Mirrors the AW WorkspaceAgent /abort. Returns the
@@ -2871,6 +3140,15 @@ async def _abort_chat_runs(s: Session, bot_id: str, chat_id: str) -> int:
     s.commit()
 
     mark_cancelled(*ids)
+    # Direct, session-rule-based kill first — doesn't depend on any specific
+    # Run row's id/state, so it can't be thrown off by which row happened to
+    # be the one cancelled above. `kill_run()` below is now also fixed to
+    # resolve the same container (belt-and-suspenders; also covers non-chat
+    # cancel paths that don't have a TelegramSession row at all).
+    try:
+        await _kill_chat_session_container(s, bot_id, chat_id)
+    except Exception:
+        log.exception("abort: session-based container kill failed for %s:%s", bot_id, chat_id)
     for rid in ids:
         try:
             await kill_run(rid)
@@ -3885,35 +4163,90 @@ def inject_system_message(body: TelegramInject, _auth: None = Depends(_verify_in
 
     run_id = str(uuid4())
     from ..core.executor import run_agent
-    _coro = run_agent(
-        agent_slug, full_input, run_id=run_id, target_id=target_id,
-        session_id=session_id, initiator_kind="telegram_system",
-        initiator_id=f"{bot.id}:{body.chat_id}",
-    )
-    if _MAIN_LOOP is not None:
-        result = asyncio.run_coroutine_threadsafe(_coro, _MAIN_LOOP).result(timeout=1860)
-    else:
-        result = asyncio.run(_coro)
 
-    output_text = result.get("reply") or result.get("text", "")
-    status = result.get("status", "unknown")
+    # Capture plain values now, before this request's DB session closes.
+    # `bot` is an ORM instance bound to `s` (Depends(get_session)); FastAPI
+    # tears `s` down the moment this endpoint function returns, which now
+    # happens immediately (see the fire-and-forget note below) — well before
+    # `_run_injected` actually runs. Referencing `bot.token`/`bot.id` from
+    # inside that later closure would read off a detached instance instead
+    # of the live row it looks like; capturing plain strings here removes
+    # any doubt.
+    bot_id = bot.id
+    bot_token = bot.token
 
-    with session_scope() as ss:
-        from ..models import Run as _Run
-        run_row = ss.query(_Run).filter(_Run.id == run_id).first()
-        if run_row and run_row.session_id:
-            _save_session_id(bot.id, body.chat_id, run_row.session_id, token=bot.token)
-
-    if output_text:
-        _deliver_reply(bot.token, body.chat_id, output_text, False, "")
+    # Fire-and-forget: enqueue onto the SAME per-(bot,chat) FIFO queue a real
+    # webhook message uses (_get_or_create_chat_queue / _chat_worker) and
+    # return immediately. This endpoint used to hold the HTTP connection open
+    # with a blocking wait for the whole turn to finish (up to 31 min) — that
+    # meant a genuinely long queued wait (now that turns are properly FIFO'd,
+    # see the queueing comment this replaced) could outlast the CALLER's own
+    # HTTP timeout (routes.py's `_telegram_inject_if_bound`, 120s at the time
+    # of the 2026-07-22 incident). When the caller gave up, it fell through
+    # to a DIFFERENT dispatch path for the same message while this call kept
+    # running unseen — two live turns for one session_id, each launching
+    # `docker run --name aw-run-<resume_id>` under the same deterministic
+    # container name (see container_name_for_run) and colliding. Bumping the
+    # caller's timeout to match papered over the symptom; not holding a
+    # connection open in the first place removes the failure mode entirely —
+    # there is no timeout value that can race a call that returns instantly.
+    #
+    # Delivery is fully decoupled from this HTTP response: `_deliver_reply`
+    # below runs inside the queued closure itself, whenever the turn actually
+    # finishes (seconds or many minutes later), and posts straight into the
+    # real Telegram chat via the bot API — same as it always did — so the
+    # reply reaches Frederico (and anyone else watching that chat, including
+    # a Watch client that's just observing the conversation) with no polling
+    # or callback plumbing needed on the caller's side.
+    def _run_injected() -> None:
         try:
+            _coro = run_agent(
+                agent_slug, full_input, run_id=run_id, target_id=target_id,
+                session_id=session_id, initiator_kind="telegram_system",
+                initiator_id=f"{bot_id}:{body.chat_id}",
+            )
             if _MAIN_LOOP is not None:
-                from ..core.redis_streams import mark_delivered
-                asyncio.run_coroutine_threadsafe(mark_delivered(run_id), _MAIN_LOOP)
+                result = asyncio.run_coroutine_threadsafe(_coro, _MAIN_LOOP).result(timeout=1860)
+            else:
+                result = asyncio.run(_coro)
         except Exception:
-            pass
+            log.exception("inject: queued run %s failed", run_id)
+            return
 
-    return {"run_id": run_id, "status": status, "delivered": bool(output_text), "reply": output_text}
+        output_text = result.get("reply") or result.get("text", "")
+        with session_scope() as ss:
+            from ..models import Run as _Run
+            run_row = ss.query(_Run).filter(_Run.id == run_id).first()
+            if run_row and run_row.session_id:
+                _save_session_id(bot_id, body.chat_id, run_row.session_id, token=bot_token)
+            else:
+                log.warning(
+                    "inject: run %s has no session_id on its Run row — "
+                    "session mapping NOT saved for chat %s", run_id, body.chat_id,
+                )
+        if output_text:
+            try:
+                _deliver_reply(bot_token, body.chat_id, output_text, False, "")
+            except Exception:
+                log.exception(
+                    "inject: _deliver_reply failed for run %s (chat %s) — "
+                    "answer generated but NOT sent to Telegram", run_id, body.chat_id,
+                )
+                return
+            try:
+                if _MAIN_LOOP is not None:
+                    from ..core.redis_streams import mark_delivered
+                    asyncio.run_coroutine_threadsafe(mark_delivered(run_id), _MAIN_LOOP)
+            except Exception:
+                log.exception("inject: mark_delivered failed for run %s (non-fatal)", run_id)
+        else:
+            log.warning(
+                "inject: run %s produced empty output_text (status=%s) — "
+                "nothing delivered to Telegram chat %s", run_id, result.get("status"), body.chat_id,
+            )
+
+    _get_or_create_chat_queue((bot_id, body.chat_id)).put((_run_injected,))
+    return {"run_id": run_id, "status": "queued"}
 
 
 # Self-contained Mini App page. __RUN_ID__ is substituted at request time.

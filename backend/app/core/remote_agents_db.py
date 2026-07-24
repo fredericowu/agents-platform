@@ -48,6 +48,13 @@ class RemoteAgentRow(Base):
     # the watcher, overridden only by AW_REMOTE_FS_EXCLUDE when that env var
     # is explicitly set.
     auto_mount_fuse: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Per-profile connection secret, separate from `id`/`name`. The client
+    # must present this on the `/ws/client/{client_id}` handshake or the
+    # server refuses to register it — without this, that endpoint accepted
+    # any caller who merely knew (or guessed) a profile's id/name, letting
+    # an attacker impersonate a real machine and hijack the commands AW
+    # sends to it. See client_ws() in api/remote_agents.py.
+    token: Mapped[str] = mapped_column(String, default="")
 
 
 class ConfigRow(Base):
@@ -97,7 +104,16 @@ def init_db() -> None:
                 text("UPDATE remote_agents SET auto_mount_fuse = false WHERE id = :bare_metal_id"),
                 {"bare_metal_id": _BARE_METAL_ID},
             )
+        if "token" not in existing_cols:
+            conn.execute(text("ALTER TABLE remote_agents ADD COLUMN token TEXT DEFAULT ''"))
     with session_scope() as s:
+        # Backfill: every profile that predates the token column (or was
+        # created before this migration ran) gets a fresh secret so existing
+        # installs aren't left permanently unauthenticated.
+        for row in s.query(RemoteAgentRow).filter(
+            (RemoteAgentRow.token == None) | (RemoteAgentRow.token == "")  # noqa: E711
+        ).all():
+            row.token = secrets.token_urlsafe(32)
         if not s.get(ConfigRow, "mcp_api_key"):
             s.add(ConfigRow(key="mcp_api_key", value=secrets.token_urlsafe(32)))
 

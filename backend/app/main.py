@@ -92,6 +92,33 @@ def _setup_otel_logs() -> None:
         logging.getLogger(__name__).warning("OTel log export setup failed: %s", exc)
 
 
+def _setup_local_logging() -> None:
+    """Make app-level `logging.getLogger(...)` records visible in the local
+    process log, not just SigNoz.
+
+    Without this, the root logger has no handler unless OTel is enabled
+    (see `_setup_otel_logs`), and even then its only handler ships to
+    SigNoz — so every `log.warning(...)`/`log.exception(...)` in this
+    codebase (container-collision retries, inject delivery failures, etc.)
+    was invisible in `/tmp/aw-agents-platform.log`, the file actually
+    tailed when debugging live. uvicorn's own access/error loggers already
+    write to stdout independently of this; this just extends the same
+    stdout stream to every other logger in the app.
+    """
+    import logging
+    import sys
+
+    root = logging.getLogger()
+    if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+        root.addHandler(handler)
+    if root.level == 0 or root.level > logging.INFO:
+        root.setLevel(logging.INFO)
+
+
+_setup_local_logging()
+
 if os.environ.get("OTEL_ENABLED") == "1":
     _setup_otel()
     _setup_otel_logs()
@@ -145,6 +172,25 @@ async def lifespan(app: FastAPI):
         rearm_stuck_wakeup_runs()
     except Exception as e:
         print(f"[main] stuck-wakeup-run re-arm skipped: {e}")
+    # Cross-channel fan-out: a pinned session's reply delivered by one channel
+    # (e.g. Meta Display/Watch) is echoed to every OTHER channel pinned to the
+    # same session_id (e.g. a Telegram chat) via Redis PSUBSCRIBE — see
+    # core/redis_streams.py's run_session_event_listener + api/telegram.py's
+    # deliver_foreign_session_event. Telegram-originated events are dropped
+    # here so a chat never gets its own reply echoed back to itself.
+    try:
+        import asyncio as _asyncio
+        from .core.redis_streams import run_session_event_listener
+        from .api.telegram import deliver_foreign_session_event
+
+        async def _on_session_event(session_id: str, data: dict) -> None:
+            if (data or {}).get("source") == "telegram":
+                return
+            await deliver_foreign_session_event(session_id, data)
+
+        _asyncio.create_task(run_session_event_listener(_on_session_event))
+    except Exception as e:
+        print(f"[main] session event listener skipped: {e}")
     yield
 
 

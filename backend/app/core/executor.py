@@ -974,6 +974,7 @@ async def _acquire_session_lock(session_id: str) -> bool:
             _release_session_ref(session_id)
             return False
     _SESSION_LOCK_OWNER[session_id] = task
+    _exec_log.info("session %s: lock acquired by task %s", session_id, id(task))
     return True
 
 
@@ -1336,6 +1337,8 @@ async def _run_agent_impl(
     err: str | None = None
     _t_run_start = _time.perf_counter()
     _t_llm_invoke: float | None = None
+    _t_container_started: float | None = None
+    _t_cli_first_byte: float | None = None
     _t_system_init: float | None = None
     _t_first_token: float | None = None
     _t_finalizing: float | None = None
@@ -1494,6 +1497,12 @@ async def _run_agent_impl(
                                 else:
                                     _exec_log.warning("agent-callback: no run_id found in tool_result "
                                                       "for %s (tool_use_id=%s)", _origin_agent_slug, _tr_id)
+                        # Timing breakdown for agent.docker_ready — see cli.py's
+                        # "container.started"/"cli.first_byte" meta chunks.
+                        if meta_kind == "container.started" and _t_container_started is None:
+                            _t_container_started = _time.perf_counter()
+                        elif meta_kind == "cli.first_byte" and _t_cli_first_byte is None:
+                            _t_cli_first_byte = _time.perf_counter()
                         # Persist session_id from system.init so callers can resume later.
                         if meta_kind == "system.init" and meta_payload and run_id:
                             if _t_system_init is None:
@@ -1700,6 +1709,15 @@ async def _run_agent_impl(
         _timing["llm_total_s"] = (_t_finalizing or _t_end) - _t_llm_invoke
     if _t_llm_invoke is not None and _t_system_init is not None:
         _timing["docker_ready_s"] = _t_system_init - _t_llm_invoke
+    # Sub-spans of docker_ready_s: container create/start vs. CLI process boot.
+    # Absent (None) for the attach/reattach-after-restart path or any run that
+    # never got that far (e.g. it errored before the container came up).
+    if _t_llm_invoke is not None and _t_container_started is not None:
+        _timing["container_create_s"] = _t_container_started - _t_llm_invoke
+    if _t_container_started is not None and _t_cli_first_byte is not None:
+        _timing["container_wait_s"] = _t_cli_first_byte - _t_container_started
+    if _t_cli_first_byte is not None and _t_system_init is not None:
+        _timing["cli_boot_s"] = _t_system_init - _t_cli_first_byte
     if _t_llm_invoke is not None and _t_first_token is not None:
         _timing["first_token_s"] = _t_first_token - _t_llm_invoke
     if _t_system_init is not None and _t_first_token is not None:
@@ -2223,6 +2241,7 @@ def start_agent_run_bg(agent_slug: str, user_input: str, *,
                 target_id=target_id,
                 model_slug=model_slug,
                 source_slug=agent_slug,
+                session_id=session_id,
                 notion_task_id=notion_task_id)
         s.add(r); s.flush()
         _record_flow_hop(s, r, agent_slug, parent_run_id, session_id=session_id)

@@ -290,6 +290,84 @@ async def mark_delivered(run_id: str) -> bool:
         return True
 
 
+def _session_channel(session_id: str) -> str:
+    return f"session:{session_id}:events"
+
+
+_SESSION_CHANNEL_PATTERN = "session:*:events"
+
+
+async def publish_session_event(session_id: str, source: str, text: str, run_id: str = "") -> None:
+    """Fire-and-forget: a reply was just delivered on ``session_id`` by
+    ``source`` (e.g. "telegram", "meta"). Cross-channel listeners (the other
+    side's `run_session_event_listener`) use this to make every OTHER channel
+    pinned to the same session aware of it — the originating channel already
+    delivered normally through its own path and must never re-deliver to
+    itself. Best-effort: a missed publish just means the other channel stays
+    unaware of this one reply, nothing durable is lost."""
+    if not session_id:
+        return
+    r = await get_client()
+    if r is None:
+        return
+    try:
+        payload = json.dumps({"source": source, "text": text, "run_id": run_id})
+        await r.publish(_session_channel(session_id), payload)
+    except Exception as e:
+        log.warning("publish_session_event failed session=%s: %s", session_id, e)
+        await reset_client()
+
+
+async def run_session_event_listener(handler) -> None:
+    """Long-lived background task: PSUBSCRIBE to every session-scoped event
+    (across ALL sessions, via the `session:*:events` pattern) and call
+    ``handler(session_id, data)`` for each one, where ``data`` is the dict
+    passed to `publish_session_event` (source/text/run_id). ``handler`` may be
+    sync or async. Reconnects with backoff on any Redis error so a transient
+    blip doesn't permanently kill cross-channel delivery. Never returns —
+    schedule with asyncio.create_task() once at process startup."""
+    backoff = 1.0
+    while True:
+        r = await get_client()
+        if r is None:
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+            continue
+        pubsub = r.pubsub()
+        try:
+            await pubsub.psubscribe(_SESSION_CHANNEL_PATTERN)
+            backoff = 1.0
+            while True:
+                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=30)
+                if msg is None:
+                    continue
+                channel = (msg.get("channel") or "")
+                parts = channel.split(":")
+                if len(parts) != 3:
+                    continue
+                session_id = parts[1]
+                try:
+                    data = json.loads(msg["data"])
+                except Exception:
+                    continue
+                try:
+                    result = handler(session_id, data)
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception:
+                    log.exception("session_event handler failed for session=%s", session_id)
+        except Exception as e:
+            log.warning("session event listener error, reconnecting: %s", e)
+            await reset_client()
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+        finally:
+            try:
+                await pubsub.aclose()
+            except Exception:
+                pass
+
+
 async def stream_has_data(run_id: str) -> bool:
     """Return True if a Redis Stream exists for this run and holds at least one entry.
 

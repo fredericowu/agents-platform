@@ -24,6 +24,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,7 +41,7 @@ const (
 	regKeyPath   = `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
 	regValueName = "AWRemoteAgent"
 
-	version = "1.5.0"
+	version = "1.6.0"
 
 	pingInterval   = 20 * time.Second // how often client sends pings
 	pongDeadline   = 10 * time.Second // how long to wait for pong before declaring dead
@@ -246,12 +247,12 @@ func updateLoop(serverURL string, launchArgs []string) {
 
 // ── Auto-start (Windows registry) ────────────────────────────────────────────
 
-func installAutoStart(exePath, serverURL, clientID string) error {
+func installAutoStart(exePath, serverURL, clientID, token string) error {
 	idFlag := "--id"
 	if strings.Contains(clientID, "-") && len(clientID) == 36 {
 		idFlag = "--profile"
 	}
-	value := fmt.Sprintf(`"%s" --server %s %s %s`, exePath, serverURL, idFlag, clientID)
+	value := fmt.Sprintf(`"%s" --server %s %s %s --token %s`, exePath, serverURL, idFlag, clientID, token)
 	return exec.Command("reg", "add", regKeyPath, "/v", regValueName, "/d", value, "/f").Run()
 }
 
@@ -728,11 +729,17 @@ func (w *wsChunkWriter) Write(p []byte) (int, error) {
 
 // connect dials the server, handles the message loop, and returns when the
 // connection is lost. The caller is responsible for reconnecting.
-func connect(serverURL, clientID string) {
-	url := fmt.Sprintf("%s/ws/client/%s", serverURL, clientID)
-	log.Printf("connecting to %s", url)
+func connect(serverURL, clientID, token string) {
+	// token is optional: during the server's grace-mode rollout window, a
+	// client launched without one (e.g. not yet redeployed) still connects
+	// the old way; a token, once configured, is always sent.
+	wsURL := fmt.Sprintf("%s/ws/client/%s", serverURL, clientID)
+	if token != "" {
+		wsURL += "?token=" + url.QueryEscape(token)
+	}
+	log.Printf("connecting to %s/ws/client/%s", serverURL, clientID)
 
-	rawConn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	rawConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
 		log.Printf("dial error: %v", err)
 		return
@@ -869,6 +876,7 @@ func main() {
 	server    := flag.String("server", "ws://localhost:10011", "AW Remote Agent server WebSocket URL")
 	id        := flag.String("id", "", "Client ID (default: <os>-<hostname>)")
 	profile   := flag.String("profile", "", "Remote Agent profile UUID (overrides --id)")
+	token     := flag.String("token", "", "Profile connection token from the Remote Agents UI (required, server rejects connections without it)")
 	dir       := flag.String("dir", "", "Restrict filesystem access to this directory (default: unrestricted)")
 	uninstall := flag.Bool("uninstall", false, "Remove from Windows auto-start and exit")
 	testMode  := flag.Bool("test-mode", false, "Self-check: ping server and exit 0 on success")
@@ -915,7 +923,7 @@ func main() {
 
 	// Register in Windows auto-start
 	if runtime.GOOS == "windows" {
-		if err := installAutoStart(exePath, *server, clientID); err != nil {
+		if err := installAutoStart(exePath, *server, clientID, *token); err != nil {
 			log.Printf("auto-start registration failed: %v", err)
 		} else {
 			log.Printf("registered for auto-start (HKCU Run)")
@@ -929,6 +937,7 @@ func main() {
 	} else {
 		launchArgs = append(launchArgs, "--id", clientID)
 	}
+	launchArgs = append(launchArgs, "--token", *token)
 	if allowedDir != "" {
 		launchArgs = append(launchArgs, "--dir", allowedDir)
 	}
@@ -939,7 +948,7 @@ func main() {
 	for {
 		attempt++
 		log.Printf("connect attempt #%d", attempt)
-		connect(*server, clientID)
+		connect(*server, clientID, *token)
 
 		backoff := time.Duration(math.Min(
 			float64(backoffBase)*math.Pow(1.5, float64(attempt-1)),
