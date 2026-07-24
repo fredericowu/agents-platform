@@ -182,7 +182,11 @@ async def get_or_create(*, agent_id: str, epoch_hash: str, build_argv: BuildArgv
     token = secrets.token_hex(16)
     argv = build_argv(name, epoch_hash, token)
     assert argv[:2] == ["docker", "run"], "build_argv must return a `docker run ...` argv"
-    rc, out, err = await _docker(*argv[2:], timeout=60.0)
+    # argv[1:] keeps "run" — _docker() re-adds "docker" itself, so slicing at
+    # argv[2:] here used to drop "run" too (docker then read "-d" as a
+    # top-level flag: "unknown shorthand flag: 'd' in -d"). Caught by the
+    # isolated warm-pool test (2026-07-24) before this ever ran live.
+    rc, out, err = await _docker(*argv[1:], timeout=60.0)
     if rc != 0:
         raise RuntimeError(f"warm_pool: failed to spawn warm container {name}: {err.strip()}")
     await _wait_ready(name)
